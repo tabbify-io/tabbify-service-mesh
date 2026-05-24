@@ -123,3 +123,18 @@ jobs:
 
           echo "Uploading bootstrap.sh..."
           aws s3 cp bootstrap.sh "${DEST}/bootstrap.sh"
+
+      # The coordinator (pure HTTP, no TUN) also ships as a container image for
+      # the service host. joiner/CA stay as S3 binaries above (host TUN). The
+      # Dockerfile wraps the static musl binary built above into distroless.
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push coordinator image
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.ecr.outputs.registry }}/tabbify-coordinator"
+          docker build -t "${IMAGE}:latest" -t "${IMAGE}:${GITHUB_SHA::7}" .
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${GITHUB_SHA::7}"
