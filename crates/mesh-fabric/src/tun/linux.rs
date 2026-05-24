@@ -273,7 +273,12 @@ fn tunsetiff(fd: RawFd, requested_name: &str) -> Result<String, TunError> {
     // SAFETY: ioctl(2) with TUNSETIFF expects a pointer to an
     // `ifreq`. We pass exactly that. The fd is the one we just
     // opened. Return value: 0 on success, -1 on error.
-    let rc = unsafe { libc::ioctl(fd, TUNSETIFF, &raw mut ifr) };
+    //
+    // `TUNSETIFF as _` coerces the request to ioctl's per-target request
+    // type: `c_ulong` on glibc, but `c_int` on musl (where passing a
+    // `c_ulong` is an i32/u64 mismatch — E0308). The constant 0x400454ca
+    // fits in i32, so the conversion is lossless.
+    let rc = unsafe { libc::ioctl(fd, TUNSETIFF as _, &raw mut ifr) };
     if rc < 0 {
         let err = io::Error::last_os_error();
         return Err(match err.raw_os_error() {
