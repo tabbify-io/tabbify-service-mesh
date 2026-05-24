@@ -1,0 +1,124 @@
+# Release pipeline for tabbify-service-mesh.
+#
+# Builds the three mesh binaries as fully static Linux executables
+# (x86_64-unknown-linux-musl) and uploads them to S3 alongside
+# bootstrap.sh, so a fresh Ubuntu host can be provisioned with a single
+# curl | sh invocation of the script.
+#
+# ---------------------------------------------------------------------------
+# REQUIRED REPO CONFIGURATION (Settings -> Secrets and variables -> Actions)
+# ---------------------------------------------------------------------------
+# Secrets:
+#   AWS_ROLE_ARN        IAM role to assume via GitHub OIDC. The role's trust
+#                       policy must allow this repo's GitHub OIDC provider,
+#                       and its permission policy must grant s3:PutObject on
+#                       the release bucket (e.g. arn:aws:s3:::<bucket>/mesh/*).
+#
+# Variables:
+#   AWS_REGION          AWS region of the bucket, e.g. eu-central-1.
+#   RELEASE_S3_BUCKET   Target bucket name (no s3:// prefix), e.g. tabbify-mesh-releases.
+#
+# ONE-TIME AWS SETUP (done by the repo owner, outside this workflow):
+#   1. Create a GitHub OIDC identity provider in IAM:
+#        Provider URL: https://token.actions.githubusercontent.com
+#        Audience:     sts.amazonaws.com
+#   2. Create an IAM role whose trust policy federates that provider and
+#      restricts `token.actions.githubusercontent.com:sub` to this repo
+#      (e.g. "repo:leontij/tabbify-service-mesh:*").
+#   3. Attach a permission policy granting s3:PutObject (and optionally
+#      s3:PutObjectAcl if you upload with --acl) on the bucket's mesh/ prefix.
+#   4. Put the role ARN in the AWS_ROLE_ARN secret and the bucket/region in
+#      the variables above.
+#
+# ALTERNATIVE — static access keys instead of OIDC:
+#   If you prefer not to set up an OIDC provider, replace the
+#   `role-to-assume` line in the "Configure AWS credentials" step with:
+#       aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+#       aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#   and drop the `permissions:` block below (OIDC is the only thing that
+#   needs `id-token: write`). Keep the IAM user's policy scoped to
+#   s3:PutObject on the bucket's mesh/ prefix.
+# ---------------------------------------------------------------------------
+
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  # musl gives us static binaries that run on any modern Linux without a
+  # matching libc. The active dependency graph uses rustls + ring for TLS
+  # (no OpenSSL C linkage), so musl builds cleanly here.
+  TARGET: x86_64-unknown-linux-musl
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    # `id-token: write` is required for the OIDC handshake with AWS STS.
+    # `contents: read` is the minimum needed to check out the repo.
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${TARGET}"
+
+      - name: Install musl build tools
+        # musl-gcc is needed to link the static C runtime (e.g. ring's
+        # assembly stubs) for the musl target.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.TARGET }}-
+
+      - name: Build static release binaries
+        # Builds the whole workspace for the musl target. The three
+        # binary-producing packages are tabbify-mesh-coordinator,
+        # tabbify-mesh and tabbify-mesh-ca (the other crates are libs).
+        run: cargo build --release --target "${TARGET}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # OIDC: no long-lived keys stored in the repo. See header for the
+          # access-key alternative if OIDC is not set up.
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload binaries and bootstrap.sh to S3
+        # Each artifact lands under the mesh/ prefix so bootstrap.sh can
+        # fetch them from a single, predictable base URL.
+        run: |
+          set -euo pipefail
+          BIN_DIR="target/${TARGET}/release"
+          DEST="s3://${{ vars.RELEASE_S3_BUCKET }}/mesh"
+
+          for bin in tabbify-mesh-coordinator tabbify-mesh tabbify-mesh-ca; do
+            echo "Uploading ${bin}..."
+            aws s3 cp "${BIN_DIR}/${bin}" "${DEST}/${bin}"
+          done
+
+          echo "Uploading bootstrap.sh..."
+          aws s3 cp bootstrap.sh "${DEST}/bootstrap.sh"
