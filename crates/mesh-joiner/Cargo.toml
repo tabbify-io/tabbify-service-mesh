@@ -1,0 +1,60 @@
+[package]
+name        = "tabbify-mesh-joiner"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "tabbify_mesh_joiner"
+path = "src/lib.rs"
+
+[dependencies]
+# WireGuard userspace + key generation
+boringtun    = { workspace = true }
+x25519-dalek = { workspace = true }
+rand_core    = { workspace = true }
+
+# Async + HTTP
+tokio        = { workspace = true }
+futures      = { workspace = true }
+async-trait  = { workspace = true }
+reqwest      = { workspace = true }
+
+# SSE client used by `peer_sync` to consume the coordinator's
+# `/v1/mesh/peers/stream` endpoint.
+eventsource-stream = "0.2"
+
+# Codec
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+base64      = { workspace = true }
+
+# IDs / Logging
+uuid        = { workspace = true }
+dashmap     = { workspace = true }
+parking_lot = { workspace = true }
+
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Reuse our existing TUN abstraction + WireGuard helpers. The
+# `wireguard` feature pulls in the cross-platform device wrapper
+# along with the boringtun integration we depend on for keypair plumbing.
+tabbify-mesh-fabric = { path = "../mesh-fabric", features = ["wireguard"] }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile   = { workspace = true }
+wiremock   = { workspace = true }
+# Generate throwaway self-signed certs in mTLS unit tests so we don't
+# need to ship PEM fixtures with the crate.
+rcgen      = "0.13"

@@ -1,0 +1,65 @@
+[package]
+name        = "tabbify-mesh-coordinator"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tabbify-mesh-coordinator"
+path = "src/main.rs"
+
+[lib]
+name = "tabbify_mesh_coordinator"
+path = "src/lib.rs"
+
+[dependencies]
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+axum         = { workspace = true }
+futures      = { workspace = true }
+async-trait  = { workspace = true }
+
+# Outbound HTTP client for the join-token validation call to the auth
+# service (spec §8). Plain HTTP — the coordinator validates over the
+# regular network, never over the mesh it is bootstrapping.
+reqwest      = { workspace = true }
+
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+base64       = { workspace = true }
+
+uuid         = { workspace = true }
+dashmap      = { workspace = true }
+parking_lot  = { workspace = true }
+
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+clap     = { workspace = true }
+anyhow   = { workspace = true }
+thiserror = { workspace = true }
+
+# mTLS server-side: rustls config + axum-server for accepting client certs.
+# rustls-pemfile parses cert / key PEM blobs; rustls-pki-types holds the
+# strongly-typed cert / key after parsing.
+rustls          = { workspace = true }
+rustls-pemfile  = "2"
+rustls-pki-types = "1"
+axum-server     = { version = "0.7", features = ["tls-rustls"] }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile   = { workspace = true }
+# wiremock fakes the auth service in the join-token validation tests
+# (auth/validate.rs unit tests + the http register integration tests).
+wiremock   = { workspace = true }
+# rcgen generates self-signed certs in tests so we don't need to ship
+# fixture .pem files in the repo. Matches the rustls 0.23 cert / key types
+# via the pki-types re-export.
+rcgen      = "0.13"

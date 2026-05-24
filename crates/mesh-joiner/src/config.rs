@@ -1,0 +1,151 @@
+//! Caller-facing configuration for [`crate::Joiner::join`].
+//!
+//! All fields are documented on the struct itself. The defaults are
+//! chosen to match what `tools/tabbify-mesh` exposes through clap, so a
+//! `Joiner::join(JoinConfig::default())` call against
+//! `http://127.0.0.1:8888` is a usable smoke test out of the box.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Caller-facing configuration for `Joiner::join`.
+#[derive(Debug, Clone)]
+pub struct JoinConfig {
+    /// HTTP base URL of the mesh-coordinator (e.g.
+    /// `http://127.0.0.1:8888`). Trailing slashes are tolerated.
+    pub coordinator_url: String,
+    /// Human-readable display name. Surfaced in the coordinator's
+    /// peer list + in the `peer_joined` event.
+    pub display_name: String,
+    /// Role tags (e.g. `["dev-machine", "wasm-host", "test"]`). Advisory:
+    /// a coordinator with join-token validation enabled (spec §8) ignores
+    /// these and takes the node's authoritative tags from the validated
+    /// token claims. Only honored by a coordinator running without
+    /// `AUTH_URL` (the dev/E1 escape hatch).
+    pub tags: Vec<String>,
+    /// Node-join JWT issued by the auth service. Sent to the coordinator
+    /// as `Authorization: Bearer <token>` on register (spec §8). The
+    /// coordinator validates it and derives the node's authoritative
+    /// `network` + `tags` from the claims. `None` (default) is the dev/E1
+    /// escape hatch — only works against a coordinator started without
+    /// `AUTH_URL`; a validating coordinator rejects a tokenless register
+    /// with 401.
+    pub join_token: Option<String>,
+    /// UDP port boringtun listens on. `None` means "let the OS pick"
+    /// (recommended for tests; production deployments typically pin
+    /// `51820`).
+    pub listen_port: Option<u16>,
+    /// TUN device name preference. `None` = auto.
+    ///
+    /// * macOS: must start with `utun` if set (e.g. `utun7`).
+    /// * Linux: any name ≤ 15 bytes; `tabbify-mesh0` is a sane
+    ///   default.
+    pub tun_name: Option<String>,
+    /// How often to send `POST /v1/mesh/heartbeat`. Default 20s,
+    /// matches the coordinator's 60s timeout with comfortable headroom.
+    pub heartbeat_interval: Duration,
+    /// Public/reachable endpoint advertised to other peers via the
+    /// coordinator. `None` (default) → auto-detect from the bound
+    /// socket. Set explicitly when the joiner is behind NAT / port
+    /// forwarding and the address other peers must dial differs from
+    /// the local bind address (e.g. `Some("host.lima.internal:51820".into())`
+    /// from a Mac peer reachable to a Lima guest).
+    pub advertise_endpoint: Option<String>,
+    /// Where to persist the X25519 private key so the joiner keeps a
+    /// stable identity across restarts. `None` (default) → use
+    /// `$HOME/.tabbify-mesh/keypair`. The file is read on every start;
+    /// missing → generate + write atomically with mode 0600 on Unix.
+    /// See [`crate::wg::persistent_keypair::load_or_generate`].
+    pub keypair_path: Option<PathBuf>,
+    /// PEM-encoded client certificate signed by the mesh CA. Sent to
+    /// the coordinator as part of the TLS handshake. Required when
+    /// `insecure_no_mtls == false`.
+    pub tls_cert: Option<PathBuf>,
+    /// PEM-encoded private key matching [`Self::tls_cert`]. Required
+    /// when `insecure_no_mtls == false`.
+    pub tls_key: Option<PathBuf>,
+    /// PEM-encoded CA bundle the joiner trusts when validating the
+    /// coordinator's server cert. Required when
+    /// `insecure_no_mtls == false`. We do NOT fall back to the
+    /// system trust store: the mesh CA is private to a deployment and
+    /// nothing else should ever vouch for the coordinator.
+    pub tls_ca: Option<PathBuf>,
+    /// Escape hatch for dev / smoke-test setups against a plaintext
+    /// coordinator. When `true`, all three `tls_*` fields are ignored
+    /// and the joiner talks plain HTTP — must match the coordinator's
+    /// `--insecure-no-mtls`, otherwise the handshake fails.
+    pub insecure_no_mtls: bool,
+}
+
+impl Default for JoinConfig {
+    fn default() -> Self {
+        Self {
+            coordinator_url: "http://127.0.0.1:8888".to_owned(),
+            display_name: "tabbify-mesh-joiner".to_owned(),
+            tags: vec![],
+            join_token: None,
+            listen_port: None,
+            tun_name: None,
+            heartbeat_interval: Duration::from_secs(20),
+            advertise_endpoint: None,
+            keypair_path: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
+            // Defaults to insecure for backward compat: existing smoke
+            // tests + the historical `http://127.0.0.1:8888` URL above
+            // both speak plaintext. CLI / operator opt in by clearing
+            // this flag and supplying the three cert paths.
+            insecure_no_mtls: true,
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// The defaults must round-trip through Clone without surprising
+    /// the caller — guards against accidentally changing the default
+    /// of `heartbeat_interval` to something silly like 0s.
+    #[test]
+    fn defaults_are_sane() {
+        let cfg = JoinConfig::default();
+        assert_eq!(cfg.coordinator_url, "http://127.0.0.1:8888");
+        assert_eq!(cfg.heartbeat_interval, Duration::from_secs(20));
+        assert!(cfg.tags.is_empty());
+        assert!(cfg.listen_port.is_none());
+        assert!(cfg.tun_name.is_none());
+    }
+
+    #[test]
+    fn clone_preserves_all_fields() {
+        let cfg = JoinConfig {
+            coordinator_url: "http://10.0.0.1:9000".into(),
+            display_name: "alice".into(),
+            tags: vec!["dev".into()],
+            join_token: Some("join-jwt".into()),
+            listen_port: Some(51820),
+            tun_name: Some("utun7".into()),
+            heartbeat_interval: Duration::from_secs(15),
+            advertise_endpoint: Some("198.51.100.7:51820".into()),
+            keypair_path: Some(PathBuf::from("/tmp/kp")),
+            tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            tls_key: Some(PathBuf::from("/tmp/key.pem")),
+            tls_ca: Some(PathBuf::from("/tmp/ca.pem")),
+            insecure_no_mtls: false,
+        };
+        let cloned = cfg.clone();
+        assert_eq!(cloned.coordinator_url, cfg.coordinator_url);
+        assert_eq!(cloned.tun_name, cfg.tun_name);
+        assert_eq!(cloned.heartbeat_interval, cfg.heartbeat_interval);
+        assert_eq!(cloned.advertise_endpoint, cfg.advertise_endpoint);
+        assert_eq!(cloned.keypair_path, cfg.keypair_path);
+        assert_eq!(cloned.join_token, cfg.join_token);
+        assert_eq!(cloned.tls_cert, cfg.tls_cert);
+        assert_eq!(cloned.tls_key, cfg.tls_key);
+        assert_eq!(cloned.tls_ca, cfg.tls_ca);
+        assert_eq!(cloned.insecure_no_mtls, cfg.insecure_no_mtls);
+    }
+}

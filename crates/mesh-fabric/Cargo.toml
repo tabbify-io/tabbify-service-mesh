@@ -1,0 +1,50 @@
+[package]
+name         = "tabbify-mesh-fabric"
+version      = "0.1.0"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+default   = []
+# Userspace-WireGuard `MeshFabric` impl via boringtun. Pulls in
+# x25519-dalek for keypair generation. Disabled by default so consumers
+# that only need the in-process / loopback fabrics keep their build
+# graph small.
+wireguard = ["dep:boringtun", "dep:x25519-dalek", "dep:rand_core"]
+
+[dependencies]
+async-trait = { workspace = true }
+tokio       = { workspace = true }
+thiserror   = { workspace = true }
+dashmap     = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+
+# Optional — gated behind the `wireguard` feature.
+boringtun     = { workspace = true, optional = true }
+x25519-dalek  = { workspace = true, optional = true }
+rand_core     = { workspace = true, optional = true }
+
+# Linux-only — raw libc FFI for the `/dev/net/tun` ioctl dance in
+# `src/tun/linux.rs`. Gated to Linux so the macOS host build never
+# pulls in the dep just to support a backend it can't compile anyway.
+# `libc` itself is platform-agnostic; the `target.cfg` gate is purely
+# about keeping the dep graph minimal on non-Linux hosts.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# macOS-only — raw libc FFI for the `PF_SYSTEM` / `CTLIOCGINFO` /
+# `UTUN_OPT_IFNAME` dance in `src/tun/macos.rs`. Same rationale as the
+# Linux gate above: keep the dep graph minimal on every other host.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tracing-subscriber = { workspace = true }

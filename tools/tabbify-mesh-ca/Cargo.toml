@@ -1,0 +1,9 @@
+[package]
+name = "tabbify-mesh-ca"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rcgen = { version = "0.13", features = ["x509-parser"] }
