@@ -138,3 +138,45 @@ jobs:
           docker build -t "${IMAGE}:latest" -t "${IMAGE}:${GITHUB_SHA::7}" .
           docker push "${IMAGE}:latest"
           docker push "${IMAGE}:${GITHUB_SHA::7}"
+
+      # A new ECR image is useless until the running container pulls it. Trigger
+      # the redeploy on the host via SSM send-command — no SSH, no static keys
+      # (the instance role carries SSM managed-node perms; this CI role carries
+      # ssm:SendCommand, both via terraform). Closes the gap where pushed images
+      # never reached the running coordinator.
+      - name: Redeploy coordinator via SSM
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          DEPLOY_SCRIPT=$(cat <<EOF
+          set -euo pipefail
+          aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REGISTRY}
+          cd /opt/tabbify && docker compose pull && docker compose up -d
+          EOF
+          )
+          CMD_ID=$(aws ssm send-command \
+            --region "${AWS_REGION}" \
+            --document-name AWS-RunShellScript \
+            --targets "Key=tag:Name,Values=tabbify-coordinator" \
+            --comment "redeploy ${GITHUB_SHA::7}" \
+            --parameters "$(jq -n --arg s "$DEPLOY_SCRIPT" '{commands:[$s]}')" \
+            --query Command.CommandId --output text)
+          echo "SSM CommandId=${CMD_ID}"
+          for _ in $(seq 1 30); do
+            sleep 10
+            STATUS=$(aws ssm list-command-invocations --region "${AWS_REGION}" \
+              --command-id "${CMD_ID}" --details \
+              --query "CommandInvocations[0].Status" --output text 2>/dev/null || echo Pending)
+            echo "redeploy status: ${STATUS}"
+            case "${STATUS}" in
+              Success) echo "coordinator redeployed"; exit 0 ;;
+              Failed|Cancelled|TimedOut|"Delivery Timed Out")
+                echo "redeploy ended: ${STATUS}"
+                aws ssm list-command-invocations --region "${AWS_REGION}" --command-id "${CMD_ID}" \
+                  --details --query "CommandInvocations[0].CommandPlugins[0].Output" --output text || true
+                exit 1 ;;
+            esac
+          done
+          echo "timed out waiting for SSM redeploy"; exit 1
