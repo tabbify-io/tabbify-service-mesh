@@ -34,6 +34,7 @@ pub async fn run(
     sessions: SessionTable,
     our_private: StaticSecret,
     peer_id: Uuid,
+    wg_listen_port: u16,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -56,7 +57,7 @@ pub async fn run(
                 }
             }
             _ = ticker.tick() => {
-                tick_once(&client, &sessions, &our_private, peer_id).await;
+                tick_once(&client, &sessions, &our_private, peer_id, wg_listen_port).await;
             }
         }
     }
@@ -64,13 +65,17 @@ pub async fn run(
 
 /// One heartbeat round-trip + roster reconciliation. Pulled out so unit
 /// tests can drive it without waiting on a real ticker.
+///
+/// `wg_listen_port` is re-sent so the coordinator can refresh our
+/// reflexive endpoint if our observed public IP changed.
 pub async fn tick_once(
     client: &CoordinatorClient,
     sessions: &SessionTable,
     our_private: &StaticSecret,
     peer_id: Uuid,
+    wg_listen_port: u16,
 ) {
-    match client.heartbeat(peer_id).await {
+    match client.heartbeat(peer_id, Some(wg_listen_port)).await {
         Ok(resp) => reconcile_roster(sessions, our_private, &resp.peers).await,
         Err(e) => {
             tracing::warn!(

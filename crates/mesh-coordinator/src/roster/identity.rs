@@ -79,6 +79,7 @@ mod tests {
         RegisterRequest {
             wg_public_key: "AAAA".into(),
             listen_endpoint: None,
+            wg_listen_port: None,
             display_name: "n".into(),
             network: network.into(),
             tags: tags.iter().map(|s| (*s).to_owned()).collect(),

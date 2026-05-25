@@ -31,9 +31,12 @@ pub struct JoinConfig {
     /// `AUTH_URL`; a validating coordinator rejects a tokenless register
     /// with 401.
     pub join_token: Option<String>,
-    /// UDP port boringtun listens on. `None` means "let the OS pick"
-    /// (recommended for tests; production deployments typically pin
-    /// `51820`).
+    /// UDP port `boringtun` listens on. `None` means use the default
+    /// well-known `WireGuard` port 51820
+    /// ([`crate::joiner::DEFAULT_WG_LISTEN_PORT`]), falling back to an
+    /// OS-picked port if it's busy. A stable port is what makes
+    /// coordinator-driven reflexive endpoint discovery work across a cone
+    /// `NAT`; pin a specific port only for a manual port-forward.
     pub listen_port: Option<u16>,
     /// TUN device name preference. `None` = auto.
     ///
@@ -44,12 +47,16 @@ pub struct JoinConfig {
     /// How often to send `POST /v1/mesh/heartbeat`. Default 20s,
     /// matches the coordinator's 60s timeout with comfortable headroom.
     pub heartbeat_interval: Duration,
-    /// Public/reachable endpoint advertised to other peers via the
-    /// coordinator. `None` (default) → auto-detect from the bound
-    /// socket. Set explicitly when the joiner is behind NAT / port
-    /// forwarding and the address other peers must dial differs from
-    /// the local bind address (e.g. `Some("host.lima.internal:51820".into())`
-    /// from a Mac peer reachable to a Lima guest).
+    /// Explicit public/reachable endpoint advertised to other peers,
+    /// OVERRIDING automatic reflexive discovery. `None` (default) → the
+    /// coordinator derives the reachable endpoint from the observed source
+    /// IP + the WG listen port (works for public hosts + cone NAT with no
+    /// config). Set explicitly only for a non-matching manual port-forward,
+    /// a name-based advertisement (e.g.
+    /// `Some("host.lima.internal:51820".into())` for a Lima guest reaching
+    /// its macOS host), or a symmetric NAT that reflexive discovery can't
+    /// solve. The joiner no longer auto-advertises its loopback / LAN bind
+    /// address (that was unreachable for off-host peers).
     pub advertise_endpoint: Option<String>,
     /// Where to persist the X25519 private key so the joiner keeps a
     /// stable identity across restarts. `None` (default) → use

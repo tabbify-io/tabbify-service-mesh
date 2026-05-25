@@ -8,13 +8,14 @@ use crate::auth::{AuthValidator, ValidatedClaims, ValidationError};
 use crate::http::api::{PeerInfo, RegisterRequest};
 use crate::http::sse::{PeerBroadcaster, PeerEvent};
 use crate::nat::holepunch::{PunchPeer, PunchTracker, try_emit_pair};
+use crate::nat::reflexive::{is_sticky_explicit_endpoint, resolve_listen_endpoint};
 use crate::policy::PolicyStore;
 use crate::publisher::{SharedPublisher, publish_event};
 use crate::roster::allocator::{AllocError, UlaAllocator};
 use crate::roster::events::{PeerHeartbeat, PeerJoined, PeerLeft};
 use crate::roster::identity::stamp_identity;
 use dashmap::DashMap;
-use std::net::Ipv6Addr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -60,6 +61,17 @@ pub struct PeerEntry {
     /// Used by the Stage 2 hole punch skeleton to know which pairs
     /// are eligible for a `HolePunchInitiate` emission.
     pub observed_external: String,
+    /// Whether [`Self::listen_endpoint`] was DERIVED from the
+    /// coordinator-observed reflexive address (`true`) rather than
+    /// explicitly self-reported by the joiner (`false`).
+    ///
+    /// This is the discriminator the heartbeat path needs: a reflexive
+    /// endpoint should ROAM (follow the peer's observed public IP across
+    /// heartbeats), whereas an explicit `--advertise-endpoint` (public IP
+    /// or hostname the operator chose) must be STICKY and never clobbered
+    /// by a heartbeat's observed source. Both land in `listen_endpoint` as
+    /// opaque strings, so we can't tell them apart without this flag.
+    pub endpoint_is_reflexive: bool,
 }
 
 impl PeerEntry {
@@ -229,15 +241,16 @@ impl Coordinator {
     }
 
     /// Register (or re-register) a peer — escape-hatch convenience that
-    /// performs **no** join-token validation.
+    /// performs **no** join-token validation and supplies **no** observed
+    /// source address (so no reflexive-endpoint reflection).
     ///
-    /// Equivalent to [`Self::register_authenticated`] with no bearer token.
-    /// When a validator is configured this will fail with
-    /// [`CoordinatorError::Unauthorized`] (a token is required); when no
-    /// validator is configured it is the dev/E1 path that trusts the
+    /// Equivalent to [`Self::register_authenticated`] with no bearer token
+    /// and no observed addr. When a validator is configured this will fail
+    /// with [`CoordinatorError::Unauthorized`] (a token is required); when
+    /// no validator is configured it is the dev/E1 path that trusts the
     /// request-supplied `network` + `tags`. Production code goes through
-    /// the HTTP handler, which forwards the `Authorization` header to
-    /// [`Self::register_authenticated`].
+    /// the HTTP handler, which forwards the `Authorization` header AND the
+    /// observed source addr to [`Self::register_authenticated`].
     ///
     /// # Errors
     /// See [`CoordinatorError`].
@@ -245,7 +258,7 @@ impl Coordinator {
         &self,
         req: RegisterRequest,
     ) -> Result<(PeerEntry, RegisterOutcome), CoordinatorError> {
-        self.register_authenticated(req, None).await
+        self.register_authenticated(req, None, None).await
     }
 
     /// Register (or re-register) a peer, validating its join token first.
@@ -271,9 +284,21 @@ impl Coordinator {
     /// request DO overwrite the prior values; tags are re-stamped through
     /// the same authoritative seam.
     ///
-    /// Data flow on the first-time path: **validate → build event →
-    /// publish → apply event → broadcast.** Publish is best-effort
-    /// (logged on failure); strict-ordering is a future tightening.
+    /// `observed` is the source `SocketAddr` of the register HTTP request
+    /// (the peer's NAT public IP + an unrelated TCP port), read by the
+    /// handler from [`axum::extract::ConnectInfo`]. Combined with the
+    /// request's `wg_listen_port` it yields the peer's reflexive endpoint
+    /// (`<observed-public-ip>:<wg_listen_port>`) for cone-NAT traversal:
+    /// when the joiner self-reported a loopback / private address we store
+    /// the reflexive public endpoint instead so other peers can dial it.
+    /// See [`crate::nat::reflexive`]. `None` (e.g. tests without
+    /// connect-info) disables reflection and the self-reported endpoint is
+    /// used verbatim.
+    ///
+    /// Data flow on the first-time path: **validate → resolve reflexive
+    /// endpoint → build event → publish → apply event → broadcast.**
+    /// Publish is best-effort (logged on failure); strict-ordering is a
+    /// future tightening.
     ///
     /// # Errors
     /// See [`CoordinatorError`] — auth rejection, allocator exhaustion, and
@@ -282,6 +307,7 @@ impl Coordinator {
         &self,
         req: RegisterRequest,
         bearer: Option<&str>,
+        observed: Option<SocketAddr>,
     ) -> Result<(PeerEntry, RegisterOutcome), CoordinatorError> {
         // Authenticate FIRST, before touching the roster or allocator, so
         // a rejected join has zero side effects.
@@ -292,11 +318,21 @@ impl Coordinator {
             return Err(CoordinatorError::InvalidPubkey(pubkey.len()));
         }
 
+        // Resolve the endpoint other peers should dial: prefer the
+        // reflexive public endpoint over a self-reported loopback/private
+        // address (NAT traversal); keep a self-reported public endpoint or
+        // explicit hostname verbatim. The `reflexive` flag records which it
+        // was so the heartbeat path knows whether to roam it. Computed
+        // identically on the re-register path inside `refresh_existing`.
+        let resolved =
+            resolve_listen_endpoint(req.listen_endpoint.as_deref(), observed, req.wg_listen_port);
+
         // Re-registration path. Holding the by_pubkey shard lock while
         // we look up the peer_id is fine — the roster is keyed by
         // peer_id, so there's no inverse-lookup contention.
         if let Some(existing_id) = self.inner.by_pubkey.get(&pubkey).map(|v| *v) {
-            let entry = self.refresh_existing(existing_id, &req, claims.as_ref())?;
+            let entry =
+                self.refresh_existing(existing_id, &req, claims.as_ref(), &resolved, observed)?;
             self.inner
                 .broadcaster
                 .broadcast(PeerEvent::Updated(entry.to_info()));
@@ -317,7 +353,9 @@ impl Coordinator {
             peer_id: peer_id.to_string(),
             wg_public_key: pubkey,
             ula: ula.to_string(),
-            listen_endpoint: req.listen_endpoint.clone().unwrap_or_default(),
+            // The reflexive-resolved endpoint, not the raw self-report —
+            // this is what lands in the roster and is handed to peers.
+            listen_endpoint: resolved.endpoint.clone().unwrap_or_default(),
             display_name: req.display_name.clone(),
             network: identity.network,
             tags: identity.tags,
@@ -327,7 +365,19 @@ impl Coordinator {
         // changes; then apply the event to in-memory state from the same
         // data so both stay derived from one source.
         publish_event(self.inner.publisher.as_ref(), PEER_SEGMENT, &event).await;
-        let entry = self.apply_peer_joined(&event)?;
+        let mut entry = self.apply_peer_joined(&event)?;
+        // Record the reflexive flag + seed `observed_external` from the
+        // register request's source addr (so the hole-punch pairing path
+        // has a value before the first heartbeat). Done after apply so it
+        // mutates the stored entry.
+        entry.endpoint_is_reflexive = resolved.reflexive;
+        if let Some(obs) = observed {
+            entry.observed_external = obs.to_string();
+        }
+        if let Some(mut e) = self.inner.roster.get_mut(&peer_id) {
+            e.endpoint_is_reflexive = resolved.reflexive;
+            e.observed_external.clone_from(&entry.observed_external);
+        }
         info!(
             peer_id = %peer_id,
             peer_index,
@@ -392,6 +442,15 @@ impl Coordinator {
     /// `last_heartbeat`). Re-broadcasts `PeerInfo` so SSE subscribers
     /// see fresh listen-endpoint info.
     ///
+    /// `observed_external` is the source `SocketAddr` of the heartbeat
+    /// request (string form; empty when unavailable). `wg_listen_port` is
+    /// the peer's reported `WireGuard` UDP port. Together they refresh the
+    /// peer's reflexive endpoint: if the peer's observed public IP changed
+    /// (`NAT` rebind / roaming) the stored `listen_endpoint` is updated so
+    /// other peers re-learn the new dial target on their next roster sync.
+    /// A self-reported public endpoint is never clobbered (see
+    /// [`crate::nat::reflexive::resolve_listen_endpoint`]).
+    ///
     /// Stage 2 side-effect: after applying the heartbeat, scan the roster
     /// for every other peer with a known `observed_external` and emit a
     /// `HolePunchInitiate` pair (deduped per canonical (a,b) — see
@@ -404,6 +463,7 @@ impl Coordinator {
         &self,
         peer_id: Uuid,
         observed_external: String,
+        wg_listen_port: Option<u16>,
     ) -> Result<PeerEntry, CoordinatorError> {
         // Pre-check membership so we can surface UnknownPeer without
         // emitting a heartbeat event for a peer that doesn't exist.
@@ -417,6 +477,11 @@ impl Coordinator {
         };
         publish_event(self.inner.publisher.as_ref(), PEER_SEGMENT, &event).await;
         self.apply_peer_heartbeat(&event);
+        // Refresh the reflexive endpoint from this heartbeat's observed
+        // source addr. The peer's existing stored endpoint is fed back in
+        // as the "self-reported" input so a public / hostname endpoint is
+        // preserved and only a NAT-derived reflexive endpoint rolls over.
+        self.refresh_reflexive_endpoint(peer_id, &observed_external, wg_listen_port);
         // Re-read after apply so the snapshot reflects the new
         // last_heartbeat. If the entry vanished between contains_key and
         // here (concurrent deregister), bail with UnknownPeer.
@@ -432,6 +497,67 @@ impl Coordinator {
             .broadcast(PeerEvent::Updated(snapshot.to_info()));
         self.try_emit_holepunch_pairs(&snapshot).await;
         Ok(snapshot)
+    }
+
+    /// Refresh a peer's reflexive `listen_endpoint` from a fresh observed
+    /// source addr + reported WG port on a heartbeat.
+    ///
+    /// A heartbeat carries NO `listen_endpoint` self-report (the joiner
+    /// sends only its id + WG port), so this must NOT treat the stored
+    /// endpoint as a self-report. Instead it uses the stored
+    /// `endpoint_is_reflexive` flag to decide:
+    ///
+    /// * stored endpoint is **explicit** (an `--advertise-endpoint` public
+    ///   IP / hostname, `endpoint_is_reflexive == false` AND non-empty) →
+    ///   leave it untouched. Operator intent is sticky.
+    /// * stored endpoint is **reflexive** (or absent) → recompute from the
+    ///   observed public IP + WG port. This is what makes a reflexive
+    ///   endpoint ROAM when the peer's NAT public IP changes, and what
+    ///   lets a peer that started passive become reachable once a public
+    ///   source is seen.
+    ///
+    /// No-ops when the observed addr is empty / unparseable or the port is
+    /// unknown — exactly the back-compat / test paths.
+    fn refresh_reflexive_endpoint(
+        &self,
+        peer_id: Uuid,
+        observed_external: &str,
+        wg_listen_port: Option<u16>,
+    ) {
+        let Ok(observed) = observed_external.parse::<SocketAddr>() else {
+            return;
+        };
+        if let Some(mut e) = self.inner.roster.get_mut(&peer_id) {
+            // Never clobber an explicit, sticky self-reported endpoint —
+            // but ONLY when it is actually reachable (a public IP or a
+            // hostname). A non-reflexive *loopback / private* endpoint is a
+            // fallback, not an operator advertisement, so it stays eligible
+            // for reflexive rollover. This keeps the decision independent
+            // of whether the first register happened to carry connect-info.
+            let has_sticky_explicit = !e.endpoint_is_reflexive
+                && e.listen_endpoint
+                    .as_deref()
+                    .is_some_and(is_sticky_explicit_endpoint);
+            if has_sticky_explicit {
+                return;
+            }
+            // Recompute reflexive from the observed addr alone (no
+            // self-report on a heartbeat). `resolved.reflexive` will be
+            // true on a public observed IP, false when the observed IP is
+            // private (same-host) — in which case we leave the endpoint as
+            // it was rather than regress a prior reflexive value to None.
+            let resolved = resolve_listen_endpoint(None, Some(observed), wg_listen_port);
+            if resolved.reflexive && resolved.endpoint != e.listen_endpoint {
+                debug!(
+                    peer_id = %peer_id,
+                    old = ?e.listen_endpoint,
+                    new = ?resolved.endpoint,
+                    "heartbeat: reflexive endpoint rolled over",
+                );
+                e.listen_endpoint = resolved.endpoint;
+                e.endpoint_is_reflexive = true;
+            }
+        }
     }
 
     /// Stage 2 hook called after a heartbeat lands. Iterates over the
@@ -548,6 +674,8 @@ impl Coordinator {
         peer_id: Uuid,
         req: &RegisterRequest,
         claims: Option<&ValidatedClaims>,
+        resolved: &crate::nat::reflexive::ResolvedEndpoint,
+        observed: Option<SocketAddr>,
     ) -> Result<PeerEntry, CoordinatorError> {
         // Re-stamp identity through the same authoritative seam as
         // first-time register so a re-register can't be used to smuggle in
@@ -561,10 +689,17 @@ impl Coordinator {
                 .roster
                 .get_mut(&peer_id)
                 .ok_or(CoordinatorError::UnknownPeer(peer_id))?;
-            e.listen_endpoint.clone_from(&req.listen_endpoint);
+            // Store the reflexive-resolved endpoint, not the raw
+            // self-report — a re-register from behind NAT must refresh the
+            // peer's reachable endpoint, not regress it to a loopback guess.
+            e.listen_endpoint.clone_from(&resolved.endpoint);
+            e.endpoint_is_reflexive = resolved.reflexive;
             e.display_name.clone_from(&req.display_name);
             e.tags = identity.tags;
             e.last_heartbeat = Instant::now();
+            if let Some(obs) = observed {
+                e.observed_external = obs.to_string();
+            }
             e.clone()
         };
         info!(peer_id = %peer_id, "peer re-registered (idempotent)");
@@ -612,6 +747,7 @@ mod tests {
         RegisterRequest {
             wg_public_key: pubkey(seed),
             listen_endpoint: Some("127.0.0.1:51820".into()),
+            wg_listen_port: Some(51820),
             display_name: name.into(),
             network: String::new(),
             tags: vec!["dev-machine".into()],
@@ -656,14 +792,14 @@ mod tests {
         let c = coordinator();
         let (entry, _) = c.register(req(3, "carol")).await.expect("register");
         let updated = c
-            .heartbeat(entry.peer_id, "203.0.113.1:51820".into())
+            .heartbeat(entry.peer_id, "203.0.113.1:51820".into(), Some(51820))
             .await
             .expect("heartbeat");
         assert_eq!(updated.peer_id, entry.peer_id);
 
         let bogus = Uuid::now_v7();
         let err = c
-            .heartbeat(bogus, "ignored".into())
+            .heartbeat(bogus, "ignored".into(), None)
             .await
             .expect_err("unknown peer");
         assert!(matches!(err, CoordinatorError::UnknownPeer(_)));
@@ -703,6 +839,7 @@ mod tests {
             .register(RegisterRequest {
                 wg_public_key: too_short,
                 listen_endpoint: None,
+                wg_listen_port: None,
                 display_name: "short".into(),
                 network: String::new(),
                 tags: vec![],
@@ -802,7 +939,7 @@ mod tests {
         // First heartbeats — neither peer has been seen yet, so each
         // populates its own observed_external. After the first heartbeat
         // from each, both peers have non-empty external addrs.
-        c.heartbeat(alice.peer_id, "203.0.113.10:11111".into())
+        c.heartbeat(alice.peer_id, "203.0.113.10:11111".into(), None)
             .await
             .expect("a hb1");
         // Only alice has external so far — no holepunch event yet.
@@ -812,7 +949,7 @@ mod tests {
             "should not emit until both peers have observed_external"
         );
 
-        c.heartbeat(bob.peer_id, "198.51.100.20:22222".into())
+        c.heartbeat(bob.peer_id, "198.51.100.20:22222".into(), None)
             .await
             .expect("b hb1");
 
@@ -849,7 +986,7 @@ mod tests {
         assert_eq!(c.punch_tracker().len(), 1);
 
         // Another heartbeat from alice should NOT re-emit (dedup).
-        c.heartbeat(alice.peer_id, "203.0.113.10:11111".into())
+        c.heartbeat(alice.peer_id, "203.0.113.10:11111".into(), None)
             .await
             .expect("a hb2");
         assert_eq!(
@@ -868,7 +1005,7 @@ mod tests {
 
         // Alice heartbeats with a known external — bob never heartbeats,
         // so its observed_external stays empty.
-        c.heartbeat(alice.peer_id, "203.0.113.30:33333".into())
+        c.heartbeat(alice.peer_id, "203.0.113.30:33333".into(), None)
             .await
             .expect("a hb");
 
@@ -888,14 +1025,14 @@ mod tests {
         let (bob, _) = c.register(req(61, "bob")).await.expect("b");
 
         // Alice gets an external on heartbeat 1.
-        c.heartbeat(alice.peer_id, "203.0.113.50:44444".into())
+        c.heartbeat(alice.peer_id, "203.0.113.50:44444".into(), None)
             .await
             .expect("a hb");
 
         // Bob heartbeats but ConnectInfo wasn't captured — empty string.
         // This mirrors the test-router path that drives via Router::call
         // without the make_service wrapper.
-        c.heartbeat(bob.peer_id, String::new())
+        c.heartbeat(bob.peer_id, String::new(), None)
             .await
             .expect("b hb empty external");
 
@@ -904,6 +1041,177 @@ mod tests {
             0,
             "empty observed_external must not trigger an emit"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 2 — reflexive endpoint reflection (the NAT-traversal path).
+    //
+    // These drive `register_authenticated` / `heartbeat` with a synthetic
+    // PUBLIC observed `SocketAddr` (what the HTTP handler reads off
+    // `ConnectInfo` in production) and assert the coordinator STORES the
+    // reflexive `<observed-public-ip>:<wg-port>` endpoint, not the
+    // joiner's loopback self-report. The pure decision table is covered in
+    // `crate::nat::reflexive::tests`; this is the roster-integration wiring.
+    // -----------------------------------------------------------------
+
+    /// A joiner behind NAT self-reports `127.0.0.1:<port>` but the
+    /// coordinator observes a PUBLIC source IP. The stored
+    /// `listen_endpoint` must be the reflexive `<public-ip>:<wg-port>`.
+    #[tokio::test]
+    async fn register_stores_reflexive_endpoint_for_natted_peer() {
+        let c = coordinator();
+        // req() self-reports 127.0.0.1:51820 with wg_listen_port 51820.
+        let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
+        let (entry, outcome) = c
+            .register_authenticated(req(1, "natted"), None, Some(observed))
+            .await
+            .expect("register");
+        assert_eq!(outcome, RegisterOutcome::Created);
+        // Reflexive: observed public IP + REPORTED wg port (51820), NOT the
+        // HTTP source port 34812 and NOT the loopback self-report.
+        assert_eq!(entry.listen_endpoint.as_deref(), Some("203.0.113.7:51820"));
+        // The observed external (full sockaddr) is seeded for hole-punch.
+        assert_eq!(entry.observed_external, "203.0.113.7:34812");
+        // And the stored roster entry agrees.
+        let stored = c.snapshot();
+        assert_eq!(stored[0].listen_endpoint.as_deref(), Some("203.0.113.7:51820"));
+    }
+
+    /// An explicit `--advertise-endpoint` pointing at a PUBLIC address must
+    /// survive — reflexive discovery must not clobber an operator override.
+    #[tokio::test]
+    async fn register_preserves_public_self_report_over_reflexive() {
+        let c = coordinator();
+        let req = RegisterRequest {
+            wg_public_key: pubkey(2),
+            listen_endpoint: Some("198.51.100.50:51820".into()), // explicit public advert
+            wg_listen_port: Some(51820),
+            display_name: "advertised".into(),
+            network: String::new(),
+            tags: vec!["dev-machine".into()],
+        };
+        let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
+        let (entry, _) = c
+            .register_authenticated(req, None, Some(observed))
+            .await
+            .expect("register");
+        assert_eq!(
+            entry.listen_endpoint.as_deref(),
+            Some("198.51.100.50:51820"),
+            "explicit public advertise-endpoint must win over reflexive"
+        );
+    }
+
+    /// Same-host smoke test: coordinator observes a loopback / private
+    /// source (it's on the same machine), so there's nothing public to
+    /// advertise — the loopback self-report is kept verbatim. This is the
+    /// back-compat path that keeps local two-peer runs working.
+    #[tokio::test]
+    async fn register_keeps_loopback_when_observed_is_private() {
+        let c = coordinator();
+        let observed: SocketAddr = "127.0.0.1:55001".parse().expect("addr");
+        let (entry, _) = c
+            .register_authenticated(req(3, "local"), None, Some(observed))
+            .await
+            .expect("register");
+        assert_eq!(entry.listen_endpoint.as_deref(), Some("127.0.0.1:51820"));
+    }
+
+    /// A heartbeat from a NEW public IP (NAT rebind / roaming) rolls the
+    /// stored reflexive endpoint over to the new IP, keeping the WG port.
+    #[tokio::test]
+    async fn heartbeat_rolls_reflexive_endpoint_over_on_ip_change() {
+        let c = coordinator();
+        let observed1: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
+        let (entry, _) = c
+            .register_authenticated(req(4, "roamer"), None, Some(observed1))
+            .await
+            .expect("register");
+        assert_eq!(entry.listen_endpoint.as_deref(), Some("203.0.113.7:51820"));
+
+        // Heartbeat arrives from a different public IP — same WG port.
+        let updated = c
+            .heartbeat(entry.peer_id, "198.51.100.99:60000".into(), Some(51820))
+            .await
+            .expect("heartbeat");
+        assert_eq!(
+            updated.listen_endpoint.as_deref(),
+            Some("198.51.100.99:51820"),
+            "reflexive endpoint must follow the peer's new public IP"
+        );
+    }
+
+    /// A heartbeat must NOT clobber an explicit public advertise-endpoint:
+    /// the peer's stored public endpoint is fed back as the self-report and
+    /// preserved.
+    #[tokio::test]
+    async fn heartbeat_preserves_public_advertised_endpoint() {
+        let c = coordinator();
+        let req = RegisterRequest {
+            wg_public_key: pubkey(5),
+            listen_endpoint: Some("198.51.100.50:51820".into()),
+            wg_listen_port: Some(51820),
+            display_name: "advertised".into(),
+            network: String::new(),
+            tags: vec![],
+        };
+        let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
+        let (entry, _) = c
+            .register_authenticated(req, None, Some(observed))
+            .await
+            .expect("register");
+        // Heartbeat from a public IP that differs from the advertised one.
+        let updated = c
+            .heartbeat(entry.peer_id, "203.0.113.7:34900".into(), Some(51820))
+            .await
+            .expect("heartbeat");
+        assert_eq!(
+            updated.listen_endpoint.as_deref(),
+            Some("198.51.100.50:51820"),
+            "explicit public advert must survive heartbeats"
+        );
+    }
+
+    /// A peer whose stored endpoint is a non-reflexive LOOPBACK fallback
+    /// (e.g. registered before connect-info was available) must still be
+    /// able to roll over to a reflexive public endpoint on a heartbeat
+    /// that reveals a public source IP — loopback is a fallback, not a
+    /// sticky operator advertisement.
+    #[tokio::test]
+    async fn heartbeat_promotes_loopback_fallback_to_reflexive() {
+        let c = coordinator();
+        // Register with NO observed addr → loopback self-report kept,
+        // endpoint_is_reflexive == false.
+        let (entry, _) = c.register(req(8, "late")).await.expect("register");
+        assert_eq!(entry.listen_endpoint.as_deref(), Some("127.0.0.1:51820"));
+        assert!(!entry.endpoint_is_reflexive);
+        // Heartbeat from a public IP → must promote to reflexive.
+        let updated = c
+            .heartbeat(entry.peer_id, "203.0.113.7:34812".into(), Some(51820))
+            .await
+            .expect("heartbeat");
+        assert_eq!(updated.listen_endpoint.as_deref(), Some("203.0.113.7:51820"));
+        assert!(updated.endpoint_is_reflexive);
+    }
+
+    /// Re-register from behind NAT must refresh (not regress) the reflexive
+    /// endpoint: the idempotent re-register path stores the reflexive
+    /// endpoint, not the loopback self-report.
+    #[tokio::test]
+    async fn re_register_refreshes_reflexive_endpoint() {
+        let c = coordinator();
+        // First register with NO observed (e.g. early bring-up) → loopback.
+        let (first, _) = c.register(req(6, "peer")).await.expect("first");
+        assert_eq!(first.listen_endpoint.as_deref(), Some("127.0.0.1:51820"));
+        // Re-register (same pubkey) WITH a public observed addr → reflexive.
+        let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
+        let (second, outcome) = c
+            .register_authenticated(req(6, "peer"), None, Some(observed))
+            .await
+            .expect("re-register");
+        assert_eq!(outcome, RegisterOutcome::Existed);
+        assert_eq!(first.peer_id, second.peer_id);
+        assert_eq!(second.listen_endpoint.as_deref(), Some("203.0.113.7:51820"));
     }
 }
 
@@ -939,6 +1247,7 @@ mod jwt_tests {
         RegisterRequest {
             wg_public_key: pubkey(seed),
             listen_endpoint: Some("127.0.0.1:51820".into()),
+            wg_listen_port: Some(51820),
             display_name: "node".into(),
             network: network.into(),
             tags: tags.iter().map(|s| (*s).to_owned()).collect(),
@@ -991,7 +1300,7 @@ mod jwt_tests {
         // Request asserts a DIFFERENT network/tags than the claims.
         let req = req_with(1, "request-network", &["tag:request-supplied"]);
         let (entry, outcome) = c
-            .register_authenticated(req, Some("good-token"))
+            .register_authenticated(req, Some("good-token"), None)
             .await
             .expect("admit");
         assert_eq!(outcome, RegisterOutcome::Created);
@@ -1026,7 +1335,7 @@ mod jwt_tests {
         // Malicious request: claim bob's network + an admin tag.
         let spoof = req_with(2, "bob", &["tag:user-bob", "tag:admin"]);
         let (entry, _) = c
-            .register_authenticated(spoof, Some("good-token"))
+            .register_authenticated(spoof, Some("good-token"), None)
             .await
             .expect("admit");
         assert_eq!(entry.network, "alice");
@@ -1064,7 +1373,7 @@ mod jwt_tests {
         let c = coordinator_with_validator(AuthValidator::new(server.uri()).unwrap());
 
         let err = c
-            .register_authenticated(req_with(3, "alice", &[]), Some("revoked-token"))
+            .register_authenticated(req_with(3, "alice", &[]), Some("revoked-token"), None)
             .await
             .expect_err("must reject");
         assert!(matches!(err, CoordinatorError::Unauthorized(_)), "{err:?}");
@@ -1081,7 +1390,7 @@ mod jwt_tests {
         let c = coordinator_with_validator(AuthValidator::new(server.uri()).unwrap());
 
         let err = c
-            .register_authenticated(req_with(4, "alice", &[]), None)
+            .register_authenticated(req_with(4, "alice", &[]), None, None)
             .await
             .expect_err("must reject");
         assert!(matches!(err, CoordinatorError::Unauthorized(_)), "{err:?}");
@@ -1094,7 +1403,7 @@ mod jwt_tests {
         // Port 1 refuses; nothing is listening.
         let c = coordinator_with_validator(AuthValidator::new("http://127.0.0.1:1").unwrap());
         let err = c
-            .register_authenticated(req_with(5, "alice", &[]), Some("token"))
+            .register_authenticated(req_with(5, "alice", &[]), Some("token"), None)
             .await
             .expect_err("must fail closed");
         assert!(matches!(err, CoordinatorError::Unauthorized(_)), "{err:?}");
@@ -1112,7 +1421,7 @@ mod jwt_tests {
             None,
         );
         let (entry, _) = c
-            .register_authenticated(req_with(6, "alice", &["tag:user-alice"]), None)
+            .register_authenticated(req_with(6, "alice", &["tag:user-alice"]), None, None)
             .await
             .expect("admit (escape hatch)");
         assert_eq!(entry.network, "alice");
@@ -1139,13 +1448,13 @@ mod jwt_tests {
         let c = coordinator_with_validator(AuthValidator::new(server.uri()).unwrap());
 
         let (first, o1) = c
-            .register_authenticated(req_with(7, "x", &["tag:request"]), Some("token"))
+            .register_authenticated(req_with(7, "x", &["tag:request"]), Some("token"), None)
             .await
             .expect("first");
         assert_eq!(o1, RegisterOutcome::Created);
         // Second register, same pubkey, tries to assert admin again.
         let (second, o2) = c
-            .register_authenticated(req_with(7, "x", &["tag:admin"]), Some("token"))
+            .register_authenticated(req_with(7, "x", &["tag:admin"]), Some("token"), None)
             .await
             .expect("re-register");
         assert_eq!(o2, RegisterOutcome::Existed);

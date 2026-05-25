@@ -115,6 +115,7 @@ mod tests {
         RegisterRequest {
             wg_public_key: pubkey(seed),
             listen_endpoint: Some("127.0.0.1:51820".into()),
+            wg_listen_port: Some(51820),
             display_name: name.into(),
             network: network.into(),
             tags: tags.iter().map(|s| (*s).to_owned()).collect(),

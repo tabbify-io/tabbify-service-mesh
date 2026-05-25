@@ -29,6 +29,16 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+/// Default `WireGuard` UDP listen port used when
+/// [`JoinConfig::listen_port`] is `None` — the well-known `WireGuard` port.
+///
+/// A stable, predictable port is what makes reflexive endpoint discovery
+/// viable across a cone `NAT`: the coordinator advertises
+/// `<observed-public-ip>:<this-port>` and a port-preserving `NAT` maps the
+/// same port externally. Override with `--listen-port` when 51820 is
+/// unavailable or already port-forwarded to a different external port.
+pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
+
 /// Handle to a running joiner.
 ///
 /// Drop = abrupt shutdown (background tasks abort, TUN device closes,
@@ -81,56 +91,51 @@ impl Joiner {
             "joiner: starting registration"
         );
 
-        // 1) Open the UDP socket. listen_port = None -> let the OS
-        //    pick. We bind to v4 wildcard because the overlay rides on
-        //    top of v4 transport, exactly like the existing
-        //    WireGuardFabric.
-        let listen_addr =
-            SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), config.listen_port.unwrap_or(0));
-        let socket = UdpSocket::bind(listen_addr)
-            .await
-            .map_err(|source| JoinerError::UdpBind { addr: listen_addr, source })?;
+        // 1) Open the UDP socket. We bind to v4 wildcard because the
+        //    overlay rides on top of v4 transport, exactly like the
+        //    existing WireGuardFabric.
+        //
+        //    Port selection: default to the well-known WireGuard port
+        //    51820 when `--listen-port` is unset, rather than letting the
+        //    OS pick an ephemeral port. A STABLE, PREDICTABLE port is what
+        //    makes reflexive endpoint discovery work: the coordinator
+        //    advertises `<observed-public-ip>:<this-port>` to other peers,
+        //    and a port-preserving (cone) NAT maps that same port
+        //    externally. An OS-picked ephemeral port still works for
+        //    same-host loopback but is a poor advertisement across NAT.
+        //    If 51820 is busy (e.g. two peers on one host in a smoke
+        //    test) we fall back to an OS-picked port so the bind still
+        //    succeeds.
+        let preferred_port = config.listen_port.unwrap_or(DEFAULT_WG_LISTEN_PORT);
+        let socket = bind_udp_with_fallback(preferred_port).await?;
         let bound = socket
             .local_addr()
             .map_err(|e| JoinerError::HttpTransport(format!("udp local_addr: {e}")))?;
+        let wg_listen_port = bound.port();
         let socket = Arc::new(socket);
-        tracing::info!(local = %bound, "joiner: udp socket bound");
+        tracing::info!(local = %bound, wg_listen_port, "joiner: udp socket bound");
 
-        // 2) Register with the coordinator. We hand it our public key
-        //    and our locally-known endpoint — the coordinator may
-        //    rewrite the endpoint based on what it actually saw on the
-        //    request socket, but we don't model NAT-rewrite this stage.
+        // 2) Register with the coordinator.
         //
-        // Endpoint rewrite priority:
-        //   1. Caller-supplied `advertise_endpoint` wins — it's the
-        //      operator's explicit "this is the address other peers
-        //      should dial me on" (used for cross-NAT / port-forwarded
-        //      topologies like Mac+Lima where each side sees the other
-        //      via a different address).
-        //   2. Bound to 0.0.0.0 → no usable host portion to advertise;
-        //      substitute 127.0.0.1 + bound port so same-host smoke
-        //      tests work out of the box.
-        //   3. Otherwise the bound socket addr is a fine advertisement.
-        // Real NAT-traversal (Stage 2) will eventually replace step 1
-        // with coordinator-driven hole punching.
-        // The `advertised` string is metadata for *other* peers — they
-        // resolve it themselves when they go to dial us. We must NOT
-        // try to resolve it locally: a Mac peer that advertises
-        // `host.lima.internal:51820` for the benefit of a Lima
-        // counterpart can't resolve that name on its own DNS resolver.
-        // Keep it as a free-form string and let the dial-time path
-        // (`coordinator_client::remote_to_info` → `wg_session::upsert`)
-        // do the lookup in the consumer's own environment.
-        // `option_if_let_else` would force a nested closure that's
-        // strictly less readable than this three-arm cascade — skip.
-        #[allow(clippy::option_if_let_else)]
-        let advertised: String = if let Some(advert) = &config.advertise_endpoint {
-            advert.clone()
-        } else if bound.ip().is_unspecified() {
-            format!("127.0.0.1:{}", bound.port())
-        } else {
-            bound.to_string()
-        };
+        // Endpoint discovery (Stage 2 — cone NAT):
+        //   * If the operator passed an explicit `--advertise-endpoint`,
+        //     send it verbatim — it's their authoritative "dial me here"
+        //     (port-forward / cross-VM name like `host.lima.internal`).
+        //     It takes precedence over reflexive discovery.
+        //   * OTHERWISE send NO `listen_endpoint` and let the coordinator
+        //     synthesize our reflexive endpoint from the source IP it
+        //     observes + the `wg_listen_port` we report. We deliberately
+        //     no longer auto-advertise a loopback / LAN bind address: it
+        //     is unreachable for off-host peers and was the source of the
+        //     `127.0.0.1:<port>` bug. Same-host smoke tests still work
+        //     because the coordinator keeps a loopback observed-IP as-is
+        //     and falls back to no endpoint → passive, while the WG
+        //     roaming path learns the real source on first contact.
+        // The advertised string (when present) is metadata for *other*
+        // peers — they resolve it in their own environment at dial time
+        // (`coordinator::client::remote_to_info`), so we must NOT resolve
+        // it locally.
+        let advertised: Option<String> = config.advertise_endpoint.clone();
         let client = Arc::new(CoordinatorClient::new(
             config.coordinator_url.clone(),
             config.tls_cert.as_deref(),
@@ -141,7 +146,8 @@ impl Joiner {
         let resp = client
             .register(
                 keypair.public.as_bytes(),
-                Some(advertised),
+                advertised,
+                Some(wg_listen_port),
                 &config.display_name,
                 &config.tags,
                 config.join_token.as_deref(),
@@ -151,7 +157,14 @@ impl Joiner {
         let my_ula: Ipv6Addr = resp.ula.parse().map_err(|e| {
             JoinerError::MalformedPeer(format!("coordinator returned bad ula {:?}: {e}", resp.ula))
         })?;
-        tracing::info!(%peer_id, %my_ula, peers = resp.peers.len(), "joiner: registered");
+        tracing::info!(
+            %peer_id,
+            %my_ula,
+            peers = resp.peers.len(),
+            observed_ip = ?resp.observed_ip,
+            observed_endpoint = ?resp.observed_endpoint,
+            "joiner: registered (reflexive endpoint from coordinator)"
+        );
 
         // 3) Open + configure the TUN device. The fabric crate already
         //    has a polished cross-platform open() that returns
@@ -206,6 +219,7 @@ impl Joiner {
             our_private: keypair.private,
             peer_id,
             my_ula,
+            wg_listen_port,
             heartbeat_interval: config.heartbeat_interval,
             shutdown_rx,
         });
@@ -304,6 +318,10 @@ struct SpawnContext {
     our_private: x25519_dalek::StaticSecret,
     peer_id: Uuid,
     my_ula: Ipv6Addr,
+    /// Our `WireGuard` UDP listen port — re-sent on every heartbeat so the
+    /// coordinator can refresh our reflexive endpoint on an observed-IP
+    /// change.
+    wg_listen_port: u16,
     heartbeat_interval: Duration,
     shutdown_rx: watch::Receiver<bool>,
 }
@@ -319,6 +337,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         our_private,
         peer_id,
         my_ula,
+        wg_listen_port,
         heartbeat_interval,
         shutdown_rx,
     } = ctx;
@@ -371,6 +390,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
                 sessions,
                 our_private,
                 peer_id,
+                wg_listen_port,
                 heartbeat_interval,
                 shutdown_rx,
             )
@@ -388,6 +408,35 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
     }));
 
     tasks
+}
+
+/// Bind the `WireGuard` UDP socket on the v4 wildcard, preferring
+/// `preferred_port`. If that port is already in use (e.g. a second peer on
+/// the same host during a smoke test, or a stale process), fall back to an
+/// OS-picked ephemeral port (`:0`) so the bind still succeeds.
+///
+/// The preferred (stable) port is what makes reflexive discovery work
+/// across a cone NAT; the ephemeral fallback keeps multi-peer same-host
+/// runs working at the cost of a less predictable advertised port — fine
+/// because same-host peers reach each other via loopback / WG roaming, not
+/// via the coordinator-advertised reflexive endpoint.
+async fn bind_udp_with_fallback(preferred_port: u16) -> Result<UdpSocket, JoinerError> {
+    let preferred = SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), preferred_port);
+    match UdpSocket::bind(preferred).await {
+        Ok(sock) => Ok(sock),
+        Err(e) if preferred_port != 0 => {
+            tracing::warn!(
+                port = preferred_port,
+                error = %e,
+                "joiner: preferred WG port unavailable, falling back to OS-picked port"
+            );
+            let ephemeral = SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0);
+            UdpSocket::bind(ephemeral)
+                .await
+                .map_err(|source| JoinerError::UdpBind { addr: ephemeral, source })
+        }
+        Err(source) => Err(JoinerError::UdpBind { addr: preferred, source }),
+    }
 }
 
 /// Default location for the persistent keypair file. Used when the

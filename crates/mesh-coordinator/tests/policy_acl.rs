@@ -139,11 +139,22 @@ async fn sse_stream_is_acl_filtered_per_viewer() {
         .expect("stream");
     assert_eq!(resp.status(), 200);
 
-    let buf = read_sse_until(&mut resp, |b| b.contains("svc1") && b.contains("a2"), 2).await;
-    assert!(buf.contains("a2"), "a1 stream must include a2: {buf}");
-    assert!(buf.contains("svc1"), "a1 stream must include svc: {buf}");
-    assert!(!buf.contains("b1"), "a1 stream must NOT include b1: {buf}");
-    assert!(!buf.contains("\"display_name\":\"a1\""), "a1 not in own stream");
+    // Match on the precise `"display_name":"<name>"` token rather than a
+    // bare substring: a bare `"b1"` (etc.) can collide with the random hex
+    // of a peer_id UUID v7 in the payload, which made this assertion
+    // intermittently false-positive. Keying on the display_name field is
+    // exact and stable.
+    let has_name = |b: &str, n: &str| b.contains(&format!("\"display_name\":\"{n}\""));
+    let buf = read_sse_until(
+        &mut resp,
+        |b| has_name(b, "svc1") && has_name(b, "a2"),
+        2,
+    )
+    .await;
+    assert!(has_name(&buf, "a2"), "a1 stream must include a2: {buf}");
+    assert!(has_name(&buf, "svc1"), "a1 stream must include svc: {buf}");
+    assert!(!has_name(&buf, "b1"), "a1 stream must NOT include b1: {buf}");
+    assert!(!has_name(&buf, "a1"), "a1 not in own stream");
 }
 
 #[tokio::test]

@@ -59,6 +59,14 @@ pub struct RegisterRequest {
     /// Optional `WireGuard` listen socket — empty for NAT-bound peers.
     #[serde(default)]
     pub listen_endpoint: Option<String>,
+    /// UDP port the joiner's `WireGuard` socket is bound to. Sent so the
+    /// coordinator can synthesize the peer's reflexive endpoint as
+    /// `<observed-public-ip>:<wg_listen_port>` for cone-NAT traversal
+    /// (the HTTP source port is a TCP port, unrelated to the WG UDP port).
+    /// `#[serde(default)]` keeps the wire format back-compatible: an older
+    /// joiner that omits it falls back to its self-reported endpoint.
+    #[serde(default)]
+    pub wg_listen_port: Option<u16>,
     /// Human-readable nickname.
     pub display_name: String,
     /// Network to join — selects the peer's ULA block (spec §6). Empty
@@ -83,6 +91,19 @@ pub struct RegisterResponse {
     pub ula: String,
     /// Snapshot of the full roster, including the newly-registered peer.
     pub peers: Vec<PeerInfo>,
+    /// The peer's own observed external IP (the source IP the coordinator
+    /// saw the register request arrive from — its NAT's public IP). `None`
+    /// when the source addr was unavailable (tests without connect-info).
+    /// The joiner can log this and/or compare it against its self-detected
+    /// address to know whether it is behind NAT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_ip: Option<String>,
+    /// The reflexive endpoint the coordinator stored for this peer (what
+    /// other peers will dial), i.e. `<observed-ip>:<wg_listen_port>` when
+    /// behind NAT, or the self-reported endpoint when already public.
+    /// `None` for a fully-passive peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_endpoint: Option<String>,
 }
 
 /// Body of `POST /v1/mesh/heartbeat`.
@@ -90,6 +111,13 @@ pub struct RegisterResponse {
 pub struct HeartbeatRequest {
     /// Peer id originally returned by `register`.
     pub peer_id: String,
+    /// UDP port the joiner's `WireGuard` socket is bound to — same role as
+    /// on [`RegisterRequest`]. Re-sent on every heartbeat so the
+    /// coordinator can refresh the reflexive endpoint if the peer's
+    /// observed public IP changes (e.g. NAT rebind / roaming).
+    /// `#[serde(default)]` for back-compat with older joiners.
+    #[serde(default)]
+    pub wg_listen_port: Option<u16>,
 }
 
 /// Body of `POST /v1/mesh/heartbeat` response.
@@ -97,6 +125,14 @@ pub struct HeartbeatRequest {
 pub struct HeartbeatResponse {
     /// Snapshot of the current roster.
     pub peers: Vec<PeerInfo>,
+    /// The peer's own observed external IP on this heartbeat. Same
+    /// semantics as [`RegisterResponse::observed_ip`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_ip: Option<String>,
+    /// The reflexive endpoint currently stored for this peer. Same
+    /// semantics as [`RegisterResponse::observed_endpoint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_endpoint: Option<String>,
 }
 
 /// Body of `POST /v1/mesh/deregister`.
@@ -200,6 +236,7 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
 
 async fn register_handler(
     State(coordinator): State<Coordinator>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Response {
@@ -208,8 +245,14 @@ async fn register_handler(
     // validated, and the node's network/tags come from the claims
     // (authoritative); when not, it is ignored (dev/E1 escape hatch).
     let bearer = bearer_token(&headers);
+    // The source socket addr is the peer's NAT public IP (+ an unrelated
+    // TCP port). The coordinator pairs the IP with the request's reported
+    // `wg_listen_port` to synthesize a reflexive endpoint for cone-NAT
+    // traversal. `None` in tests driving the router without the
+    // make-service wrapper — reflection is then skipped.
+    let observed = connect_info.as_ref().map(|c| c.0);
     match coordinator
-        .register_authenticated(req, bearer.as_deref())
+        .register_authenticated(req, bearer.as_deref(), observed)
         .await
     {
         Ok((entry, _outcome)) => {
@@ -221,6 +264,10 @@ async fn register_handler(
                 peer_id: entry.peer_id.to_string(),
                 ula: entry.ula.to_string(),
                 peers: coordinator.visible_peers(entry.peer_id, &entry.tags),
+                // Echo the peer its own observed external IP + the
+                // reflexive endpoint we stored (what others will dial).
+                observed_ip: observed.map(|o| o.ip().to_string()),
+                observed_endpoint: entry.listen_endpoint.clone(),
             };
             (StatusCode::OK, Json(body)).into_response()
         }
@@ -244,16 +291,23 @@ async fn heartbeat_handler(
     // without the make-service wrapper. Recording an empty string in that
     // case keeps the publish path lossless for production while not
     // forcing test plumbing to fake a SocketAddr.
-    let observed = connect_info
-        .as_ref()
-        .map(|c| c.0.to_string())
+    let observed_addr = connect_info.as_ref().map(|c| c.0);
+    let observed = observed_addr
+        .map(|a| a.to_string())
         .unwrap_or_default();
-    match coordinator.heartbeat(peer_id, observed).await {
+    match coordinator
+        .heartbeat(peer_id, observed, req.wg_listen_port)
+        .await
+    {
         Ok(entry) => {
             // Filter the self-heal roster the same way as register: a peer
             // only re-learns the peers it is policy-permitted to reach.
             let body = HeartbeatResponse {
                 peers: coordinator.visible_peers(entry.peer_id, &entry.tags),
+                // Echo the peer its own observed external IP + the
+                // (possibly refreshed) reflexive endpoint we now store.
+                observed_ip: observed_addr.map(|a| a.ip().to_string()),
+                observed_endpoint: entry.listen_endpoint.clone(),
             };
             (StatusCode::OK, Json(body)).into_response()
         }

@@ -35,6 +35,16 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+/// `WireGuard` persistent-keepalive interval (seconds), applied to EVERY
+/// peer session.
+///
+/// Crucial for `NAT` traversal: a keepalive every 25s keeps the `NAT`'s
+/// UDP mapping for our `WireGuard` socket open even when no data flows, so
+/// the reflexive endpoint other peers dial stays valid and `boringtun`'s
+/// endpoint roaming has live traffic to latch onto. 25s is the canonical
+/// `WireGuard` default and matches `mesh-fabric::wireguard`.
+pub const WG_PERSISTENT_KEEPALIVE_SECS: u16 = 25;
+
 /// Sink that mirrors a peer's allowed `/128`s into the kernel routing
 /// table (spec §5.5 — per-peer allowed-ips, TX direction).
 ///
@@ -269,10 +279,10 @@ impl SessionTable {
         let tunn = Tunn::new(
             our_private.clone(),
             peer_pubkey,
-            None,        // no preshared key in MVP
-            Some(25),    // 25s persistent keepalive (matches mesh-fabric)
+            None,                                 // no preshared key in MVP
+            Some(WG_PERSISTENT_KEEPALIVE_SECS),   // keep NAT mapping open
             index,
-            None,        // default rate limiter
+            None,                                 // default rate limiter
         );
 
         let session = Arc::new(PeerSession {
@@ -576,5 +586,66 @@ mod tests {
         let p = info(1, "fd5a:1f00:1::1", Some("127.0.0.1:51820"));
         t.upsert(&me, &p);
         assert!(t.remove(p.ula));
+    }
+
+    // ---- NAT traversal: persistent keepalive + endpoint roaming ----
+
+    // The persistent-keepalive constant must stay at the WireGuard
+    // canonical 25s — the value that keeps NAT UDP mappings open. A
+    // regression here silently breaks cone-NAT traversal (mappings expire
+    // between sparse data packets), so pin it.
+    #[test]
+    fn persistent_keepalive_is_25s() {
+        assert_eq!(WG_PERSISTENT_KEEPALIVE_SECS, 25);
+    }
+
+    // Endpoint roaming, passive-peer case: a peer that registered with NO
+    // endpoint (passive / behind NAT) adopts the source address of the
+    // first datagram we successfully decapsulate from it as its outbound
+    // endpoint. This is what lets us reply to a peer that punched out to
+    // us first.
+    #[test]
+    fn learn_endpoint_promotes_source_for_passive_peer() {
+        let t = SessionTable::new();
+        let me = StaticSecret::from([42u8; 32]);
+        let p = info(1, "fd5a:1f00:1::1", None); // passive — no endpoint
+        t.upsert(&me, &p);
+        let session = t.by_ula(p.ula).expect("session");
+        assert!(session.endpoint().is_none(), "starts passive");
+
+        let learned: SocketAddr = "203.0.113.9:51820".parse().unwrap();
+        t.learn_endpoint(&session, learned);
+        // Promoted as the outbound default AND indexed for inbound demux.
+        assert_eq!(session.endpoint(), Some(learned));
+        assert!(t.by_endpoint(learned).is_some());
+    }
+
+    // Endpoint roaming, active-peer case: a peer that already has a stable
+    // advertised endpoint (e.g. its reflexive endpoint from the
+    // coordinator) keeps that endpoint as the OUTBOUND default even after
+    // we observe inbound from a different source port — but the new source
+    // IS indexed for inbound demux + response targeting. This matches
+    // WireGuard semantics: new outbound traffic uses the advertised
+    // endpoint, while the ephemeral inbound source keeps the existing flow
+    // alive.
+    #[test]
+    fn learn_endpoint_indexes_but_keeps_advertised_default_for_active_peer() {
+        let t = SessionTable::new();
+        let me = StaticSecret::from([42u8; 32]);
+        let advertised = "203.0.113.9:51820";
+        let p = info(1, "fd5a:1f00:1::1", Some(advertised));
+        t.upsert(&me, &p);
+        let session = t.by_ula(p.ula).expect("session");
+
+        let inbound_src: SocketAddr = "203.0.113.9:40000".parse().unwrap(); // different port
+        t.learn_endpoint(&session, inbound_src);
+        // Outbound default unchanged (still the advertised endpoint).
+        assert_eq!(
+            session.endpoint(),
+            Some(advertised.parse().unwrap()),
+            "advertised endpoint must remain the outbound default"
+        );
+        // But the new source is indexed so inbound from it routes here.
+        assert!(t.by_endpoint(inbound_src).is_some());
     }
 }

@@ -57,6 +57,15 @@ impl Coordinator {
             // populates this. Empty string means "unknown" — the Stage 2
             // hole-punch logic checks `is_empty()` to skip.
             observed_external: String::new(),
+            // Conservative default: the apply layer derives state purely
+            // from the `PeerJoined` event, which doesn't carry the
+            // reflexive discriminator. `register_authenticated` overwrites
+            // this with the true value immediately after apply; a hostname
+            // / public endpoint loaded by a future durable replayer is
+            // therefore treated as sticky (the safe choice — it just
+            // means a replayed endpoint won't auto-roam until the next
+            // live register).
+            endpoint_is_reflexive: false,
         };
         self.inner.roster.insert(peer_id, entry.clone());
         self.inner
@@ -181,6 +190,7 @@ mod tests {
                 [42_u8; 32],
             ),
             listen_endpoint: None,
+            wg_listen_port: None,
             display_name: "fresh".into(),
             network: "net7".into(),
             tags: vec![],

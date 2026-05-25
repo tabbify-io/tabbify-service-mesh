@@ -62,7 +62,13 @@ pub struct JoinArgs {
     #[arg(long, env = "MESH_JOIN_TOKEN")]
     pub join_token: Option<String>,
 
-    /// Optional fixed `WireGuard` listen port.
+    /// Fixed `WireGuard` UDP listen port. Defaults to 51820 (the
+    /// well-known `WireGuard` port) when unset — a STABLE, PREDICTABLE port
+    /// is what makes automatic reflexive endpoint discovery work across a
+    /// cone `NAT` (the coordinator advertises `<your-public-ip>:<this-port>`
+    /// to peers, and a port-preserving `NAT` maps the same port). If 51820
+    /// is already in use the joiner falls back to an OS-picked port. Set
+    /// this explicitly only when you port-forward a specific UDP port.
     #[arg(long)]
     pub listen_port: Option<u16>,
 
@@ -74,13 +80,19 @@ pub struct JoinArgs {
     #[arg(long, default_value_t = 20)]
     pub heartbeat_interval: u64,
 
-    /// Public/reachable endpoint to advertise to other peers via the
-    /// coordinator. Overrides the auto-detected bound address. Use this
-    /// when the joiner is behind a NAT / port-forward and the address
-    /// other peers must dial differs from what `bind` returns. Example:
-    /// `--advertise-endpoint host.lima.internal:51820` from a Mac peer
-    /// so a Lima peer can reach it; `--advertise-endpoint 127.0.0.1:51821`
-    /// from a Lima peer if Lima forwards its `:51820` to Mac's `:51821`.
+    /// Explicit public/reachable endpoint to advertise to other peers,
+    /// OVERRIDING automatic reflexive discovery.
+    ///
+    /// Normally you do NOT need this: the coordinator derives your
+    /// reachable endpoint from the source IP it observes plus your
+    /// `--listen-port`, which works for public hosts and common (cone /
+    /// port-preserving) `NAT`s with zero configuration. Set it only for a
+    /// manual port-forward to a NON-matching external port (e.g. external
+    /// `:51999` to internal `:51820`), for a name-based advertisement (e.g.
+    /// `--advertise-endpoint host.lima.internal:51820` for a Lima guest
+    /// reaching its macOS host), or for a symmetric / port-randomizing
+    /// `NAT` that reflexive discovery cannot solve (which otherwise needs a
+    /// relay — see the Stage-3 follow-up).
     #[arg(long)]
     pub advertise_endpoint: Option<String>,
 

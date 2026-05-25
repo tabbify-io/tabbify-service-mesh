@@ -31,8 +31,18 @@ use uuid::Uuid;
 pub struct RegisterRequest {
     /// 32-byte X25519 public key, base64-encoded.
     pub wg_public_key: String,
-    /// Locally-known UDP listen address, if any.
+    /// Locally-known UDP listen address, if any. With reflexive endpoint
+    /// discovery this is usually `None` — the joiner lets the coordinator
+    /// derive the reachable endpoint from the observed source IP + the
+    /// `wg_listen_port` below. Set only when the operator passed an
+    /// explicit `--advertise-endpoint` override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_endpoint: Option<String>,
+    /// UDP port our `WireGuard` socket is bound to. Sent so the coordinator
+    /// can synthesize our reflexive endpoint (`<observed-ip>:<port>`) for
+    /// cone-NAT traversal without a manual `--advertise-endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_listen_port: Option<u16>,
     /// Human-readable display name.
     pub display_name: String,
     /// Role tags ("dev-machine", "wasm-host", ...).
@@ -48,6 +58,16 @@ pub struct RegisterResponse {
     pub ula: String,
     /// Initial roster (excluding the joiner itself).
     pub peers: Vec<RemotePeer>,
+    /// Our own observed external IP, as the coordinator saw the register
+    /// request arrive (our NAT's public IP). `None` from an older
+    /// coordinator that doesn't reflect it. Informational — lets the
+    /// joiner log whether it is behind NAT.
+    #[serde(default)]
+    pub observed_ip: Option<String>,
+    /// The reflexive endpoint the coordinator stored for us (what other
+    /// peers will dial). `None` from an older coordinator.
+    #[serde(default)]
+    pub observed_endpoint: Option<String>,
 }
 
 /// Body of `POST /v1/mesh/heartbeat`.
@@ -55,6 +75,11 @@ pub struct RegisterResponse {
 pub struct HeartbeatRequest {
     /// The peer id this joiner was assigned at registration time.
     pub peer_id: Uuid,
+    /// Our `WireGuard` UDP listen port — re-sent on every heartbeat so the
+    /// coordinator can refresh our reflexive endpoint if our observed
+    /// public IP changes (NAT rebind / roaming).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_listen_port: Option<u16>,
 }
 
 /// Body of the heartbeat response. The coordinator returns the current
@@ -63,6 +88,14 @@ pub struct HeartbeatRequest {
 pub struct HeartbeatResponse {
     /// Current full roster (excluding this peer).
     pub peers: Vec<RemotePeer>,
+    /// Our own observed external IP on this heartbeat. `None` from an
+    /// older coordinator.
+    #[serde(default)]
+    pub observed_ip: Option<String>,
+    /// The reflexive endpoint currently stored for us. `None` from an
+    /// older coordinator.
+    #[serde(default)]
+    pub observed_endpoint: Option<String>,
 }
 
 /// Body of `POST /v1/mesh/deregister`.
@@ -187,6 +220,7 @@ impl CoordinatorClient {
         &self,
         wg_public_key: &[u8; 32],
         listen_endpoint: Option<String>,
+        wg_listen_port: Option<u16>,
         display_name: &str,
         tags: &[String],
         join_token: Option<&str>,
@@ -194,6 +228,7 @@ impl CoordinatorClient {
         let body = RegisterRequest {
             wg_public_key: B64.encode(wg_public_key),
             listen_endpoint,
+            wg_listen_port,
             display_name: display_name.to_owned(),
             tags: tags.to_vec(),
         };
@@ -215,9 +250,20 @@ impl CoordinatorClient {
 
     /// `POST /v1/mesh/heartbeat` — keepalive that also refreshes the
     /// caller's view of the roster.
-    pub async fn heartbeat(&self, peer_id: Uuid) -> Result<HeartbeatResponse> {
+    ///
+    /// `wg_listen_port` is our `WireGuard` UDP port, re-sent so the
+    /// coordinator can refresh our reflexive endpoint on an observed-IP
+    /// change.
+    pub async fn heartbeat(
+        &self,
+        peer_id: Uuid,
+        wg_listen_port: Option<u16>,
+    ) -> Result<HeartbeatResponse> {
         let url = format!("{}/v1/mesh/heartbeat", self.base_url);
-        let body = HeartbeatRequest { peer_id };
+        let body = HeartbeatRequest {
+            peer_id,
+            wg_listen_port,
+        };
         let resp = self
             .http
             .post(&url)
@@ -556,6 +602,7 @@ mod tests {
             .register(
                 &pubkey,
                 Some("127.0.0.1:51820".parse().unwrap()),
+                Some(51820),
                 "alice",
                 &["dev-machine".to_owned()],
                 None,
@@ -593,10 +640,120 @@ mod tests {
 
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         let resp = client
-            .register(&[0xAAu8; 32], None, "alice", &[], Some("my-join-jwt"))
+            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], Some("my-join-jwt"))
             .await
             .expect("register with bearer should succeed");
         assert_eq!(resp.ula, "fd5a:1f00:1::1");
+    }
+
+    /// The register body must carry `wg_listen_port` (for reflexive
+    /// discovery) and, when no explicit advertise-endpoint is given, must
+    /// OMIT `listen_endpoint` — the joiner no longer auto-advertises a
+    /// loopback address; it lets the coordinator reflect. A body matcher
+    /// proves both on the wire.
+    #[tokio::test]
+    async fn register_sends_wg_port_and_omits_listen_endpoint() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        let response_body = serde_json::json!({
+            "peer_id": "01910f10-0000-7000-8000-000000000001",
+            "ula": "fd5a:1f00:1::1",
+            "peers": []
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            // Requires wg_listen_port == 51820 in the JSON body.
+            .and(body_partial_json(serde_json::json!({ "wg_listen_port": 51820 })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&response_body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        // listen_endpoint = None → must be omitted from the body (serde
+        // skip_serializing_if). The mock only matched on wg_listen_port, so
+        // also assert the serialized body has no listen_endpoint key.
+        let body = serde_json::to_value(RegisterRequest {
+            wg_public_key: B64.encode([0xAAu8; 32]),
+            listen_endpoint: None,
+            wg_listen_port: Some(51820),
+            display_name: "alice".into(),
+            tags: vec![],
+        })
+        .unwrap();
+        assert!(
+            body.get("listen_endpoint").is_none(),
+            "listen_endpoint must be omitted when None: {body}"
+        );
+        assert_eq!(body["wg_listen_port"], 51820);
+
+        client
+            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None)
+            .await
+            .expect("register should succeed and match the wg_listen_port body");
+    }
+
+    /// The register response must surface the coordinator-reflected
+    /// `observed_ip` + `observed_endpoint` (the reflexive endpoint other
+    /// peers will dial). Older coordinators omit them → `None`.
+    #[tokio::test]
+    async fn register_parses_observed_reflexive_fields() {
+        let server = MockServer::start().await;
+        let response_body = serde_json::json!({
+            "peer_id": "01910f10-0000-7000-8000-000000000001",
+            "ula": "fd5a:1f00:1::1",
+            "peers": [],
+            "observed_ip": "203.0.113.7",
+            "observed_endpoint": "203.0.113.7:51820"
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(response_body),
+            )
+            .mount(&server)
+            .await;
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        let resp = client
+            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None)
+            .await
+            .expect("register");
+        assert_eq!(resp.observed_ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(resp.observed_endpoint.as_deref(), Some("203.0.113.7:51820"));
+    }
+
+    /// Back-compat: a response WITHOUT the observed fields parses cleanly
+    /// (they default to `None`) — older coordinators must still work.
+    #[tokio::test]
+    async fn register_tolerates_missing_observed_fields() {
+        let server = MockServer::start().await;
+        let response_body = serde_json::json!({
+            "peer_id": "01910f10-0000-7000-8000-000000000001",
+            "ula": "fd5a:1f00:1::1",
+            "peers": []
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(response_body),
+            )
+            .mount(&server)
+            .await;
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        let resp = client
+            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None)
+            .await
+            .expect("register");
+        assert!(resp.observed_ip.is_none());
+        assert!(resp.observed_endpoint.is_none());
     }
 
     /// With no join token, the register request must NOT carry an
@@ -637,7 +794,7 @@ mod tests {
 
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         client
-            .register(&[0xAAu8; 32], None, "alice", &[], None)
+            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None)
             .await
             .expect("tokenless register should succeed");
         // The `.expect(0)` on the header-requiring mock is verified on
@@ -660,7 +817,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
-        let resp = client.heartbeat(Uuid::nil()).await.unwrap();
+        let resp = client.heartbeat(Uuid::nil(), Some(51820)).await.unwrap();
         assert!(resp.peers.is_empty());
     }
 
@@ -715,7 +872,7 @@ mod tests {
             .await;
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         let err = client
-            .register(&[0u8; 32], None, "x", &[], None)
+            .register(&[0u8; 32], None, Some(51820), "x", &[], None)
             .await
             .unwrap_err();
         assert!(matches!(err, JoinerError::JsonCodec(_)), "{err:?}");

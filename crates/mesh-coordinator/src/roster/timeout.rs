@@ -79,6 +79,7 @@ mod tests {
             .register(RegisterRequest {
                 wg_public_key: pubkey(1),
                 listen_endpoint: None,
+                wg_listen_port: None,
                 display_name: "stale".into(),
                 network: String::new(),
                 tags: vec![],
@@ -89,6 +90,7 @@ mod tests {
             .register(RegisterRequest {
                 wg_public_key: pubkey(2),
                 listen_endpoint: None,
+                wg_listen_port: None,
                 display_name: "fresh".into(),
                 network: String::new(),
                 tags: vec![],
@@ -100,7 +102,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         // Refresh `b`'s heartbeat so it survives the sweep.
         coord
-            .heartbeat(b.peer_id, String::new())
+            .heartbeat(b.peer_id, String::new(), None)
             .await
             .expect("heartbeat");
 
