@@ -4,9 +4,12 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-/// Default coordinator URL used when neither `--coordinator` nor the
-/// `TABBIFY_MESH_COORDINATOR` env var are set.
-pub const DEFAULT_COORDINATOR_URL: &str = "http://127.0.0.1:8888";
+/// Default coordinator URL when neither `--coordinator` nor the
+/// `TABBIFY_MESH_COORDINATOR` env var are set. There is exactly one
+/// coordinator and its address never changes, so the production EIP is baked
+/// in — `tabbify-mesh join --name X` is enough (zero config). Override with
+/// `--coordinator http://127.0.0.1:8888` for a local smoke run.
+pub const DEFAULT_COORDINATOR_URL: &str = "http://3.124.69.92:8888";
 
 /// `tabbify-mesh` — overlay-mesh peer CLI.
 #[derive(Debug, Parser)]
