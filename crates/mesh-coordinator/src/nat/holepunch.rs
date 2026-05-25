@@ -56,9 +56,11 @@ pub fn canonical_pair(a: Uuid, b: Uuid) -> PunchPair {
 pub struct PunchPeer {
     /// Coordinator-assigned UUID.
     pub peer_id: Uuid,
-    /// Last observed external socket addr (from `PeerHeartbeat`).
-    /// Empty string ≡ "no known external", in which case we skip.
-    pub observed_external: String,
+    /// The reflexive `WireGuard` endpoint to dial for the punch (`ip:wg_port`)
+    /// — the peer's `listen_endpoint`, NOT the raw heartbeat TCP source. A
+    /// punch fired at the TCP source would miss the `WireGuard` UDP mapping.
+    /// Empty string ≡ "not dialable yet", in which case we skip.
+    pub dial_endpoint: String,
 }
 
 /// Tracks which `(peer_id, peer_id)` ordered pairs have already had
@@ -125,7 +127,7 @@ pub async fn try_emit_pair(
     if a.peer_id == b.peer_id {
         return false;
     }
-    if a.observed_external.is_empty() || b.observed_external.is_empty() {
+    if a.dial_endpoint.is_empty() || b.dial_endpoint.is_empty() {
         return false;
     }
     let pair = canonical_pair(a.peer_id, b.peer_id);
@@ -135,15 +137,15 @@ pub async fn try_emit_pair(
     debug!(
         a = %a.peer_id,
         b = %b.peer_id,
-        ext_a = %a.observed_external,
-        ext_b = %b.observed_external,
+        ext_a = %a.dial_endpoint,
+        ext_b = %b.dial_endpoint,
         "holepunch: emitting initiate pair (skeleton — no real punching yet)",
     );
     // Event 1: A is initiator, B is target. A sends first to B's external.
     let ev_a = HolePunchInitiate {
         initiator_peer_id: a.peer_id.to_string(),
         target_peer_id: b.peer_id.to_string(),
-        target_external_endpoint: b.observed_external.clone(),
+        target_external_endpoint: b.dial_endpoint.clone(),
         timestamp_micros: now_micros,
     };
     // Persist (audit/event-log) AND broadcast to live SSE subscribers —
@@ -155,7 +157,7 @@ pub async fn try_emit_pair(
     let ev_b = HolePunchInitiate {
         initiator_peer_id: b.peer_id.to_string(),
         target_peer_id: a.peer_id.to_string(),
-        target_external_endpoint: a.observed_external.clone(),
+        target_external_endpoint: a.dial_endpoint.clone(),
         timestamp_micros: now_micros,
     };
     publish_event(publisher, PEER_SEGMENT, &ev_b).await;
@@ -210,7 +212,7 @@ mod tests {
     fn peer(seed: u8, ext: &str) -> PunchPeer {
         PunchPeer {
             peer_id: Uuid::from_u128(u128::from(seed)),
-            observed_external: ext.into(),
+            dial_endpoint: ext.into(),
         }
     }
 
@@ -250,13 +252,13 @@ mod tests {
             .find(|e| e.initiator_peer_id == a.peer_id.to_string())
             .expect("event from A");
         assert_eq!(from_a.target_peer_id, b.peer_id.to_string());
-        assert_eq!(from_a.target_external_endpoint, b.observed_external);
+        assert_eq!(from_a.target_external_endpoint, b.dial_endpoint);
         let from_b = decoded
             .iter()
             .find(|e| e.initiator_peer_id == b.peer_id.to_string())
             .expect("event from B");
         assert_eq!(from_b.target_peer_id, a.peer_id.to_string());
-        assert_eq!(from_b.target_external_endpoint, a.observed_external);
+        assert_eq!(from_b.target_external_endpoint, a.dial_endpoint);
     }
 
     #[tokio::test]

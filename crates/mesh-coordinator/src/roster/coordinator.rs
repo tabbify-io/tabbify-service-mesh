@@ -560,17 +560,29 @@ impl Coordinator {
         }
     }
 
-    /// Stage 2 hook called after a heartbeat lands. Iterates over the
-    /// roster and emits a `HolePunchInitiate` pair for every other peer
-    /// with a non-empty `observed_external` that hasn't yet been paired.
+    /// Build a punch candidate from a roster entry. A peer is eligible once
+    /// it has heartbeated (we've seen its public source -> non-empty
+    /// `observed_external`) AND has a dialable endpoint (`listen_endpoint`).
+    /// The punch TARGET is that reflexive `WireGuard` endpoint (`ip:wg_port`),
+    /// NOT the raw heartbeat TCP source — a punch fired at the TCP source
+    /// would miss the `WireGuard` UDP NAT mapping entirely.
+    fn punch_peer(e: &PeerEntry) -> Option<PunchPeer> {
+        if e.observed_external.is_empty() {
+            return None;
+        }
+        let dial = e.listen_endpoint.clone().filter(|s| !s.is_empty())?;
+        Some(PunchPeer {
+            peer_id: e.peer_id,
+            dial_endpoint: dial,
+        })
+    }
+
+    /// Stage 2 hook called after a heartbeat lands. Emits a `HolePunchInitiate`
+    /// pair for every other dialable peer that hasn't yet been paired.
     /// Best-effort — publish failures are swallowed via `publish_event`.
     async fn try_emit_holepunch_pairs(&self, just_heartbeated: &PeerEntry) {
-        if just_heartbeated.observed_external.is_empty() {
+        let Some(a) = Self::punch_peer(just_heartbeated) else {
             return;
-        }
-        let a = PunchPeer {
-            peer_id: just_heartbeated.peer_id,
-            observed_external: just_heartbeated.observed_external.clone(),
         };
         // Collect candidates before await to avoid holding the DashMap
         // shard locks across .await points.
@@ -580,14 +592,10 @@ impl Coordinator {
             .iter()
             .filter_map(|kv| {
                 let e = kv.value();
-                if e.peer_id == a.peer_id || e.observed_external.is_empty() {
-                    None
-                } else {
-                    Some(PunchPeer {
-                        peer_id: e.peer_id,
-                        observed_external: e.observed_external.clone(),
-                    })
+                if e.peer_id == a.peer_id {
+                    return None;
                 }
+                Self::punch_peer(e)
             })
             .collect();
         let now = now_unix_micros();
@@ -940,7 +948,7 @@ mod tests {
         // First heartbeats — neither peer has been seen yet, so each
         // populates its own observed_external. After the first heartbeat
         // from each, both peers have non-empty external addrs.
-        c.heartbeat(alice.peer_id, "203.0.113.10:11111".into(), None)
+        c.heartbeat(alice.peer_id, "203.0.113.10:11111".into(), Some(51820))
             .await
             .expect("a hb1");
         // Only alice has external so far — no holepunch event yet.
@@ -950,7 +958,7 @@ mod tests {
             "should not emit until both peers have observed_external"
         );
 
-        c.heartbeat(bob.peer_id, "198.51.100.20:22222".into(), None)
+        c.heartbeat(bob.peer_id, "198.51.100.20:22222".into(), Some(51820))
             .await
             .expect("b hb1");
 
@@ -975,19 +983,21 @@ mod tests {
             .find(|e| e.initiator_peer_id == alice.peer_id.to_string())
             .expect("event from alice");
         assert_eq!(from_alice.target_peer_id, bob.peer_id.to_string());
-        assert_eq!(from_alice.target_external_endpoint, "198.51.100.20:22222");
+        // Target is bob's REFLEXIVE WG endpoint (observed-ip:wg-port), not the
+        // raw heartbeat TCP source (:22222).
+        assert_eq!(from_alice.target_external_endpoint, "198.51.100.20:51820");
         let from_bob = events
             .iter()
             .find(|e| e.initiator_peer_id == bob.peer_id.to_string())
             .expect("event from bob");
         assert_eq!(from_bob.target_peer_id, alice.peer_id.to_string());
-        assert_eq!(from_bob.target_external_endpoint, "203.0.113.10:11111");
+        assert_eq!(from_bob.target_external_endpoint, "203.0.113.10:51820");
 
         // Sanity: the tracker should know about this pair now.
         assert_eq!(c.punch_tracker().len(), 1);
 
         // Another heartbeat from alice should NOT re-emit (dedup).
-        c.heartbeat(alice.peer_id, "203.0.113.10:11111".into(), None)
+        c.heartbeat(alice.peer_id, "203.0.113.10:11111".into(), Some(51820))
             .await
             .expect("a hb2");
         assert_eq!(
@@ -1010,10 +1020,10 @@ mod tests {
         // Subscribe AFTER register so the channel only carries the
         // heartbeat-time frames we care about.
         let mut rx = c.broadcaster().subscribe();
-        c.heartbeat(alice.peer_id, "203.0.113.70:11111".into(), None)
+        c.heartbeat(alice.peer_id, "203.0.113.70:11111".into(), Some(51820))
             .await
             .expect("a hb");
-        c.heartbeat(bob.peer_id, "198.51.100.71:22222".into(), None)
+        c.heartbeat(bob.peer_id, "198.51.100.71:22222".into(), Some(51820))
             .await
             .expect("b hb");
 
@@ -1029,13 +1039,14 @@ mod tests {
             2,
             "expected the hole-punch pair on the broadcast channel"
         );
-        // Each event points the initiator at the OTHER peer's external.
+        // Each event points the initiator at the OTHER peer's REFLEXIVE WG
+        // endpoint (observed-ip:wg-port), not the raw heartbeat TCP source.
         assert!(punches
             .iter()
-            .any(|p| p.target_external_endpoint == "203.0.113.70:11111"));
+            .any(|p| p.target_external_endpoint == "203.0.113.70:51820"));
         assert!(punches
             .iter()
-            .any(|p| p.target_external_endpoint == "198.51.100.71:22222"));
+            .any(|p| p.target_external_endpoint == "198.51.100.71:51820"));
     }
 
     #[tokio::test]
