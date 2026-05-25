@@ -83,6 +83,7 @@ mod tests {
             display_name: "n".into(),
             network: network.into(),
             tags: tags.iter().map(|s| (*s).to_owned()).collect(),
+            hosted_app_ulas: vec![],
         }
     }
 

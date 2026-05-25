@@ -33,6 +33,12 @@ pub struct PeerInfo {
     pub display_name: String,
     /// Role tags ("dev-machine", "wasm-host", ...).
     pub tags: Vec<String>,
+    /// App-ULAs (`fd5a:1f02:...`) this peer currently hosts, parsed from
+    /// the roster. The roster consumer installs an app-route for each
+    /// (per-app-ULA routing) so traffic to `[app_ula]` reaches this peer.
+    /// Empty for a peer that hosts no apps (the common case).
+    #[serde(default)]
+    pub hosted_app_ulas: Vec<Ipv6Addr>,
     /// Coordinator-stamped microseconds-since-epoch.
     pub joined_at_micros: i64,
 }
@@ -54,6 +60,13 @@ pub struct RemotePeer {
     pub display_name: String,
     /// Role tags.
     pub tags: Vec<String>,
+    /// App-ULAs (IPv6 literals, `fd5a:1f02:...`) this peer currently
+    /// hosts, as advertised by the coordinator. Parsed into typed
+    /// addresses by [`crate::coordinator::client::remote_to_info`].
+    /// `#[serde(default)]` keeps older coordinators (which omit it)
+    /// working — the peer is then treated as hosting no apps.
+    #[serde(default)]
+    pub hosted_app_ulas: Vec<String>,
     /// Microseconds-since-epoch as stamped by the coordinator.
     pub joined_at_micros: i64,
 }

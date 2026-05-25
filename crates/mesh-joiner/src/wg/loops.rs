@@ -15,10 +15,10 @@
 //! None of these loops own any data — they hand back to the
 //! [`crate::wg::session::SessionTable`] for routing decisions.
 
-use crate::wg::session::{classify_tunn_result, PeerSession, SessionTable, WgAction};
+use crate::wg::session::{PeerSession, SessionTable, WgAction, classify_tunn_result};
 use std::net::Ipv6Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tabbify_mesh_fabric::tun::TunDevice;
 use tokio::net::UdpSocket;
@@ -284,11 +284,7 @@ pub(crate) async fn tun_read_loop(
     }
 }
 
-async fn encapsulate_and_send(
-    socket: &UdpSocket,
-    session: &Arc<PeerSession>,
-    packet: &[u8],
-) {
+async fn encapsulate_and_send(socket: &UdpSocket, session: &Arc<PeerSession>, packet: &[u8]) {
     let action: WgAction = {
         // Size for the largest WireGuard message, NOT the input packet. When no
         // session exists yet, encapsulate() emits a 148-byte handshake-init
@@ -460,6 +456,7 @@ mod tests {
             listen_endpoint: Some("127.0.0.1:51820".parse().unwrap()),
             display_name: "peer".into(),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 0,
         };
         let t = SessionTable::new();
@@ -520,7 +517,7 @@ mod tests {
         let session = Arc::new(PeerSession {
             peer_id: uuid::Uuid::nil(),
             ula: a,
-            allowed_ips: HashSet::from([a, b]),
+            allowed_ips: parking_lot::RwLock::new(HashSet::from([a, b])),
             endpoint: parking_lot::RwLock::new(None),
             tunn: tokio::sync::Mutex::new(boringtun::noise::Tunn::new(
                 StaticSecret::from([1u8; 32]),
@@ -534,5 +531,68 @@ mod tests {
         assert!(inner_source_allowed(&session, &ipv6_packet_from(a)));
         assert!(inner_source_allowed(&session, &ipv6_packet_from(b)));
         assert!(!inner_source_allowed(&session, &ipv6_packet_from(denied)));
+    }
+
+    // ---- per-app-ULA routing: TX lookup + RX source check ----
+
+    /// The TX path's `by_ula(dst)` lookup (used by `tun_read_loop`)
+    /// resolves a packet destined for an APP-ULA to the hosting peer's
+    /// session via the `app_routes` fallback. This is the lookup the loop
+    /// performs at loops.rs ~`tun_read_loop`; assert it directly so the
+    /// data path is pinned without spinning real sockets.
+    #[test]
+    fn tun_read_lookup_resolves_app_ula_to_host_session() {
+        use x25519_dalek::StaticSecret;
+        let host: Ipv6Addr = "fd5a:1f00:1::1".parse().unwrap();
+        let app: Ipv6Addr = "fd5a:1f02:dead:beef:cafe:0:0:1".parse().unwrap();
+        let me = StaticSecret::from([42u8; 32]);
+        let info = crate::peer::PeerInfo {
+            peer_id: uuid::Uuid::nil(),
+            wg_public_key: *x25519_dalek::PublicKey::from(&StaticSecret::from([3u8; 32]))
+                .as_bytes(),
+            ula: host,
+            listen_endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+            display_name: "host".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![app],
+            joined_at_micros: 0,
+        };
+        let t = SessionTable::new();
+        t.upsert(&me, &info);
+        t.reconcile_app_routes(host, &[app]);
+        // The dst the loop extracts (app-ULA) resolves to the host session.
+        let session = t.by_ula(app).expect("app-ULA dst resolves for tun_read");
+        assert_eq!(session.ula, host);
+    }
+
+    /// RX source check: a RESPONSE inner packet whose SOURCE is the
+    /// app-ULA passes once the app-ULA is in the host session's
+    /// allowed-set (the reverse direction of per-app-ULA routing). Before
+    /// hosting it would be dropped; after, it is accepted.
+    #[test]
+    fn rx_accepts_response_sourced_from_hosted_app_ula() {
+        use x25519_dalek::StaticSecret;
+        let host: Ipv6Addr = "fd5a:1f00:1::1".parse().unwrap();
+        let app: Ipv6Addr = "fd5a:1f02:dead:beef:cafe:0:0:1".parse().unwrap();
+        let me = StaticSecret::from([42u8; 32]);
+        let info = crate::peer::PeerInfo {
+            peer_id: uuid::Uuid::nil(),
+            wg_public_key: *x25519_dalek::PublicKey::from(&StaticSecret::from([3u8; 32]))
+                .as_bytes(),
+            ula: host,
+            listen_endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+            display_name: "host".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            joined_at_micros: 0,
+        };
+        let t = SessionTable::new();
+        t.upsert(&me, &info);
+        let session = t.by_ula(host).expect("session");
+        // Before hosting the app, a response sourced from it is rejected.
+        assert!(!inner_source_allowed(&session, &ipv6_packet_from(app)));
+        // After hosting, the same response passes.
+        t.reconcile_app_routes(host, &[app]);
+        assert!(inner_source_allowed(&session, &ipv6_packet_from(app)));
     }
 }

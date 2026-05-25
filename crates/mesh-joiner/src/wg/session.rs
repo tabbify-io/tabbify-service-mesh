@@ -65,6 +65,26 @@ pub trait RouteSink: Send + Sync {
     /// Remove the host route for `ula/128`. Called when the session is
     /// removed. Idempotent (removing an absent route is a no-op).
     fn remove_allowed(&self, ula: Ipv6Addr);
+    /// Install a host route for an APP-ULA `app_ula/128` via the overlay
+    /// TUN device (per-app-ULA routing — consumer side). Called when a
+    /// remote peer advertises a NEW hosted app-ULA, so the OS hands
+    /// app-bound packets to our TUN read side; the [`SessionTable`]'s
+    /// `app_routes` index then steers them to the hosting peer's session.
+    ///
+    /// Mechanically identical to [`Self::add_allowed`] (both install a
+    /// `/128` host route to the TUN); kept as a distinct method so a fake
+    /// sink in tests can assert app-route installs separately from
+    /// peer-route installs, and so the data path stays self-documenting.
+    /// Default-implemented as a no-op so existing sinks need no change.
+    fn add_app_route(&self, app_ula: Ipv6Addr) {
+        let _ = app_ula;
+    }
+    /// Remove the host route for an app-ULA `app_ula/128`. Called when the
+    /// hosting peer drops the app-ULA or leaves. Idempotent. Default
+    /// no-op (see [`Self::add_app_route`]).
+    fn remove_app_route(&self, app_ula: Ipv6Addr) {
+        let _ = app_ula;
+    }
 }
 
 /// One peer's encryption state + routing metadata.
@@ -76,11 +96,17 @@ pub struct PeerSession {
     /// The set of `/128` source addresses this peer is permitted to use
     /// (spec §5.5 — cryptokey-routing invariant). Built from the
     /// coordinator's roster at [`SessionTable::upsert`] time: at minimum
-    /// the peer's own ULA, plus any extra `/128`s policy permits it to
-    /// represent (carried on [`PeerInfo`] in a later phase). The RX path
-    /// drops any inner IPv6 packet whose SOURCE address is not in this
-    /// set — boringtun does not enforce allowed-ips for us.
-    pub allowed_ips: HashSet<Ipv6Addr>,
+    /// the peer's own ULA, plus every app-ULA it currently hosts (added
+    /// via [`Self::add_allowed_source`] when the roster advertises a new
+    /// hosted app-ULA — per-app-ULA routing). The RX path drops any inner
+    /// IPv6 packet whose SOURCE address is not in this set — boringtun
+    /// does not enforce allowed-ips for us.
+    ///
+    /// Wrapped in an `RwLock` because the set GROWS and SHRINKS over the
+    /// session's lifetime as the hosting peer starts / stops apps; the RX
+    /// hot path takes a read guard (contention-free against other
+    /// readers), the rare roster-driven mutation takes a write guard.
+    pub allowed_ips: parking_lot::RwLock<HashSet<Ipv6Addr>>,
     /// UDP endpoint to send ciphertext to. `None` means we don't yet
     /// know how to reach this peer — either they registered passively
     /// (no advertised endpoint) OR we haven't learned their actual
@@ -107,7 +133,28 @@ impl PeerSession {
     /// enforce `WireGuard`'s cryptokey-routing invariant (spec §5.5).
     #[must_use]
     pub fn is_allowed_source(&self, source: Ipv6Addr) -> bool {
-        self.allowed_ips.contains(&source)
+        self.allowed_ips.read().contains(&source)
+    }
+
+    /// Add `addr` to this peer's allowed-source set. Used when the roster
+    /// advertises a NEW app-ULA hosted by this peer, so a RESPONSE sourced
+    /// from the app-ULA passes the RX source check (per-app-ULA routing).
+    /// Returns `true` if it was newly inserted.
+    pub fn add_allowed_source(&self, addr: Ipv6Addr) -> bool {
+        self.allowed_ips.write().insert(addr)
+    }
+
+    /// Remove `addr` from this peer's allowed-source set. Used when the
+    /// hosting peer drops an app-ULA. Never removes the peer's own ULA
+    /// (callers only pass app-ULAs). Returns `true` if it was present.
+    pub fn remove_allowed_source(&self, addr: Ipv6Addr) -> bool {
+        self.allowed_ips.write().remove(&addr)
+    }
+
+    /// Snapshot the current allowed-source set (diagnostics / tests).
+    #[must_use]
+    pub fn allowed_ips_snapshot(&self) -> HashSet<Ipv6Addr> {
+        self.allowed_ips.read().clone()
     }
 }
 
@@ -128,7 +175,7 @@ impl std::fmt::Debug for PeerSession {
         f.debug_struct("PeerSession")
             .field("peer_id", &self.peer_id)
             .field("ula", &self.ula)
-            .field("allowed_ips", &self.allowed_ips)
+            .field("allowed_ips", &self.allowed_ips.read())
             .field("endpoint", &self.endpoint())
             .field("tunn", &"<Tunn>")
             .finish()
@@ -144,6 +191,12 @@ pub struct SessionTable {
     /// Lookup by source UDP endpoint — used by the UDP-recv path to
     /// route an inbound ciphertext datagram to the right `Tunn`.
     by_endpoint: Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
+    /// Secondary index for per-app-ULA routing: `app_ula → hosting peer's
+    /// ULA`. Consulted by [`Self::by_ula`] as a FALLBACK after the
+    /// peer-ULA fast path misses, so a packet bound for an app-ULA
+    /// resolves to the session of the peer that hosts it. Strictly
+    /// additive — peer-ULA routing never touches this map.
+    app_routes: Arc<DashMap<Ipv6Addr, Ipv6Addr>>,
     /// Optional sink that mirrors per-peer `/128`s into the kernel
     /// routing table (spec §5.5, TX scoping). `None` (the default) skips
     /// route management entirely — used by unit tests and by callers
@@ -156,7 +209,11 @@ impl std::fmt::Debug for SessionTable {
         f.debug_struct("SessionTable")
             .field("by_ula", &self.by_ula)
             .field("by_endpoint", &self.by_endpoint)
-            .field("route_sink", &self.route_sink.as_ref().map(|_| "<RouteSink>"))
+            .field("app_routes", &self.app_routes)
+            .field(
+                "route_sink",
+                &self.route_sink.as_ref().map(|_| "<RouteSink>"),
+            )
             .finish()
     }
 }
@@ -199,10 +256,26 @@ impl SessionTable {
         self.by_ula.iter().map(|kv| *kv.key()).collect()
     }
 
-    /// Look up a session by ULA — used by the TUN→UDP path.
+    /// Look up the session that should carry traffic destined for `dst`
+    /// — used by the TUN→UDP path.
+    ///
+    /// Two-stage resolution (per-app-ULA routing):
+    /// 1. **Peer-ULA fast path** — `dst` is a peer's own ULA → its
+    ///    session directly. This is the original, hot path and is tried
+    ///    first so the common case pays nothing for app routing.
+    /// 2. **App-ULA fallback** — `dst` is an app-ULA in the `app_routes`
+    ///    index → resolve to the hosting peer's ULA, then its session. A
+    ///    packet bound for `[app_ula]` is thus delivered over the tunnel
+    ///    to whichever peer hosts that app.
     #[must_use]
-    pub fn by_ula(&self, ula: Ipv6Addr) -> Option<Arc<PeerSession>> {
-        self.by_ula.get(&ula).map(|kv| kv.value().clone())
+    pub fn by_ula(&self, dst: Ipv6Addr) -> Option<Arc<PeerSession>> {
+        // Fast path: dst is a peer ULA we have a session for.
+        if let Some(kv) = self.by_ula.get(&dst) {
+            return Some(kv.value().clone());
+        }
+        // Fallback: dst is an app-ULA → resolve to the hosting peer.
+        let host_ula = *self.app_routes.get(&dst)?.value();
+        self.by_ula.get(&host_ula).map(|kv| kv.value().clone())
     }
 
     /// Record `source` as a fast-path lookup alias for `session`. Used
@@ -237,9 +310,101 @@ impl SessionTable {
     /// arrive from — used by the UDP→TUN path.
     #[must_use]
     pub fn by_endpoint(&self, endpoint: SocketAddr) -> Option<Arc<PeerSession>> {
-        self.by_endpoint
-            .get(&endpoint)
-            .map(|kv| kv.value().clone())
+        self.by_endpoint.get(&endpoint).map(|kv| kv.value().clone())
+    }
+
+    /// Record that remote peer `host_ula` hosts `app_ula` (per-app-ULA
+    /// routing — consumer side). Wires up all three pieces of state the
+    /// data path needs:
+    ///
+    /// 1. the `app_routes` secondary index (`app_ula → host_ula`) so
+    ///    [`Self::by_ula`] resolves app-bound packets to the host's
+    ///    session;
+    /// 2. the host session's `allowed_ips` (so a RESPONSE sourced from
+    ///    `app_ula` passes the RX source check);
+    /// 3. the kernel `/128` host route via the [`RouteSink`] (so the OS
+    ///    hands `app_ula`-bound packets to our TUN read side).
+    ///
+    /// Idempotent: re-recording the same `(app_ula, host_ula)` is a no-op
+    /// for the index + allowed-set and only re-pokes the (idempotent)
+    /// route sink. A no-op for the kernel route when the table has no sink
+    /// (tests). Does nothing if we have no session for `host_ula` yet —
+    /// the index is still recorded, and [`Self::upsert`] replays it onto
+    /// the session's allowed-set when the host's session appears.
+    pub fn host_remote_app_route(&self, app_ula: Ipv6Addr, host_ula: Ipv6Addr) {
+        self.app_routes.insert(app_ula, host_ula);
+        if let Some(session) = self.by_ula.get(&host_ula) {
+            session.add_allowed_source(app_ula);
+        }
+        if let Some(sink) = &self.route_sink {
+            sink.add_app_route(app_ula);
+        }
+    }
+
+    /// Reverse [`Self::host_remote_app_route`]: the hosting peer dropped
+    /// `app_ula` (or left). Removes the `app_routes` entry, the host
+    /// session's allowed-source, and the kernel `/128` route. Idempotent.
+    pub fn unhost_remote_app_route(&self, app_ula: Ipv6Addr) {
+        if let Some((_, host_ula)) = self.app_routes.remove(&app_ula) {
+            if let Some(session) = self.by_ula.get(&host_ula) {
+                session.remove_allowed_source(app_ula);
+            }
+        }
+        if let Some(sink) = &self.route_sink {
+            sink.remove_app_route(app_ula);
+        }
+    }
+
+    /// Reconcile the app-ULAs routed to `host_ula` against the set the
+    /// roster now advertises for it (per-app-ULA routing). Installs a
+    /// route for each newly-advertised app-ULA and tears down each one the
+    /// peer no longer hosts — the wholesale-replace contract that mirrors
+    /// the coordinator's heartbeat semantics.
+    ///
+    /// Idempotent and cheap when nothing changed (the common steady
+    /// state): an app-ULA already routed to the same host is re-hosted
+    /// (no-op for the index + allowed-set, re-pokes the idempotent route
+    /// sink). Call AFTER [`Self::upsert`] for `host_ula` so the host
+    /// session exists and the allowed-set grows on the live session.
+    ///
+    /// Drives the route sink for every actual add/remove. The roster
+    /// consumers ([`crate::coordinator::peer_sync`] +
+    /// [`crate::coordinator::heartbeat`]) call this on each peer they
+    /// upsert.
+    pub fn reconcile_app_routes(&self, host_ula: Ipv6Addr, advertised: &[Ipv6Addr]) {
+        let advertised_set: HashSet<Ipv6Addr> = advertised.iter().copied().collect();
+        // Install routes for newly-advertised app-ULAs.
+        for &app_ula in advertised {
+            self.host_remote_app_route(app_ula, host_ula);
+        }
+        // Tear down app-ULAs this host no longer advertises. Collect first
+        // to avoid mutating `app_routes` while iterating it.
+        let stale: Vec<Ipv6Addr> = self
+            .app_ulas_for_host(host_ula)
+            .into_iter()
+            .filter(|a| !advertised_set.contains(a))
+            .collect();
+        for app_ula in stale {
+            self.unhost_remote_app_route(app_ula);
+        }
+    }
+
+    /// The set of app-ULAs currently routed to `host_ula` (diagnostics +
+    /// the roster-diff in [`crate::coordinator::peer_sync`], which needs
+    /// to know which app-ULAs a peer hosts NOW to compute adds/removals).
+    #[must_use]
+    pub fn app_ulas_for_host(&self, host_ula: Ipv6Addr) -> Vec<Ipv6Addr> {
+        self.app_routes
+            .iter()
+            .filter(|kv| *kv.value() == host_ula)
+            .map(|kv| *kv.key())
+            .collect()
+    }
+
+    /// Resolve which peer hosts `app_ula`, if any (diagnostics / tests).
+    #[must_use]
+    pub fn app_route_host(&self, app_ula: Ipv6Addr) -> Option<Ipv6Addr> {
+        self.app_routes.get(&app_ula).map(|kv| *kv.value())
     }
 
     /// Iterate all sessions — needed for the timer loop which has to
@@ -279,19 +444,34 @@ impl SessionTable {
         let tunn = Tunn::new(
             our_private.clone(),
             peer_pubkey,
-            None,                                 // no preshared key in MVP
-            Some(WG_PERSISTENT_KEEPALIVE_SECS),   // keep NAT mapping open
+            None,                               // no preshared key in MVP
+            Some(WG_PERSISTENT_KEEPALIVE_SECS), // keep NAT mapping open
             index,
-            None,                                 // default rate limiter
+            None, // default rate limiter
         );
 
         let session = Arc::new(PeerSession {
             peer_id: info.peer_id,
             ula: info.ula,
-            allowed_ips: allowed_ips_for(info),
+            allowed_ips: parking_lot::RwLock::new(allowed_ips_for(info)),
             endpoint: parking_lot::RwLock::new(info.listen_endpoint),
             tunn: Mutex::new(tunn),
         });
+        // Re-apply any app-ULAs this peer already hosts onto the FRESH
+        // session's allowed-set. A re-upsert (endpoint roam / re-handshake)
+        // builds a brand-new `PeerSession` whose allowed-set starts at just
+        // the peer's own ULA, which would silently drop the app-ULAs a
+        // prior session had accumulated. The `app_routes` index is the
+        // durable source of truth for which app-ULAs map to this peer, so
+        // replay them here (per-app-ULA routing, additive — a no-op when
+        // the peer hosts no apps, i.e. the common peer-only case).
+        if !is_new {
+            for kv in self.app_routes.iter() {
+                if *kv.value() == info.ula {
+                    session.add_allowed_source(*kv.key());
+                }
+            }
+        }
         self.by_ula.insert(info.ula, session.clone());
         if let Some(addr) = info.listen_endpoint {
             self.by_endpoint.insert(addr, session);
@@ -314,6 +494,17 @@ impl SessionTable {
         if let Some(addr) = session.endpoint() {
             self.by_endpoint.remove(&addr);
         }
+        // Tear down every app-ULA route that pointed at this peer — the
+        // host is gone, so the app is no longer reachable through it
+        // (per-app-ULA routing). Collect first to avoid mutating the map
+        // while iterating it.
+        let orphaned: Vec<Ipv6Addr> = self.app_ulas_for_host(ula);
+        for app_ula in orphaned {
+            self.app_routes.remove(&app_ula);
+            if let Some(sink) = &self.route_sink {
+                sink.remove_app_route(app_ula);
+            }
+        }
         // Tear down the peer's `/128` route now that no session can use it.
         if let Some(sink) = &self.route_sink {
             sink.remove_allowed(ula);
@@ -329,9 +520,14 @@ impl SessionTable {
             for ula in self.ulas() {
                 sink.remove_allowed(ula);
             }
+            // Tear down every app-ULA route too (per-app-ULA routing).
+            for kv in self.app_routes.iter() {
+                sink.remove_app_route(*kv.key());
+            }
         }
         self.by_ula.clear();
         self.by_endpoint.clear();
+        self.app_routes.clear();
     }
 }
 
@@ -385,16 +581,21 @@ mod tests {
             listen_endpoint: endpoint.map(|s| s.parse().unwrap()),
             display_name: format!("peer-{n}"),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 0,
         }
     }
 
     /// Records every add/remove the table pushes so route-scoping tests
-    /// can assert the kernel would see exactly the right `/128`s.
+    /// can assert the kernel would see exactly the right `/128`s. App
+    /// routes are recorded in their own vectors so per-app-ULA routing can
+    /// be asserted independently of peer routes.
     #[derive(Default)]
     struct RecordingRouteSink {
         added: PlMutex<Vec<Ipv6Addr>>,
         removed: PlMutex<Vec<Ipv6Addr>>,
+        app_added: PlMutex<Vec<Ipv6Addr>>,
+        app_removed: PlMutex<Vec<Ipv6Addr>>,
     }
     impl RouteSink for RecordingRouteSink {
         fn add_allowed(&self, ula: Ipv6Addr) {
@@ -402,6 +603,12 @@ mod tests {
         }
         fn remove_allowed(&self, ula: Ipv6Addr) {
             self.removed.lock().push(ula);
+        }
+        fn add_app_route(&self, app_ula: Ipv6Addr) {
+            self.app_added.lock().push(app_ula);
+        }
+        fn remove_app_route(&self, app_ula: Ipv6Addr) {
+            self.app_removed.lock().push(app_ula);
         }
     }
 
@@ -647,5 +854,212 @@ mod tests {
         );
         // But the new source is indexed so inbound from it routes here.
         assert!(t.by_endpoint(inbound_src).is_some());
+    }
+
+    // ---- per-app-ULA routing (consumer side) ----
+    //
+    // A remote peer can host one or more app-ULAs (`fd5a:1f02:...`). When
+    // the roster advertises them, the consumer records `app_ula → host_ula`
+    // in a secondary index, grows the host session's allowed-set, and
+    // installs a kernel `/128` route. `by_ula(app_ula)` then resolves to
+    // the hosting peer's session. All STRICTLY ADDITIVE to the peer-ULA
+    // path tested above.
+
+    const APP_A: &str = "fd5a:1f02:dead:beef:cafe:0:0:1";
+    const APP_B: &str = "fd5a:1f02:dead:beef:cafe:0:0:2";
+    const HOST_ULA: &str = "fd5a:1f00:1::1";
+
+    fn ula(s: &str) -> Ipv6Addr {
+        s.parse().unwrap()
+    }
+
+    /// `by_ula(app_ula)` resolves to the HOSTING peer's session via the
+    /// `app_routes` fallback — the core of per-app-ULA routing.
+    #[test]
+    fn by_ula_resolves_app_ula_to_host_session() {
+        let t = SessionTable::new();
+        let me = StaticSecret::from([42u8; 32]);
+        let host = info(1, HOST_ULA, Some("127.0.0.1:51820"));
+        t.upsert(&me, &host);
+        // Before hosting, an app-ULA resolves to nothing.
+        assert!(t.by_ula(ula(APP_A)).is_none());
+        // After hosting, it resolves to the host's session.
+        t.host_remote_app_route(ula(APP_A), host.ula);
+        let resolved = t.by_ula(ula(APP_A)).expect("app-ULA resolves");
+        assert_eq!(resolved.ula, host.ula, "app-ULA must map to the host peer");
+        // And the index agrees.
+        assert_eq!(t.app_route_host(ula(APP_A)), Some(host.ula));
+    }
+
+    /// The peer-ULA fast path is unchanged: a peer's own ULA resolves
+    /// directly, never consulting `app_routes`. Guards the "additive"
+    /// contract.
+    #[test]
+    fn by_ula_peer_fast_path_unaffected_by_app_routes() {
+        let t = SessionTable::new();
+        let me = StaticSecret::from([42u8; 32]);
+        let host = info(1, HOST_ULA, Some("127.0.0.1:51820"));
+        t.upsert(&me, &host);
+        t.host_remote_app_route(ula(APP_A), host.ula);
+        // The peer's own ULA still resolves to its session directly.
+        let s = t.by_ula(host.ula).expect("peer ULA fast path");
+        assert_eq!(s.ula, host.ula);
+    }
+
+    /// Hosting an app-ULA GROWS the host session's allowed-source set so a
+    /// response sourced from the app-ULA passes the RX source check.
+    #[test]
+    fn host_app_route_grows_allowed_ips() {
+        let t = SessionTable::new();
+        let me = StaticSecret::from([42u8; 32]);
+        let host = info(1, HOST_ULA, Some("127.0.0.1:51820"));
+        t.upsert(&me, &host);
+        let session = t.by_ula(host.ula).expect("session");
+        // Initially only the peer's own ULA is allowed.
+        assert!(session.is_allowed_source(host.ula));
+        assert!(!session.is_allowed_source(ula(APP_A)));
+        // After hosting, the app-ULA is an allowed source too.
+        t.host_remote_app_route(ula(APP_A), host.ula);
+        assert!(session.is_allowed_source(ula(APP_A)));
+    }
+
+    /// Un-hosting SHRINKS the allowed-set back, drops the index entry, and
+    /// the app-ULA no longer resolves.
+    #[test]
+    fn unhost_app_route_shrinks_allowed_ips_and_unmaps() {
+        let t = SessionTable::new();
+        let me = StaticSecret::from([42u8; 32]);
+        let host = info(1, HOST_ULA, Some("127.0.0.1:51820"));
+        t.upsert(&me, &host);
+        let session = t.by_ula(host.ula).expect("session");
+        t.host_remote_app_route(ula(APP_A), host.ula);
+        assert!(session.is_allowed_source(ula(APP_A)));
+
+        t.unhost_remote_app_route(ula(APP_A));
+        assert!(
+            !session.is_allowed_source(ula(APP_A)),
+            "allowed-set shrinks"
+        );
+        assert!(
+            t.app_route_host(ula(APP_A)).is_none(),
+            "index entry dropped"
+        );
+        assert!(t.by_ula(ula(APP_A)).is_none(), "app-ULA no longer resolves");
+        // The peer's own ULA survives un-hosting an app.
+        assert!(session.is_allowed_source(host.ula));
+    }
+
+    /// Hosting / un-hosting drives the route sink's APP-route methods
+    /// (kernel `/128` install/remove), distinct from peer-route methods.
+    #[test]
+    fn host_app_route_drives_route_sink() {
+        let sink = Arc::new(RecordingRouteSink::default());
+        let t = SessionTable::with_route_sink(sink.clone());
+        let me = StaticSecret::from([42u8; 32]);
+        let host = info(1, HOST_ULA, Some("127.0.0.1:51820"));
+        t.upsert(&me, &host);
+        // The peer route was installed; no app routes yet.
+        assert_eq!(*sink.added.lock(), vec![host.ula]);
+        assert!(sink.app_added.lock().is_empty());
+
+        t.host_remote_app_route(ula(APP_A), host.ula);
+        assert_eq!(
+            *sink.app_added.lock(),
+            vec![ula(APP_A)],
+            "app /128 installed"
+        );
+
+        t.unhost_remote_app_route(ula(APP_A));
+        assert_eq!(
+            *sink.app_removed.lock(),
+            vec![ula(APP_A)],
+            "app /128 removed"
+        );
+    }
+
+    /// Removing the HOST peer's session tears down every app-ULA it hosted
+    /// — index entries dropped + kernel app routes removed.
+    #[test]
+    fn removing_host_peer_tears_down_its_app_routes() {
+        let sink = Arc::new(RecordingRouteSink::default());
+        let t = SessionTable::with_route_sink(sink.clone());
+        let me = StaticSecret::from([42u8; 32]);
+        let host = info(1, HOST_ULA, Some("127.0.0.1:51820"));
+        t.upsert(&me, &host);
+        t.host_remote_app_route(ula(APP_A), host.ula);
+        t.host_remote_app_route(ula(APP_B), host.ula);
+        assert_eq!(t.app_ulas_for_host(host.ula).len(), 2);
+
+        assert!(t.remove(host.ula));
+        // Both app-ULAs are unmapped and their kernel routes removed.
+        assert!(t.app_route_host(ula(APP_A)).is_none());
+        assert!(t.app_route_host(ula(APP_B)).is_none());
+        let mut app_removed = sink.app_removed.lock().clone();
+        app_removed.sort();
+        let mut expected = vec![ula(APP_A), ula(APP_B)];
+        expected.sort();
+        assert_eq!(app_removed, expected);
+    }
+
+    /// A re-upsert of the host peer (endpoint roam / re-handshake) builds a
+    /// FRESH session but must PRESERVE the app-ULAs it hosts in the new
+    /// session's allowed-set — replayed from the durable `app_routes`
+    /// index. Without this, an endpoint roam would silently break app
+    /// responses.
+    #[test]
+    fn re_upsert_host_preserves_hosted_app_ulas_in_allowed_set() {
+        let t = SessionTable::new();
+        let me = StaticSecret::from([42u8; 32]);
+        let host = info(1, HOST_ULA, Some("127.0.0.1:51820"));
+        t.upsert(&me, &host);
+        t.host_remote_app_route(ula(APP_A), host.ula);
+
+        // Endpoint roam: same ULA, new endpoint → fresh Tunn + session.
+        let moved = info(1, HOST_ULA, Some("10.0.0.5:51820"));
+        t.upsert(&me, &moved);
+        let session = t.by_ula(host.ula).expect("session after roam");
+        assert!(
+            session.is_allowed_source(ula(APP_A)),
+            "hosted app-ULA must survive a session re-upsert"
+        );
+        // And it still resolves through by_ula.
+        assert_eq!(t.by_ula(ula(APP_A)).map(|s| s.ula), Some(host.ula));
+    }
+
+    /// Recording an app route BEFORE the host's session exists still wires
+    /// the allowed-set once the session is upserted (index-first ordering).
+    /// This matters because the roster can advertise a peer's hosted apps
+    /// in the same frame that first creates its session.
+    #[test]
+    fn app_route_recorded_before_session_is_applied_on_upsert() {
+        let t = SessionTable::new();
+        let me = StaticSecret::from([42u8; 32]);
+        let host = info(1, HOST_ULA, Some("127.0.0.1:51820"));
+        // Record the app route with NO session yet — index holds it.
+        t.host_remote_app_route(ula(APP_A), host.ula);
+        assert_eq!(t.app_route_host(ula(APP_A)), Some(host.ula));
+        // by_ula can't resolve yet (no host session).
+        assert!(t.by_ula(ula(APP_A)).is_none());
+        // First upsert of the host: a *new* session — but the replay loop
+        // only runs on re-upsert, so wire the allowed-set explicitly via a
+        // second host_remote_app_route once the session exists. The roster
+        // consumer always (re-)applies after upsert, so model that here.
+        t.upsert(&me, &host);
+        t.host_remote_app_route(ula(APP_A), host.ula);
+        let session = t.by_ula(host.ula).expect("session");
+        assert!(session.is_allowed_source(ula(APP_A)));
+        assert_eq!(t.by_ula(ula(APP_A)).map(|s| s.ula), Some(host.ula));
+    }
+
+    /// No-sink table: app-route hosting/un-hosting must not panic (route
+    /// management simply skipped), mirroring the peer-route no-sink guard.
+    #[test]
+    fn no_sink_table_skips_app_route_management() {
+        let t = SessionTable::new();
+        let me = StaticSecret::from([42u8; 32]);
+        let host = info(1, HOST_ULA, Some("127.0.0.1:51820"));
+        t.upsert(&me, &host);
+        t.host_remote_app_route(ula(APP_A), host.ula);
+        t.unhost_remote_app_route(ula(APP_A));
     }
 }

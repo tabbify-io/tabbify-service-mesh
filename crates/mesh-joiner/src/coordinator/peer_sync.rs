@@ -15,7 +15,7 @@
 //! [`crate::coordinator::heartbeat`] is doing its own periodic
 //! reconciliation.
 
-use crate::coordinator::client::{remote_to_info, CoordinatorClient};
+use crate::coordinator::client::{CoordinatorClient, remote_to_info};
 use crate::nat::holepunch::HolePunchInitiate;
 use crate::peer::{PeerEventKind, PeerRemovedPayload, RemotePeer};
 use crate::wg::session::SessionTable;
@@ -193,9 +193,15 @@ pub async fn apply_event(
                 peer_id = %info.peer_id,
                 ula = %info.ula,
                 ?kind,
+                hosted_app_ulas = ?info.hosted_app_ulas,
                 "peer-stream: applying upsert"
             );
             sessions.upsert(our_private, &info);
+            // Per-app-ULA routing: after the peer's session exists,
+            // reconcile the app-ULAs it advertises against what we
+            // currently route to it (installs new app-routes, tears down
+            // dropped ones). Additive — a no-op for peers hosting no apps.
+            sessions.reconcile_app_routes(info.ula, &info.hosted_app_ulas);
         }
         PeerEventKind::Removed => {
             let payload: PeerRemovedPayload = match serde_json::from_str(data) {
@@ -261,7 +267,7 @@ async fn sleep_or_shutdown(dur: Duration, shutdown: &mut watch::Receiver<bool>) 
 mod tests {
     use super::*;
     use crate::peer::RemotePeer;
-    use base64::engine::{general_purpose::STANDARD as B64, Engine as _};
+    use base64::engine::{Engine as _, general_purpose::STANDARD as B64};
     use std::net::Ipv6Addr;
     use uuid::Uuid;
     use x25519_dalek::PublicKey;
@@ -280,6 +286,7 @@ mod tests {
             listen_endpoint: Some("127.0.0.1:51820".into()),
             display_name: format!("peer-{n}"),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 0,
         })
         .unwrap()
@@ -297,9 +304,11 @@ mod tests {
             &remote_json("fd5a:1f00:1::1", 1),
         )
         .await;
-        assert!(sessions
-            .by_ula("fd5a:1f00:1::1".parse::<Ipv6Addr>().unwrap())
-            .is_some());
+        assert!(
+            sessions
+                .by_ula("fd5a:1f00:1::1".parse::<Ipv6Addr>().unwrap())
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -328,12 +337,16 @@ mod tests {
             &serde_json::to_string(&updated).unwrap(),
         )
         .await;
-        assert!(sessions
-            .by_endpoint("127.0.0.1:51820".parse().unwrap())
-            .is_none());
-        assert!(sessions
-            .by_endpoint("10.0.0.5:51820".parse().unwrap())
-            .is_some());
+        assert!(
+            sessions
+                .by_endpoint("127.0.0.1:51820".parse().unwrap())
+                .is_none()
+        );
+        assert!(
+            sessions
+                .by_endpoint("10.0.0.5:51820".parse().unwrap())
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -344,8 +357,7 @@ mod tests {
         let parsed: RemotePeer = serde_json::from_str(&json).unwrap();
         apply_event(&sessions, &me, None, PeerEventKind::Added, &json).await;
         assert_eq!(sessions.len(), 1);
-        let removed_payload =
-            serde_json::json!({ "peer_id": parsed.peer_id }).to_string();
+        let removed_payload = serde_json::json!({ "peer_id": parsed.peer_id }).to_string();
         apply_event(
             &sessions,
             &me,
@@ -396,7 +408,14 @@ mod tests {
         let sessions = SessionTable::new();
         let me = StaticSecret::from([0xAA; 32]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        apply_event(&sessions, &me, Some(&tx), PeerEventKind::HolePunch, "not json").await;
+        apply_event(
+            &sessions,
+            &me,
+            Some(&tx),
+            PeerEventKind::HolePunch,
+            "not json",
+        )
+        .await;
         assert!(rx.try_recv().is_err(), "nothing forwarded on bad json");
     }
 
@@ -426,5 +445,188 @@ mod tests {
         assert!(url.contains("/v1/mesh/peers/stream"));
         assert!(url.contains("?peer_id="));
         assert!(url.ends_with(&id.to_string()));
+    }
+
+    // ---- per-app-ULA routing: roster consumer install / remove ----
+    //
+    // These drive `apply_event` with roster frames that carry
+    // `hosted_app_ulas` and assert the SESSION TABLE (with a recording
+    // route sink) ends up with the right app-routes — adds on advertise,
+    // removals on a shrunk set. A FAKE sink is used so the tests never
+    // shell out to real `route` / `ifconfig`.
+
+    use crate::wg::session::RouteSink;
+    use parking_lot::Mutex as PlMutex;
+    use std::sync::Arc;
+
+    /// Recording route sink — captures app-route installs / removals so a
+    /// roster-driven test can assert the kernel WOULD see the right /128s
+    /// without shelling out.
+    #[derive(Default)]
+    struct RecordingSink {
+        app_added: PlMutex<Vec<Ipv6Addr>>,
+        app_removed: PlMutex<Vec<Ipv6Addr>>,
+    }
+    impl RouteSink for RecordingSink {
+        fn add_allowed(&self, _ula: Ipv6Addr) {}
+        fn remove_allowed(&self, _ula: Ipv6Addr) {}
+        fn add_app_route(&self, app_ula: Ipv6Addr) {
+            self.app_added.lock().push(app_ula);
+        }
+        fn remove_app_route(&self, app_ula: Ipv6Addr) {
+            self.app_removed.lock().push(app_ula);
+        }
+    }
+
+    /// A `RemotePeer` JSON body that ALSO advertises hosted app-ULAs.
+    fn remote_json_hosting(ula: &str, n: u8, hosted: &[&str]) -> String {
+        serde_json::to_string(&RemotePeer {
+            peer_id: Uuid::parse_str("01910f10-0000-7000-8000-000000000001").unwrap(),
+            wg_public_key: pubkey_b64(n),
+            ula: ula.into(),
+            listen_endpoint: Some("127.0.0.1:51820".into()),
+            display_name: format!("peer-{n}"),
+            tags: vec![],
+            hosted_app_ulas: hosted.iter().map(|s| (*s).to_owned()).collect(),
+            joined_at_micros: 0,
+        })
+        .unwrap()
+    }
+
+    const APP_X: &str = "fd5a:1f02:dead:beef:cafe:0:0:1";
+    const APP_Y: &str = "fd5a:1f02:dead:beef:cafe:0:0:2";
+    const HOST: &str = "fd5a:1f00:1::1";
+
+    fn ula6(s: &str) -> Ipv6Addr {
+        s.parse().unwrap()
+    }
+
+    /// A `peer_added` advertising hosted app-ULAs installs an app-route
+    /// per app-ULA: the session table resolves each to the host, the
+    /// host's allowed-set grows, and the route sink fires.
+    #[tokio::test]
+    async fn apply_added_with_hosted_app_ulas_installs_routes() {
+        let sink = Arc::new(RecordingSink::default());
+        let sessions = SessionTable::with_route_sink(sink.clone());
+        let me = StaticSecret::from([0xAA; 32]);
+        apply_event(
+            &sessions,
+            &me,
+            None,
+            PeerEventKind::Added,
+            &remote_json_hosting(HOST, 1, &[APP_X, APP_Y]),
+        )
+        .await;
+        // Both app-ULAs resolve to the host's session.
+        assert_eq!(
+            sessions.by_ula(ula6(APP_X)).map(|s| s.ula),
+            Some(ula6(HOST))
+        );
+        assert_eq!(
+            sessions.by_ula(ula6(APP_Y)).map(|s| s.ula),
+            Some(ula6(HOST))
+        );
+        // The host session's allowed-set grew to include both.
+        let host_session = sessions.by_ula(ula6(HOST)).expect("host session");
+        assert!(host_session.is_allowed_source(ula6(APP_X)));
+        assert!(host_session.is_allowed_source(ula6(APP_Y)));
+        // The route sink installed both app /128s.
+        let mut added = sink.app_added.lock().clone();
+        added.sort();
+        let mut expected = vec![ula6(APP_X), ula6(APP_Y)];
+        expected.sort();
+        assert_eq!(added, expected);
+    }
+
+    /// A `peer_updated` with a SHRUNK hosted set tears down the dropped
+    /// app-ULA (reverse of install) while keeping the surviving one.
+    #[tokio::test]
+    async fn apply_updated_with_shrunk_hosted_set_removes_dropped_route() {
+        let sink = Arc::new(RecordingSink::default());
+        let sessions = SessionTable::with_route_sink(sink.clone());
+        let me = StaticSecret::from([0xAA; 32]);
+        // First advertise both X and Y.
+        apply_event(
+            &sessions,
+            &me,
+            None,
+            PeerEventKind::Added,
+            &remote_json_hosting(HOST, 1, &[APP_X, APP_Y]),
+        )
+        .await;
+        // Now an update drops Y, keeps X.
+        apply_event(
+            &sessions,
+            &me,
+            None,
+            PeerEventKind::Updated,
+            &remote_json_hosting(HOST, 1, &[APP_X]),
+        )
+        .await;
+        // X still routes; Y no longer does.
+        assert_eq!(
+            sessions.by_ula(ula6(APP_X)).map(|s| s.ula),
+            Some(ula6(HOST))
+        );
+        assert!(sessions.by_ula(ula6(APP_Y)).is_none());
+        // The dropped app /128 was removed from the kernel.
+        assert_eq!(*sink.app_removed.lock(), vec![ula6(APP_Y)]);
+        // And the host's allowed-set no longer accepts Y.
+        let host_session = sessions.by_ula(ula6(HOST)).expect("host session");
+        assert!(host_session.is_allowed_source(ula6(APP_X)));
+        assert!(!host_session.is_allowed_source(ula6(APP_Y)));
+    }
+
+    /// `peer_removed` for the host tears down ALL its app-routes (the host
+    /// is gone, so every app it served is unreachable through it).
+    #[tokio::test]
+    async fn apply_removed_host_tears_down_all_its_app_routes() {
+        let sink = Arc::new(RecordingSink::default());
+        let sessions = SessionTable::with_route_sink(sink.clone());
+        let me = StaticSecret::from([0xAA; 32]);
+        let added = remote_json_hosting(HOST, 1, &[APP_X, APP_Y]);
+        let parsed: RemotePeer = serde_json::from_str(&added).unwrap();
+        apply_event(&sessions, &me, None, PeerEventKind::Added, &added).await;
+        assert_eq!(sessions.app_ulas_for_host(ula6(HOST)).len(), 2);
+
+        let removed_payload = serde_json::json!({ "peer_id": parsed.peer_id }).to_string();
+        apply_event(
+            &sessions,
+            &me,
+            None,
+            PeerEventKind::Removed,
+            &removed_payload,
+        )
+        .await;
+        // Host gone → neither app-ULA resolves.
+        assert!(sessions.by_ula(ula6(APP_X)).is_none());
+        assert!(sessions.by_ula(ula6(APP_Y)).is_none());
+        let mut app_removed = sink.app_removed.lock().clone();
+        app_removed.sort();
+        let mut expected = vec![ula6(APP_X), ula6(APP_Y)];
+        expected.sort();
+        assert_eq!(app_removed, expected);
+    }
+
+    /// A peer-only `peer_added` (no hosted apps) installs ZERO app-routes
+    /// — the additive contract: the app path is dormant for normal peers.
+    #[tokio::test]
+    async fn apply_added_without_hosted_apps_installs_no_app_routes() {
+        let sink = Arc::new(RecordingSink::default());
+        let sessions = SessionTable::with_route_sink(sink.clone());
+        let me = StaticSecret::from([0xAA; 32]);
+        apply_event(
+            &sessions,
+            &me,
+            None,
+            PeerEventKind::Added,
+            &remote_json(HOST, 1),
+        )
+        .await;
+        assert!(
+            sink.app_added.lock().is_empty(),
+            "no app routes for a plain peer"
+        );
+        assert_eq!(sessions.len(), 1);
     }
 }

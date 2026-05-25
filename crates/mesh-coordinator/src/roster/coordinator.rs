@@ -50,6 +50,13 @@ pub struct PeerEntry {
     /// seam ([`crate::roster::identity`]) so the source can be swapped to
     /// JWT claims in E4 without touching the roster/policy code.
     pub tags: Vec<String>,
+    /// App-ULAs (IPv6 literals, `fd5a:1f02:...`) this peer currently
+    /// hosts. Set on register, REPLACED wholesale on every heartbeat (a
+    /// supervisor re-sends its full hosted set each tick). The coordinator
+    /// treats these as opaque `/128`s — `derive_app_ula` lives in the app
+    /// layer — and advertises them to every viewer like [`Self::ula`]
+    /// (per-app-ULA routing).
+    pub hosted_app_ulas: Vec<String>,
     /// Joined-at, wall-clock micros (matches event field).
     pub joined_at_micros: i64,
     /// Last heartbeat — monotonic clock; only used for timeout sweeps.
@@ -91,6 +98,7 @@ impl PeerEntry {
             display_name: self.display_name.clone(),
             network: self.network.clone(),
             tags: self.tags.clone(),
+            hosted_app_ulas: self.hosted_app_ulas.clone(),
             joined_at_micros: self.joined_at_micros,
         }
     }
@@ -359,6 +367,10 @@ impl Coordinator {
             display_name: req.display_name.clone(),
             network: identity.network,
             tags: identity.tags,
+            // The set of app-ULAs the registrant declares it already hosts.
+            // Opaque /128s to the coordinator — advertised to viewers like
+            // the peer's own ULA (per-app-ULA routing).
+            hosted_app_ulas: req.hosted_app_ulas.clone(),
             joined_at_micros: now_micros,
         };
         // Publish first so the sink sees the event before in-memory state
@@ -464,15 +476,28 @@ impl Coordinator {
         peer_id: Uuid,
         observed_external: String,
         wg_listen_port: Option<u16>,
+        hosted_app_ulas: Vec<String>,
     ) -> Result<PeerEntry, CoordinatorError> {
         // Pre-check membership so we can surface UnknownPeer without
-        // emitting a heartbeat event for a peer that doesn't exist.
-        if !self.inner.roster.contains_key(&peer_id) {
+        // emitting a heartbeat event for a peer that doesn't exist. Capture
+        // the prior hosted-app-ULA set in the same lookup so we can detect
+        // a change after apply and re-broadcast only when it actually moved
+        // (per-app-ULA routing).
+        let Some(prior_hosted) = self
+            .inner
+            .roster
+            .get(&peer_id)
+            .map(|e| e.hosted_app_ulas.clone())
+        else {
             return Err(CoordinatorError::UnknownPeer(peer_id));
-        }
+        };
         let event = PeerHeartbeat {
             peer_id: peer_id.to_string(),
             observed_external: observed_external.clone(),
+            // Carry the supervisor's current hosted set through the event
+            // so the apply layer (and any future durable replay) replaces
+            // the stored set from one source of truth.
+            hosted_app_ulas,
             at_micros: now_unix_micros(),
         };
         publish_event(self.inner.publisher.as_ref(), PEER_SEGMENT, &event).await;
@@ -491,7 +516,20 @@ impl Coordinator {
             .get(&peer_id)
             .map(|e| e.clone())
             .ok_or(CoordinatorError::UnknownPeer(peer_id))?;
-        debug!(peer_id = %peer_id, observed_external, "heartbeat stamped");
+        let hosted_changed = snapshot.hosted_app_ulas != prior_hosted;
+        debug!(
+            peer_id = %peer_id,
+            observed_external,
+            hosted_changed,
+            "heartbeat stamped"
+        );
+        // Every heartbeat already re-broadcasts `Updated` so endpoint
+        // roaming converges on SSE subscribers; the per-app-ULA set rides
+        // along in `to_info()`, so a changed hosted set is published the
+        // same way (spec: "if changed, broadcast PeerEvent::Updated"). The
+        // broadcast stays unconditional to avoid regressing the existing
+        // endpoint-roaming path; `hosted_changed` is logged for
+        // observability.
         self.inner
             .broadcaster
             .broadcast(PeerEvent::Updated(snapshot.to_info()));
@@ -628,12 +666,7 @@ impl Coordinator {
         // only learn of a removal for a peer it could previously see).
         // Returning early here also covers the unknown-peer case so we
         // don't emit a spurious PeerLeft into the log.
-        let Some(tags) = self
-            .inner
-            .roster
-            .get(&peer_id)
-            .map(|e| e.tags.clone())
-        else {
+        let Some(tags) = self.inner.roster.get(&peer_id).map(|e| e.tags.clone()) else {
             return false;
         };
         let event = PeerLeft {
@@ -654,8 +687,12 @@ impl Coordinator {
     /// Snapshot the entire roster, ordered by `peer_index` for stable output.
     #[must_use]
     pub fn snapshot(&self) -> Vec<PeerInfo> {
-        let mut entries: Vec<PeerEntry> =
-            self.inner.roster.iter().map(|kv| kv.value().clone()).collect();
+        let mut entries: Vec<PeerEntry> = self
+            .inner
+            .roster
+            .iter()
+            .map(|kv| kv.value().clone())
+            .collect();
         entries.sort_by_key(|p| p.peer_index);
         entries.iter().map(PeerEntry::to_info).collect()
     }
@@ -705,6 +742,10 @@ impl Coordinator {
             e.endpoint_is_reflexive = resolved.reflexive;
             e.display_name.clone_from(&req.display_name);
             e.tags = identity.tags;
+            // Refresh the hosted app-ULA set from the (re-)register request
+            // so a re-register reflects the supervisor's current hosting
+            // state, mirroring the heartbeat replace semantics.
+            e.hosted_app_ulas.clone_from(&req.hosted_app_ulas);
             e.last_heartbeat = Instant::now();
             if let Some(obs) = observed {
                 e.observed_external = obs.to_string();
@@ -760,6 +801,7 @@ mod tests {
             display_name: name.into(),
             network: String::new(),
             tags: vec!["dev-machine".into()],
+            hosted_app_ulas: vec![],
         }
     }
 
@@ -801,14 +843,19 @@ mod tests {
         let c = coordinator();
         let (entry, _) = c.register(req(3, "carol")).await.expect("register");
         let updated = c
-            .heartbeat(entry.peer_id, "203.0.113.1:51820".into(), Some(51820))
+            .heartbeat(
+                entry.peer_id,
+                "203.0.113.1:51820".into(),
+                Some(51820),
+                vec![],
+            )
             .await
             .expect("heartbeat");
         assert_eq!(updated.peer_id, entry.peer_id);
 
         let bogus = Uuid::now_v7();
         let err = c
-            .heartbeat(bogus, "ignored".into(), None)
+            .heartbeat(bogus, "ignored".into(), None, vec![])
             .await
             .expect_err("unknown peer");
         assert!(matches!(err, CoordinatorError::UnknownPeer(_)));
@@ -823,8 +870,10 @@ mod tests {
         assert!(!c.deregister(entry.peer_id, "test").await);
         // After deregister the by_pubkey index is also clear, so the
         // same pubkey can register fresh and earn a new peer_id.
-        let (replacement, outcome) =
-            c.register(req(4, "dave-prime")).await.expect("register again");
+        let (replacement, outcome) = c
+            .register(req(4, "dave-prime"))
+            .await
+            .expect("register again");
         assert_ne!(replacement.peer_id, entry.peer_id);
         assert_eq!(outcome, RegisterOutcome::Created);
     }
@@ -852,6 +901,7 @@ mod tests {
                 display_name: "short".into(),
                 network: String::new(),
                 tags: vec![],
+                hosted_app_ulas: vec![],
             })
             .await
             .expect_err("invalid pubkey");
@@ -948,9 +998,14 @@ mod tests {
         // First heartbeats — neither peer has been seen yet, so each
         // populates its own observed_external. After the first heartbeat
         // from each, both peers have non-empty external addrs.
-        c.heartbeat(alice.peer_id, "203.0.113.10:11111".into(), Some(51820))
-            .await
-            .expect("a hb1");
+        c.heartbeat(
+            alice.peer_id,
+            "203.0.113.10:11111".into(),
+            Some(51820),
+            vec![],
+        )
+        .await
+        .expect("a hb1");
         // Only alice has external so far — no holepunch event yet.
         assert_eq!(
             pub_.count_by_type("holepunch_initiate"),
@@ -958,9 +1013,14 @@ mod tests {
             "should not emit until both peers have observed_external"
         );
 
-        c.heartbeat(bob.peer_id, "198.51.100.20:22222".into(), Some(51820))
-            .await
-            .expect("b hb1");
+        c.heartbeat(
+            bob.peer_id,
+            "198.51.100.20:22222".into(),
+            Some(51820),
+            vec![],
+        )
+        .await
+        .expect("b hb1");
 
         // Now both have external addrs → exactly one pair = 2 events.
         let punch_events = pub_.count_by_type("holepunch_initiate");
@@ -997,9 +1057,14 @@ mod tests {
         assert_eq!(c.punch_tracker().len(), 1);
 
         // Another heartbeat from alice should NOT re-emit (dedup).
-        c.heartbeat(alice.peer_id, "203.0.113.10:11111".into(), Some(51820))
-            .await
-            .expect("a hb2");
+        c.heartbeat(
+            alice.peer_id,
+            "203.0.113.10:11111".into(),
+            Some(51820),
+            vec![],
+        )
+        .await
+        .expect("a hb2");
         assert_eq!(
             pub_.count_by_type("holepunch_initiate"),
             2,
@@ -1020,12 +1085,22 @@ mod tests {
         // Subscribe AFTER register so the channel only carries the
         // heartbeat-time frames we care about.
         let mut rx = c.broadcaster().subscribe();
-        c.heartbeat(alice.peer_id, "203.0.113.70:11111".into(), Some(51820))
-            .await
-            .expect("a hb");
-        c.heartbeat(bob.peer_id, "198.51.100.71:22222".into(), Some(51820))
-            .await
-            .expect("b hb");
+        c.heartbeat(
+            alice.peer_id,
+            "203.0.113.70:11111".into(),
+            Some(51820),
+            vec![],
+        )
+        .await
+        .expect("a hb");
+        c.heartbeat(
+            bob.peer_id,
+            "198.51.100.71:22222".into(),
+            Some(51820),
+            vec![],
+        )
+        .await
+        .expect("b hb");
 
         // Drain the channel and keep only the hole-punch frames.
         let mut punches = Vec::new();
@@ -1041,12 +1116,16 @@ mod tests {
         );
         // Each event points the initiator at the OTHER peer's REFLEXIVE WG
         // endpoint (observed-ip:wg-port), not the raw heartbeat TCP source.
-        assert!(punches
-            .iter()
-            .any(|p| p.target_external_endpoint == "203.0.113.70:51820"));
-        assert!(punches
-            .iter()
-            .any(|p| p.target_external_endpoint == "198.51.100.71:51820"));
+        assert!(
+            punches
+                .iter()
+                .any(|p| p.target_external_endpoint == "203.0.113.70:51820")
+        );
+        assert!(
+            punches
+                .iter()
+                .any(|p| p.target_external_endpoint == "198.51.100.71:51820")
+        );
     }
 
     #[tokio::test]
@@ -1058,7 +1137,7 @@ mod tests {
 
         // Alice heartbeats with a known external — bob never heartbeats,
         // so its observed_external stays empty.
-        c.heartbeat(alice.peer_id, "203.0.113.30:33333".into(), None)
+        c.heartbeat(alice.peer_id, "203.0.113.30:33333".into(), None, vec![])
             .await
             .expect("a hb");
 
@@ -1078,14 +1157,14 @@ mod tests {
         let (bob, _) = c.register(req(61, "bob")).await.expect("b");
 
         // Alice gets an external on heartbeat 1.
-        c.heartbeat(alice.peer_id, "203.0.113.50:44444".into(), None)
+        c.heartbeat(alice.peer_id, "203.0.113.50:44444".into(), None, vec![])
             .await
             .expect("a hb");
 
         // Bob heartbeats but ConnectInfo wasn't captured — empty string.
         // This mirrors the test-router path that drives via Router::call
         // without the make_service wrapper.
-        c.heartbeat(bob.peer_id, String::new(), None)
+        c.heartbeat(bob.peer_id, String::new(), None, vec![])
             .await
             .expect("b hb empty external");
 
@@ -1127,7 +1206,10 @@ mod tests {
         assert_eq!(entry.observed_external, "203.0.113.7:34812");
         // And the stored roster entry agrees.
         let stored = c.snapshot();
-        assert_eq!(stored[0].listen_endpoint.as_deref(), Some("203.0.113.7:51820"));
+        assert_eq!(
+            stored[0].listen_endpoint.as_deref(),
+            Some("203.0.113.7:51820")
+        );
     }
 
     /// An explicit `--advertise-endpoint` pointing at a PUBLIC address must
@@ -1142,6 +1224,7 @@ mod tests {
             display_name: "advertised".into(),
             network: String::new(),
             tags: vec!["dev-machine".into()],
+            hosted_app_ulas: vec![],
         };
         let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
         let (entry, _) = c
@@ -1184,7 +1267,12 @@ mod tests {
 
         // Heartbeat arrives from a different public IP — same WG port.
         let updated = c
-            .heartbeat(entry.peer_id, "198.51.100.99:60000".into(), Some(51820))
+            .heartbeat(
+                entry.peer_id,
+                "198.51.100.99:60000".into(),
+                Some(51820),
+                vec![],
+            )
             .await
             .expect("heartbeat");
         assert_eq!(
@@ -1207,6 +1295,7 @@ mod tests {
             display_name: "advertised".into(),
             network: String::new(),
             tags: vec![],
+            hosted_app_ulas: vec![],
         };
         let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
         let (entry, _) = c
@@ -1215,7 +1304,12 @@ mod tests {
             .expect("register");
         // Heartbeat from a public IP that differs from the advertised one.
         let updated = c
-            .heartbeat(entry.peer_id, "203.0.113.7:34900".into(), Some(51820))
+            .heartbeat(
+                entry.peer_id,
+                "203.0.113.7:34900".into(),
+                Some(51820),
+                vec![],
+            )
             .await
             .expect("heartbeat");
         assert_eq!(
@@ -1240,10 +1334,18 @@ mod tests {
         assert!(!entry.endpoint_is_reflexive);
         // Heartbeat from a public IP → must promote to reflexive.
         let updated = c
-            .heartbeat(entry.peer_id, "203.0.113.7:34812".into(), Some(51820))
+            .heartbeat(
+                entry.peer_id,
+                "203.0.113.7:34812".into(),
+                Some(51820),
+                vec![],
+            )
             .await
             .expect("heartbeat");
-        assert_eq!(updated.listen_endpoint.as_deref(), Some("203.0.113.7:51820"));
+        assert_eq!(
+            updated.listen_endpoint.as_deref(),
+            Some("203.0.113.7:51820")
+        );
         assert!(updated.endpoint_is_reflexive);
     }
 
@@ -1265,6 +1367,163 @@ mod tests {
         assert_eq!(outcome, RegisterOutcome::Existed);
         assert_eq!(first.peer_id, second.peer_id);
         assert_eq!(second.listen_endpoint.as_deref(), Some("203.0.113.7:51820"));
+    }
+
+    // -----------------------------------------------------------------
+    // Per-app-ULA routing — the coordinator carries opaque hosted
+    // app-ULA /128s through register + heartbeat and advertises them to
+    // viewers exactly like the peer's own ULA. The coordinator stays
+    // app-agnostic: it never derives or validates an app-ULA, it just
+    // relays the set the peer declares. These tests pin the control-plane
+    // contract the joiner's app-route layer (Component 2) consumes.
+    // -----------------------------------------------------------------
+
+    /// A request that also declares a set of hosted app-ULAs.
+    fn req_hosting(seed: u8, name: &str, hosted: &[&str]) -> RegisterRequest {
+        RegisterRequest {
+            hosted_app_ulas: hosted.iter().map(|s| (*s).to_owned()).collect(),
+            ..req(seed, name)
+        }
+    }
+
+    /// Register must STORE the declared hosted app-ULAs and surface them
+    /// on the roster entry + the wire `PeerInfo` (snapshot), with the same
+    /// visibility as the peer's own ULA.
+    #[tokio::test]
+    async fn register_stores_and_advertises_hosted_app_ulas() {
+        let c = coordinator();
+        let app_a = "fd5a:1f02:dead:beef:cafe:0:0:1";
+        let app_b = "fd5a:1f02:dead:beef:cafe:0:0:2";
+        let (entry, outcome) = c
+            .register(req_hosting(1, "supervisor", &[app_a, app_b]))
+            .await
+            .expect("register");
+        assert_eq!(outcome, RegisterOutcome::Created);
+        assert_eq!(
+            entry.hosted_app_ulas,
+            vec![app_a.to_owned(), app_b.to_owned()]
+        );
+        // The wire-facing snapshot carries them too (advertised to viewers).
+        let snap = c.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].hosted_app_ulas,
+            vec![app_a.to_owned(), app_b.to_owned()]
+        );
+    }
+
+    /// A heartbeat REPLACES the stored hosted set wholesale: a supervisor
+    /// re-sends its full hosted set each tick, so an added app appears and
+    /// a removed app disappears purely from the replace.
+    #[tokio::test]
+    async fn heartbeat_replaces_hosted_app_ula_set() {
+        let c = coordinator();
+        let app_a = "fd5a:1f02:dead:beef:cafe:0:0:1";
+        let app_b = "fd5a:1f02:dead:beef:cafe:0:0:2";
+        let (entry, _) = c
+            .register(req_hosting(2, "supervisor", &[app_a]))
+            .await
+            .expect("register");
+        assert_eq!(entry.hosted_app_ulas, vec![app_a.to_owned()]);
+
+        // Heartbeat now advertises a DIFFERENT set: drop app_a, add app_b.
+        let updated = c
+            .heartbeat(
+                entry.peer_id,
+                "203.0.113.1:51820".into(),
+                Some(51820),
+                vec![app_b.to_owned()],
+            )
+            .await
+            .expect("heartbeat");
+        assert_eq!(
+            updated.hosted_app_ulas,
+            vec![app_b.to_owned()],
+            "heartbeat must replace the stored hosted set wholesale"
+        );
+
+        // An empty heartbeat set clears everything (supervisor stopped all).
+        let cleared = c
+            .heartbeat(
+                entry.peer_id,
+                "203.0.113.1:51820".into(),
+                Some(51820),
+                vec![],
+            )
+            .await
+            .expect("heartbeat clear");
+        assert!(cleared.hosted_app_ulas.is_empty());
+    }
+
+    /// A heartbeat that CHANGES the hosted set must reach SSE subscribers
+    /// as an `Updated` frame carrying the new set — that is how a viewer
+    /// re-learns which apps a supervisor hosts (per-app-ULA routing).
+    #[tokio::test]
+    async fn heartbeat_broadcasts_updated_with_new_hosted_set() {
+        let c = coordinator();
+        let app_a = "fd5a:1f02:dead:beef:cafe:0:0:1";
+        let (entry, _) = c.register(req(3, "supervisor")).await.expect("register");
+
+        // Subscribe AFTER register so we only see heartbeat-time frames.
+        let mut rx = c.broadcaster().subscribe();
+        c.heartbeat(
+            entry.peer_id,
+            "203.0.113.1:51820".into(),
+            Some(51820),
+            vec![app_a.to_owned()],
+        )
+        .await
+        .expect("heartbeat");
+
+        // Drain the channel; find an Updated frame for this peer carrying
+        // the new hosted set.
+        let mut saw_hosted = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let PeerEvent::Updated(info) = ev {
+                if info.peer_id == entry.peer_id.to_string()
+                    && info.hosted_app_ulas == vec![app_a.to_owned()]
+                {
+                    saw_hosted = true;
+                }
+            }
+        }
+        assert!(
+            saw_hosted,
+            "a changed hosted set must be broadcast as Updated with the new set"
+        );
+    }
+
+    /// Re-register also refreshes the hosted set from the request, mirroring
+    /// the heartbeat replace semantics (so a restart that re-declares its
+    /// apps converges).
+    #[tokio::test]
+    async fn re_register_refreshes_hosted_app_ula_set() {
+        let c = coordinator();
+        let app_a = "fd5a:1f02:dead:beef:cafe:0:0:1";
+        let app_b = "fd5a:1f02:dead:beef:cafe:0:0:2";
+        let (first, o1) = c
+            .register(req_hosting(4, "supervisor", &[app_a]))
+            .await
+            .expect("first");
+        assert_eq!(o1, RegisterOutcome::Created);
+        // Re-register (same pubkey/seed) with a different hosted set.
+        let (second, o2) = c
+            .register(req_hosting(4, "supervisor", &[app_b]))
+            .await
+            .expect("re-register");
+        assert_eq!(o2, RegisterOutcome::Existed);
+        assert_eq!(first.peer_id, second.peer_id);
+        assert_eq!(second.hosted_app_ulas, vec![app_b.to_owned()]);
+    }
+
+    /// An older joiner that omits `hosted_app_ulas` (serde default) is
+    /// treated as hosting no apps — the field defaults to empty and never
+    /// errors. This guards the back-compat contract.
+    #[tokio::test]
+    async fn register_defaults_hosted_app_ulas_to_empty() {
+        let c = coordinator();
+        let (entry, _) = c.register(req(5, "legacy")).await.expect("register");
+        assert!(entry.hosted_app_ulas.is_empty());
     }
 }
 
@@ -1304,6 +1563,7 @@ mod jwt_tests {
             display_name: "node".into(),
             network: network.into(),
             tags: tags.iter().map(|s| (*s).to_owned()).collect(),
+            hosted_app_ulas: vec![],
         }
     }
 

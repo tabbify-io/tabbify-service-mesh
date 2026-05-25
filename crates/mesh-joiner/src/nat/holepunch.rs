@@ -25,7 +25,7 @@
 //! decided — gives downstream code the right import path now without
 //! requiring SSE-extension work today.
 
-use crate::wg::session::{classify_tunn_result, PeerSession, SessionTable, WgAction};
+use crate::wg::session::{PeerSession, SessionTable, WgAction, classify_tunn_result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -217,6 +217,7 @@ mod tests {
             listen_endpoint: endpoint.map(|s| s.parse().expect("endpoint")),
             display_name: "target".into(),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 0,
         };
         t.upsert(&me, &info);
@@ -230,8 +231,7 @@ mod tests {
         let me = Uuid::from_u128(1);
         let target = Uuid::from_u128(2);
         let sessions = session_table_with(target, "fd5a:1f00:1::2", Some("198.51.100.2:51820"));
-        let plan = plan_punch(&sessions, me, &ev(me, target, "203.0.113.2:40000"))
-            .expect("a plan");
+        let plan = plan_punch(&sessions, me, &ev(me, target, "203.0.113.2:40000")).expect("a plan");
         assert_eq!(plan.endpoint, "203.0.113.2:40000".parse().expect("addr"));
         assert_eq!(plan.session.peer_id, target);
     }
@@ -280,8 +280,8 @@ mod tests {
         let me = Uuid::from_u128(1);
         let target = Uuid::from_u128(2);
         let sessions = session_table_with(target, "fd5a:1f00:1::2", None);
-        let plan = plan_punch(&sessions, me, &ev(me, target, &target_addr.to_string()))
-            .expect("a plan");
+        let plan =
+            plan_punch(&sessions, me, &ev(me, target, &target_addr.to_string())).expect("a plan");
 
         execute_punch(&sender, &plan, 2, Duration::from_millis(1)).await;
 
@@ -291,7 +291,10 @@ mod tests {
             .expect("a datagram within timeout")
             .expect("recv ok");
         assert!(n >= 148, "WireGuard handshake-init is 148 bytes, got {n}");
-        assert_eq!(buf[0], 1, "first byte is the WG handshake-init message type");
+        assert_eq!(
+            buf[0], 1,
+            "first byte is the WG handshake-init message type"
+        );
         // The session now targets the reflexive endpoint for outbound.
         assert_eq!(plan.session.endpoint(), Some(target_addr));
     }

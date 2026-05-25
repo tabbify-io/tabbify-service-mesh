@@ -16,28 +16,65 @@
 //! style channel — we use a plain `tokio::sync::watch` to avoid pulling
 //! `tokio-util` just for one token.
 
-use crate::coordinator::client::{remote_to_info, CoordinatorClient};
+use crate::coordinator::client::{CoordinatorClient, remote_to_info};
 use crate::wg::session::SessionTable;
+use dashmap::DashMap;
 use std::collections::HashSet;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use uuid::Uuid;
 use x25519_dalek::StaticSecret;
 
+/// Snapshot the locally-hosted app-ULA set into the wire form
+/// (`Vec<String>` of IPv6 literals) the heartbeat advertises. Sorted for
+/// deterministic ordering (stable change-detection on the coordinator).
+fn hosted_app_ula_strings(hosted: &DashMap<Ipv6Addr, ()>) -> Vec<String> {
+    let mut v: Vec<String> = hosted.iter().map(|kv| kv.key().to_string()).collect();
+    v.sort();
+    v
+}
+
+/// Inputs to the heartbeat loop. Bundled into one struct so [`run`]
+/// stays under the clippy argument-count cap without an `allow` — same
+/// pattern as the joiner's `SpawnContext`.
+pub struct HeartbeatTask {
+    /// Coordinator HTTP client.
+    pub client: Arc<CoordinatorClient>,
+    /// Shared session table (reconciled against each heartbeat roster).
+    pub sessions: SessionTable,
+    /// Our X25519 private key — needed to (re)build peer sessions on
+    /// reconcile.
+    pub our_private: StaticSecret,
+    /// Our coordinator-assigned peer id.
+    pub peer_id: Uuid,
+    /// Our `WireGuard` UDP listen port — re-sent for reflexive refresh.
+    pub wg_listen_port: u16,
+    /// App-ULAs this node hosts — advertised on every heartbeat
+    /// (per-app-ULA routing). Shared with [`crate::Joiner`].
+    pub hosted_app_ulas: Arc<DashMap<Ipv6Addr, ()>>,
+    /// Heartbeat interval.
+    pub interval: Duration,
+    /// Cancellation signal.
+    pub shutdown: watch::Receiver<bool>,
+}
+
 /// Run the heartbeat loop until `shutdown` flips to `true`.
 ///
-/// Designed to be spawned with `tokio::spawn(run(...))` — does not
+/// Designed to be spawned with `tokio::spawn(run(task))` — does not
 /// return until cancelled.
-pub async fn run(
-    client: Arc<CoordinatorClient>,
-    sessions: SessionTable,
-    our_private: StaticSecret,
-    peer_id: Uuid,
-    wg_listen_port: u16,
-    interval: Duration,
-    mut shutdown: watch::Receiver<bool>,
-) {
+pub async fn run(task: HeartbeatTask) {
+    let HeartbeatTask {
+        client,
+        sessions,
+        our_private,
+        peer_id,
+        wg_listen_port,
+        hosted_app_ulas,
+        interval,
+        mut shutdown,
+    } = task;
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate first tick — the initial roster was already
@@ -57,7 +94,15 @@ pub async fn run(
                 }
             }
             _ = ticker.tick() => {
-                tick_once(&client, &sessions, &our_private, peer_id, wg_listen_port).await;
+                tick_once(
+                    &client,
+                    &sessions,
+                    &our_private,
+                    peer_id,
+                    wg_listen_port,
+                    &hosted_app_ulas,
+                )
+                .await;
             }
         }
     }
@@ -74,8 +119,15 @@ pub async fn tick_once(
     our_private: &StaticSecret,
     peer_id: Uuid,
     wg_listen_port: u16,
+    hosted_app_ulas: &DashMap<Ipv6Addr, ()>,
 ) {
-    match client.heartbeat(peer_id, Some(wg_listen_port)).await {
+    // Advertise our CURRENT hosted app-ULA set so the coordinator replaces
+    // its stored set (per-app-ULA routing — supervisor side).
+    let hosted = hosted_app_ula_strings(hosted_app_ulas);
+    match client
+        .heartbeat(peer_id, Some(wg_listen_port), &hosted)
+        .await
+    {
         Ok(resp) => reconcile_roster(sessions, our_private, &resp.peers).await,
         Err(e) => {
             tracing::warn!(
@@ -108,6 +160,10 @@ async fn reconcile_roster(
                 // MVP). Future work: skip when (peer_id, endpoint,
                 // pubkey) match.
                 sessions.upsert(our_private, &info);
+                // Per-app-ULA routing self-heal: reconcile the peer's
+                // advertised app-ULAs even if the SSE stream missed a
+                // frame. Same wholesale-replace semantics as peer_sync.
+                sessions.reconcile_app_routes(info.ula, &info.hosted_app_ulas);
             }
             Err(e) => {
                 tracing::warn!(
@@ -132,7 +188,7 @@ async fn reconcile_roster(
 mod tests {
     use super::*;
     use crate::peer::{PeerInfo, RemotePeer};
-    use base64::engine::{general_purpose::STANDARD as B64, Engine as _};
+    use base64::engine::{Engine as _, general_purpose::STANDARD as B64};
     use std::net::Ipv6Addr;
     use x25519_dalek::PublicKey;
 
@@ -150,6 +206,7 @@ mod tests {
             listen_endpoint: Some("127.0.0.1:51820".into()),
             display_name: format!("peer-{n}"),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 0,
         }
     }
@@ -162,9 +219,14 @@ mod tests {
             ula: ula.parse().unwrap(),
             // Distinct port per peer keeps the endpoint index unique
             // across the test population without burning real OS ports.
-            listen_endpoint: Some(format!("127.0.0.1:{}", 30_000 + u16::from(n)).parse().unwrap()),
+            listen_endpoint: Some(
+                format!("127.0.0.1:{}", 30_000 + u16::from(n))
+                    .parse()
+                    .unwrap(),
+            ),
             display_name: format!("peer-{n}"),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 0,
         }
     }
@@ -177,12 +239,16 @@ mod tests {
         let me = StaticSecret::from([0xAA; 32]);
         let remote = vec![remote("fd5a:1f00:1::1", 1), remote("fd5a:1f00:1::2", 2)];
         reconcile_roster(&sessions, &me, &remote).await;
-        assert!(sessions
-            .by_ula("fd5a:1f00:1::1".parse::<Ipv6Addr>().unwrap())
-            .is_some());
-        assert!(sessions
-            .by_ula("fd5a:1f00:1::2".parse::<Ipv6Addr>().unwrap())
-            .is_some());
+        assert!(
+            sessions
+                .by_ula("fd5a:1f00:1::1".parse::<Ipv6Addr>().unwrap())
+                .is_some()
+        );
+        assert!(
+            sessions
+                .by_ula("fd5a:1f00:1::2".parse::<Ipv6Addr>().unwrap())
+                .is_some()
+        );
         assert_eq!(sessions.len(), 2);
     }
 
@@ -197,12 +263,16 @@ mod tests {
         // The coordinator only knows about ::1 now — ::2 should be
         // pruned.
         reconcile_roster(&sessions, &me, &[remote("fd5a:1f00:1::1", 1)]).await;
-        assert!(sessions
-            .by_ula("fd5a:1f00:1::1".parse::<Ipv6Addr>().unwrap())
-            .is_some());
-        assert!(sessions
-            .by_ula("fd5a:1f00:1::2".parse::<Ipv6Addr>().unwrap())
-            .is_none());
+        assert!(
+            sessions
+                .by_ula("fd5a:1f00:1::1".parse::<Ipv6Addr>().unwrap())
+                .is_some()
+        );
+        assert!(
+            sessions
+                .by_ula("fd5a:1f00:1::2".parse::<Ipv6Addr>().unwrap())
+                .is_none()
+        );
     }
 
     /// A malformed peer record should be skipped, not crash the
@@ -215,9 +285,11 @@ mod tests {
         bad.ula = "not-an-ipv6".into();
         let good = remote("fd5a:1f00:1::5", 5);
         reconcile_roster(&sessions, &me, &[bad, good]).await;
-        assert!(sessions
-            .by_ula("fd5a:1f00:1::5".parse::<Ipv6Addr>().unwrap())
-            .is_some());
+        assert!(
+            sessions
+                .by_ula("fd5a:1f00:1::5".parse::<Ipv6Addr>().unwrap())
+                .is_some()
+        );
         assert_eq!(sessions.len(), 1);
     }
 }

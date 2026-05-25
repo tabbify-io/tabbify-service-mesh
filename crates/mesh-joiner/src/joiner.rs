@@ -12,7 +12,7 @@
 //! 7. [`crate::wg::loops`] — UDP / TUN / timer background loops.
 
 use crate::config::JoinConfig;
-use crate::coordinator::client::{remote_to_info, CoordinatorClient};
+use crate::coordinator::client::{CoordinatorClient, remote_to_info};
 use crate::coordinator::{heartbeat, peer_sync};
 use crate::error::JoinerError;
 use crate::nat::holepunch;
@@ -66,6 +66,18 @@ pub struct Joiner {
     /// fd close. Wrapped in Option so `leave` can drop it explicitly
     /// after the deregister round-trip succeeds.
     tun: Option<Arc<dyn TunDevice>>,
+    /// The overlay TUN interface name captured at join time. `None` in
+    /// `--no-mesh` / no-TUN modes. Callers that host an app-ULA need this
+    /// to assign the `/128` alias (per-app-ULA routing — supervisor side);
+    /// exposed via [`Self::tun_name`].
+    iface_name: Option<String>,
+    /// App-ULAs THIS node currently hosts (per-app-ULA routing —
+    /// supervisor side). [`Self::host_app_ula`] inserts (and assigns the
+    /// TUN alias); [`Self::unhost_app_ula`] removes (and releases it). The
+    /// register + heartbeat payloads advertise this set as
+    /// `hosted_app_ulas` so other peers learn to route to us. Shared with
+    /// the heartbeat task (lock-free reads via `DashMap`).
+    hosted_app_ulas: Arc<dashmap::DashMap<Ipv6Addr, ()>>,
 }
 
 impl Joiner {
@@ -81,7 +93,10 @@ impl Joiner {
     /// HTTP, TUN setup, UDP bind, and sudo all share this path. The
     /// underlying error is a [`JoinerError`] variant in every case.
     pub async fn join(config: JoinConfig) -> anyhow::Result<Self> {
-        let kp_path = config.keypair_path.clone().unwrap_or_else(default_keypair_path);
+        let kp_path = config
+            .keypair_path
+            .clone()
+            .unwrap_or_else(default_keypair_path);
         let keypair = crate::wg::persistent_keypair::load_or_generate(&kp_path)
             .map_err(|e| anyhow::anyhow!("load keypair {}: {}", kp_path.display(), e))?;
         tracing::info!(
@@ -191,25 +206,19 @@ impl Joiner {
         //    the call is a no-op there modulo `File exists` tolerance.
         platform::assign_ula(&iface_name, my_ula).await?;
 
-        // 5) Seed the session table from the initial roster, dropping
-        //    any malformed records with a warning. The table is wired to
-        //    a `TunRouteSink` so every successful upsert installs the
-        //    peer's `/128` host route (TX scoping); removals tear it
-        //    down.
+        // 5) Seed the session table from the initial roster. The table is
+        //    wired to a `TunRouteSink` so every upsert installs the peer's
+        //    `/128` host route (TX scoping) and every advertised app-ULA
+        //    its app-route (per-app-ULA routing). See `seed_initial_roster`.
         let route_sink = Arc::new(platform::TunRouteSink::new(iface_name.clone()));
         let sessions = SessionTable::with_route_sink(route_sink);
         let peer_info: Arc<dashmap::DashMap<Ipv6Addr, PeerInfo>> = Arc::default();
-        for r in &resp.peers {
-            match remote_to_info(r).await {
-                Ok(info) => {
-                    peer_info.insert(info.ula, info.clone());
-                    sessions.upsert(&keypair.private, &info);
-                }
-                Err(e) => tracing::warn!(error = %e, "joiner: skipping malformed initial peer"),
-            }
-        }
+        seed_initial_roster(&sessions, &peer_info, &keypair.private, &resp.peers).await;
 
-        // 6) Spawn the background tasks.
+        // 6) Spawn the background tasks. The locally-hosted app-ULA set is
+        //    shared with the heartbeat task so each heartbeat advertises
+        //    the CURRENT set (per-app-ULA routing — supervisor side).
+        let hosted_app_ulas: Arc<dashmap::DashMap<Ipv6Addr, ()>> = Arc::default();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let tasks = spawn_background_tasks(SpawnContext {
             socket: socket.clone(),
@@ -221,6 +230,7 @@ impl Joiner {
             my_ula,
             wg_listen_port,
             heartbeat_interval: config.heartbeat_interval,
+            hosted_app_ulas: hosted_app_ulas.clone(),
             shutdown_rx,
         });
 
@@ -233,6 +243,8 @@ impl Joiner {
             shutdown_tx,
             tasks,
             tun: Some(tun_arc),
+            iface_name: Some(iface_name),
+            hosted_app_ulas,
         })
     }
 
@@ -248,6 +260,61 @@ impl Joiner {
         self.peer_id
     }
 
+    /// The overlay TUN interface name, for callers that need to assign
+    /// app-ULA `/128` aliases themselves. `None` in `--no-mesh` / no-TUN
+    /// modes.
+    #[must_use]
+    pub fn tun_name(&self) -> Option<String> {
+        self.iface_name.clone()
+    }
+
+    /// SUPERVISOR side: start hosting `app_ula` on THIS node
+    /// (per-app-ULA routing).
+    ///
+    /// Two effects:
+    /// 1. assigns a local `/128` alias for `app_ula` on the overlay TUN
+    ///    ([`platform::assign_app_ula`]) so inbound packets addressed to
+    ///    `app_ula` are delivered to a local listener bound on it;
+    /// 2. records `app_ula` in the locally-hosted set, which the next
+    ///    register / heartbeat advertises as `hosted_app_ulas` — so other
+    ///    peers learn to route `app_ula`-bound traffic to us.
+    ///
+    /// Idempotent: hosting an already-hosted `app_ula` re-asserts the
+    /// (idempotent) alias and leaves the set unchanged.
+    ///
+    /// # Errors
+    /// - [`anyhow::Error`] wrapping [`JoinerError::TunSetup`] if the alias
+    ///   can't be assigned (missing privileges, bad interface).
+    /// - Fails if the joiner has no TUN interface (`--no-mesh` mode): an
+    ///   app-ULA can't be hosted without an interface to bind it on.
+    pub async fn host_app_ula(&self, app_ula: Ipv6Addr) -> anyhow::Result<()> {
+        let iface = self
+            .iface_name
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("cannot host app-ULA: joiner has no TUN interface"))?;
+        platform::assign_app_ula(iface, app_ula).await?;
+        self.hosted_app_ulas.insert(app_ula, ());
+        tracing::info!(%app_ula, iface, "joiner: now hosting app-ULA");
+        Ok(())
+    }
+
+    /// SUPERVISOR side: stop hosting `app_ula` — release the `/128` alias
+    /// and drop it from the advertised set. Idempotent (un-hosting an
+    /// app-ULA we don't host releases the alias and is otherwise a no-op).
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] wrapping [`JoinerError::TunSetup`] on a
+    /// non-idempotent alias-release failure. No-op (Ok) in `--no-mesh`
+    /// mode — there's nothing hosted to release.
+    pub async fn unhost_app_ula(&self, app_ula: Ipv6Addr) -> anyhow::Result<()> {
+        self.hosted_app_ulas.remove(&app_ula);
+        if let Some(iface) = self.iface_name.as_deref() {
+            platform::release_app_ula(iface, app_ula).await?;
+            tracing::info!(%app_ula, iface, "joiner: stopped hosting app-ULA");
+        }
+        Ok(())
+    }
+
     /// Snapshot of currently-known peers (excluding self).
     #[must_use]
     pub fn peers(&self) -> Vec<PeerInfo> {
@@ -260,10 +327,9 @@ impl Joiner {
             .snapshot()
             .into_iter()
             .map(|s| {
-                self.peer_info.get(&s.ula).map_or_else(
-                    || synth_info(&s),
-                    |kv| kv.value().clone(),
-                )
+                self.peer_info
+                    .get(&s.ula)
+                    .map_or_else(|| synth_info(&s), |kv| kv.value().clone())
             })
             .collect()
     }
@@ -323,6 +389,10 @@ struct SpawnContext {
     /// change.
     wg_listen_port: u16,
     heartbeat_interval: Duration,
+    /// App-ULAs this node hosts — advertised on every heartbeat
+    /// (per-app-ULA routing). Shared with [`Joiner`] so `host_app_ula` /
+    /// `unhost_app_ula` mutate the set the heartbeat task reads.
+    hosted_app_ulas: Arc<dashmap::DashMap<Ipv6Addr, ()>>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -339,6 +409,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         my_ula,
         wg_listen_port,
         heartbeat_interval,
+        hosted_app_ulas,
         shutdown_rx,
     } = ctx;
     let mut tasks: Vec<JoinHandle<()>> = Vec::with_capacity(6);
@@ -382,8 +453,15 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         let client = client.clone();
         let shutdown_rx = shutdown_rx.clone();
         tasks.push(tokio::spawn(async move {
-            peer_sync::run(client, sessions, our_private, Some(punch_tx), peer_id, shutdown_rx)
-                .await;
+            peer_sync::run(
+                client,
+                sessions,
+                our_private,
+                Some(punch_tx),
+                peer_id,
+                shutdown_rx,
+            )
+            .await;
         }));
     }
 
@@ -399,17 +477,20 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         }));
     }
 
-    // Heartbeat — the last task, so it moves the remaining handles.
+    // Heartbeat — the last task, so it moves the remaining handles. It
+    // reads `hosted_app_ulas` each tick to advertise our current hosted
+    // set to the coordinator (per-app-ULA routing).
     tasks.push(tokio::spawn(async move {
-        heartbeat::run(
+        heartbeat::run(heartbeat::HeartbeatTask {
             client,
             sessions,
             our_private,
             peer_id,
             wg_listen_port,
-            heartbeat_interval,
-            shutdown_rx,
-        )
+            hosted_app_ulas,
+            interval: heartbeat_interval,
+            shutdown: shutdown_rx,
+        })
         .await;
     }));
 
@@ -439,9 +520,15 @@ async fn bind_udp_with_fallback(preferred_port: u16) -> Result<UdpSocket, Joiner
             let ephemeral = SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0);
             UdpSocket::bind(ephemeral)
                 .await
-                .map_err(|source| JoinerError::UdpBind { addr: ephemeral, source })
+                .map_err(|source| JoinerError::UdpBind {
+                    addr: ephemeral,
+                    source,
+                })
         }
-        Err(source) => Err(JoinerError::UdpBind { addr: preferred, source }),
+        Err(source) => Err(JoinerError::UdpBind {
+            addr: preferred,
+            source,
+        }),
     }
 }
 
@@ -452,7 +539,34 @@ async fn bind_udp_with_fallback(preferred_port: u16) -> Result<UdpSocket, Joiner
 /// that go through CLI subcommands with explicit `--keypair-path`.
 fn default_keypair_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    std::path::PathBuf::from(home).join(".tabbify-mesh").join("keypair")
+    std::path::PathBuf::from(home)
+        .join(".tabbify-mesh")
+        .join("keypair")
+}
+
+/// Seed the session table + metadata map from the initial register
+/// roster, dropping any malformed records with a warning. For each good
+/// peer this upserts its session AND reconciles the app-ULAs it
+/// advertises (per-app-ULA routing) — so a supervisor that was already
+/// hosting apps when we joined is routable immediately, not only after
+/// the next heartbeat. Pulled out of [`Joiner::join`] to keep that
+/// constructor under the clippy line cap.
+async fn seed_initial_roster(
+    sessions: &SessionTable,
+    peer_info: &dashmap::DashMap<Ipv6Addr, PeerInfo>,
+    our_private: &x25519_dalek::StaticSecret,
+    remote: &[crate::peer::RemotePeer],
+) {
+    for r in remote {
+        match remote_to_info(r).await {
+            Ok(info) => {
+                peer_info.insert(info.ula, info.clone());
+                sessions.upsert(our_private, &info);
+                sessions.reconcile_app_routes(info.ula, &info.hosted_app_ulas);
+            }
+            Err(e) => tracing::warn!(error = %e, "joiner: skipping malformed initial peer"),
+        }
+    }
 }
 
 /// Build a placeholder [`PeerInfo`] from a session when we somehow
@@ -465,10 +579,13 @@ fn synth_info(s: &PeerSession) -> PeerInfo {
         listen_endpoint: s.endpoint(),
         display_name: String::new(),
         tags: Vec::new(),
+        // We lost the rich metadata; hosted app-ULAs aren't reconstructable
+        // from a `PeerSession` alone, so report none. The next roster
+        // upsert re-applies the real set.
+        hosted_app_ulas: Vec::new(),
         joined_at_micros: 0,
     }
 }
-
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -487,6 +604,7 @@ mod tests {
             listen_endpoint: Some("127.0.0.1:51820".parse().unwrap()),
             display_name: "irrelevant".into(),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 0,
         };
         let table = SessionTable::new();

@@ -72,7 +72,10 @@ impl Coordinator {
             .map(|kv| kv.value().clone())
             .collect();
         entries.sort_by_key(|p| p.peer_index);
-        entries.iter().map(crate::roster::coordinator::PeerEntry::to_info).collect()
+        entries
+            .iter()
+            .map(crate::roster::coordinator::PeerEntry::to_info)
+            .collect()
     }
 }
 
@@ -119,6 +122,7 @@ mod tests {
             display_name: name.into(),
             network: network.into(),
             tags: tags.iter().map(|s| (*s).to_owned()).collect(),
+            hosted_app_ulas: vec![],
         }
     }
 
@@ -134,9 +138,18 @@ mod tests {
         let c = coordinator_with(shared_service_policy());
 
         // Two nodes in network "a", one in "b", one shared service.
-        let (a1, _) = c.register(req(1, "a1", "a", &["tag:user-a"])).await.expect("a1");
-        let (a2, _) = c.register(req(2, "a2", "a", &["tag:user-a"])).await.expect("a2");
-        let (b1, _) = c.register(req(3, "b1", "b", &["tag:user-b"])).await.expect("b1");
+        let (a1, _) = c
+            .register(req(1, "a1", "a", &["tag:user-a"]))
+            .await
+            .expect("a1");
+        let (a2, _) = c
+            .register(req(2, "a2", "a", &["tag:user-a"]))
+            .await
+            .expect("a2");
+        let (b1, _) = c
+            .register(req(3, "b1", "b", &["tag:user-b"]))
+            .await
+            .expect("b1");
         let (svc, _) = c
             .register(req(4, "svc1", "svc", &["tag:svc"]))
             .await
@@ -145,26 +158,56 @@ mod tests {
         // ---- a1's view: a2 + svc, never b1, never itself. ----
         let a1_view = c.visible_peers(a1.peer_id, &["tag:user-a".to_owned()]);
         let a1_names: Vec<_> = a1_view.iter().map(|p| p.display_name.clone()).collect();
-        assert!(a1_names.contains(&"a2".to_owned()), "a1 must see a2: {a1_names:?}");
-        assert!(a1_names.contains(&"svc1".to_owned()), "a1 must see svc: {a1_names:?}");
-        assert!(!a1_names.contains(&"b1".to_owned()), "a1 must NOT see b1: {a1_names:?}");
-        assert!(!a1_names.contains(&"a1".to_owned()), "a1 must NOT see itself");
+        assert!(
+            a1_names.contains(&"a2".to_owned()),
+            "a1 must see a2: {a1_names:?}"
+        );
+        assert!(
+            a1_names.contains(&"svc1".to_owned()),
+            "a1 must see svc: {a1_names:?}"
+        );
+        assert!(
+            !a1_names.contains(&"b1".to_owned()),
+            "a1 must NOT see b1: {a1_names:?}"
+        );
+        assert!(
+            !a1_names.contains(&"a1".to_owned()),
+            "a1 must NOT see itself"
+        );
         assert_eq!(a1_view.len(), 2, "a1 sees exactly a2 and svc");
 
         // ---- b1's view (symmetric): svc only (no other user-b peer). ----
         let b1_view = c.visible_peers(b1.peer_id, &["tag:user-b".to_owned()]);
         let b1_names: Vec<_> = b1_view.iter().map(|p| p.display_name.clone()).collect();
-        assert!(b1_names.contains(&"svc1".to_owned()), "b1 must see svc: {b1_names:?}");
-        assert!(!b1_names.contains(&"a1".to_owned()), "b1 must NOT see a1: {b1_names:?}");
-        assert!(!b1_names.contains(&"a2".to_owned()), "b1 must NOT see a2: {b1_names:?}");
+        assert!(
+            b1_names.contains(&"svc1".to_owned()),
+            "b1 must see svc: {b1_names:?}"
+        );
+        assert!(
+            !b1_names.contains(&"a1".to_owned()),
+            "b1 must NOT see a1: {b1_names:?}"
+        );
+        assert!(
+            !b1_names.contains(&"a2".to_owned()),
+            "b1 must NOT see a2: {b1_names:?}"
+        );
         assert_eq!(b1_view.len(), 1, "b1 sees exactly svc");
 
         // ---- svc's view: all three users (symmetric to user-*→svc). ----
         let svc_view = c.visible_peers(svc.peer_id, &["tag:svc".to_owned()]);
         let svc_names: Vec<_> = svc_view.iter().map(|p| p.display_name.clone()).collect();
-        assert!(svc_names.contains(&"a1".to_owned()), "svc sees a1: {svc_names:?}");
-        assert!(svc_names.contains(&"a2".to_owned()), "svc sees a2: {svc_names:?}");
-        assert!(svc_names.contains(&"b1".to_owned()), "svc sees b1: {svc_names:?}");
+        assert!(
+            svc_names.contains(&"a1".to_owned()),
+            "svc sees a1: {svc_names:?}"
+        );
+        assert!(
+            svc_names.contains(&"a2".to_owned()),
+            "svc sees a2: {svc_names:?}"
+        );
+        assert!(
+            svc_names.contains(&"b1".to_owned()),
+            "svc sees b1: {svc_names:?}"
+        );
         assert_eq!(svc_view.len(), 3, "svc sees all three user nodes");
 
         // a2 is in a DIFFERENT ULA block than b1 (multi-network allocator).
@@ -179,21 +222,30 @@ mod tests {
     #[tokio::test]
     async fn empty_policy_hides_everyone() {
         let c = coordinator_with(Policy::default());
-        let (a, _) = c.register(req(1, "a", "a", &["tag:user-a"])).await.expect("a");
-        let _ = c.register(req(2, "b", "a", &["tag:user-a"])).await.expect("b");
+        let (a, _) = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
+        let _ = c
+            .register(req(2, "b", "a", &["tag:user-a"]))
+            .await
+            .expect("b");
         let view = c.visible_peers(a.peer_id, &["tag:user-a".to_owned()]);
-        assert!(view.is_empty(), "default-deny: empty policy reveals nothing");
+        assert!(
+            view.is_empty(),
+            "default-deny: empty policy reveals nothing"
+        );
     }
 
     /// `peer_tags` resolves a viewer's identity from just its id.
     #[tokio::test]
     async fn peer_tags_resolves_registered_peer() {
         let c = coordinator_with(shared_service_policy());
-        let (a, _) = c.register(req(1, "a", "a", &["tag:user-a"])).await.expect("a");
-        assert_eq!(
-            c.peer_tags(a.peer_id),
-            Some(vec!["tag:user-a".to_owned()]),
-        );
+        let (a, _) = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
+        assert_eq!(c.peer_tags(a.peer_id), Some(vec!["tag:user-a".to_owned()]),);
         assert_eq!(c.peer_tags(Uuid::now_v7()), None);
     }
 

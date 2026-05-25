@@ -24,16 +24,12 @@ impl Coordinator {
     ///
     /// # Errors
     /// `InvalidPeerId` if the event's `peer_id` or `ula` is malformed.
-    pub fn apply_peer_joined(
-        &self,
-        event: &PeerJoined,
-    ) -> Result<PeerEntry, CoordinatorError> {
+    pub fn apply_peer_joined(&self, event: &PeerJoined) -> Result<PeerEntry, CoordinatorError> {
         let peer_id = Uuid::parse_str(&event.peer_id)
             .map_err(|e| CoordinatorError::InvalidPeerId(e.to_string()))?;
-        let ula: Ipv6Addr = event
-            .ula
-            .parse()
-            .map_err(|e: std::net::AddrParseError| CoordinatorError::InvalidPeerId(e.to_string()))?;
+        let ula: Ipv6Addr = event.ula.parse().map_err(|e: std::net::AddrParseError| {
+            CoordinatorError::InvalidPeerId(e.to_string())
+        })?;
         // ULA layout is fd5a:1f00:<network16>:<idx>::1 — the network slot
         // lives in the 3rd hextet, the per-network index in the 4th.
         let network_slot = ula.segments()[2];
@@ -51,6 +47,7 @@ impl Coordinator {
             display_name: event.display_name.clone(),
             network: event.network.clone(),
             tags: event.tags.clone(),
+            hosted_app_ulas: event.hosted_app_ulas.clone(),
             joined_at_micros: event.joined_at_micros,
             last_heartbeat: Instant::now(),
             // No heartbeat has been recorded yet; the heartbeat path
@@ -92,6 +89,14 @@ impl Coordinator {
             // logic can iterate over the roster and emit pairs without
             // re-reading the event.
             entry.observed_external.clone_from(&event.observed_external);
+            // REPLACE the hosted app-ULA set with the heartbeat's set: a
+            // supervisor re-sends its full hosted set every tick, so the
+            // stored set tracks exactly what the peer hosts right now —
+            // adds and removals both fall out of the wholesale replace
+            // (per-app-ULA routing). The change-detection + re-broadcast
+            // lives in [`Coordinator::heartbeat`], which compares before
+            // and after this apply.
+            entry.hosted_app_ulas.clone_from(&event.hosted_app_ulas);
         }
     }
 
@@ -130,6 +135,7 @@ mod tests {
             display_name: "test".into(),
             network: "n1".into(),
             tags: vec!["t1".into()],
+            hosted_app_ulas: vec![],
             joined_at_micros: 1,
         };
         let entry = coord.apply_peer_joined(&joined).expect("apply joined");
@@ -140,6 +146,7 @@ mod tests {
         let hb = PeerHeartbeat {
             peer_id: peer_id.to_string(),
             observed_external: "203.0.113.1:51820".into(),
+            hosted_app_ulas: vec![],
             at_micros: 2,
         };
         coord.apply_peer_heartbeat(&hb);
@@ -147,6 +154,7 @@ mod tests {
         let unknown_hb = PeerHeartbeat {
             peer_id: uuid::Uuid::now_v7().to_string(),
             observed_external: String::new(),
+            hosted_app_ulas: vec![],
             at_micros: 3,
         };
         coord.apply_peer_heartbeat(&unknown_hb);
@@ -164,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_peer_joined_advances_allocator_within_network() {
-        use crate::roster::allocator::{network_slot, UlaAllocator};
+        use crate::roster::allocator::{UlaAllocator, network_slot};
         let coord = Coordinator::new(Arc::new(NoopPublisher), Duration::from_secs(60));
         // Apply a peer at index 7 in network "net7" — a subsequent register
         // in the SAME network must NOT collide. Build the ULA from the
@@ -180,6 +188,7 @@ mod tests {
             display_name: "applied".into(),
             network: "net7".into(),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 1,
         };
         coord.apply_peer_joined(&joined).expect("apply");
@@ -194,6 +203,7 @@ mod tests {
             display_name: "fresh".into(),
             network: "net7".into(),
             tags: vec![],
+            hosted_app_ulas: vec![],
         };
         let (entry, _) = coord.register(req).await.expect("register");
         assert_eq!(entry.peer_index, 8);
@@ -210,6 +220,7 @@ mod tests {
             display_name: "x".into(),
             network: "n1".into(),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 1,
         };
         let err = coord.apply_peer_joined(&bad).expect_err("bad uuid");

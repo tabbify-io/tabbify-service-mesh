@@ -41,9 +41,7 @@ pub async fn sweep_once(coordinator: &Coordinator) {
         return;
     }
     for peer_id in stale {
-        let removed = coordinator
-            .deregister(peer_id, "heartbeat_timeout")
-            .await;
+        let removed = coordinator.deregister(peer_id, "heartbeat_timeout").await;
         if removed {
             info!(peer_id = %peer_id, "peer dropped (heartbeat timeout)");
         }
@@ -83,6 +81,7 @@ mod tests {
                 display_name: "stale".into(),
                 network: String::new(),
                 tags: vec![],
+                hosted_app_ulas: vec![],
             })
             .await
             .expect("ok");
@@ -94,6 +93,7 @@ mod tests {
                 display_name: "fresh".into(),
                 network: String::new(),
                 tags: vec![],
+                hosted_app_ulas: vec![],
             })
             .await
             .expect("ok");
@@ -102,7 +102,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         // Refresh `b`'s heartbeat so it survives the sweep.
         coord
-            .heartbeat(b.peer_id, String::new(), None)
+            .heartbeat(b.peer_id, String::new(), None, vec![])
             .await
             .expect("heartbeat");
 

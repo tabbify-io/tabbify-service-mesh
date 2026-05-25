@@ -20,9 +20,9 @@
 
 use crate::error::{JoinerError, Result};
 use crate::peer::{PeerInfo, RemotePeer};
-use base64::engine::{general_purpose::STANDARD as B64, Engine as _};
+use base64::engine::{Engine as _, general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -47,6 +47,13 @@ pub struct RegisterRequest {
     pub display_name: String,
     /// Role tags ("dev-machine", "wasm-host", ...).
     pub tags: Vec<String>,
+    /// App-ULAs (IPv6 literals, `fd5a:1f02:...`) this node hosts at
+    /// register time. Usually empty — apps are typically hosted after
+    /// join via [`crate::Joiner::host_app_ula`], which advertises them on
+    /// the next heartbeat. Omitted from the wire when empty for a tidy
+    /// body (per-app-ULA routing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosted_app_ulas: Vec<String>,
 }
 
 /// Body of `POST /v1/mesh/register`'s response.
@@ -80,6 +87,11 @@ pub struct HeartbeatRequest {
     /// public IP changes (NAT rebind / roaming).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wg_listen_port: Option<u16>,
+    /// Our CURRENT full set of hosted app-ULAs (IPv6 literals), re-sent on
+    /// every heartbeat. The coordinator replaces our stored set with this
+    /// one (per-app-ULA routing). Omitted from the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosted_app_ulas: Vec<String>,
 }
 
 /// Body of the heartbeat response. The coordinator returns the current
@@ -150,10 +162,7 @@ impl CoordinatorClient {
         tls_ca: Option<&Path>,
         insecure: bool,
     ) -> Result<Self> {
-        let trimmed = base_url
-            .into()
-            .trim_end_matches('/')
-            .to_owned();
+        let trimmed = base_url.into().trim_end_matches('/').to_owned();
 
         let builder = if insecure {
             reqwest::Client::builder()
@@ -161,8 +170,7 @@ impl CoordinatorClient {
             // mTLS branch: validate the trio before touching disk so
             // the operator gets a precise error instead of a generic
             // "file not found" if they forgot a flag.
-            let (Some(cert_path), Some(key_path), Some(ca_path)) =
-                (tls_cert, tls_key, tls_ca)
+            let (Some(cert_path), Some(key_path), Some(ca_path)) = (tls_cert, tls_key, tls_ca)
             else {
                 return Err(JoinerError::InvalidConfig(
                     "mTLS requires all three paths: --tls-cert, --tls-key, --tls-ca \
@@ -231,6 +239,11 @@ impl CoordinatorClient {
             wg_listen_port,
             display_name: display_name.to_owned(),
             tags: tags.to_vec(),
+            // Initial register hosts no apps — they are hosted after join
+            // via `Joiner::host_app_ula` and advertised on the next
+            // heartbeat (per-app-ULA routing). The field exists on the wire
+            // for forward-compat + symmetry with heartbeat.
+            hosted_app_ulas: Vec::new(),
         };
         let url = format!("{}/v1/mesh/register", self.base_url);
         let mut builder = self.http.post(&url).json(&body);
@@ -258,11 +271,13 @@ impl CoordinatorClient {
         &self,
         peer_id: Uuid,
         wg_listen_port: Option<u16>,
+        hosted_app_ulas: &[String],
     ) -> Result<HeartbeatResponse> {
         let url = format!("{}/v1/mesh/heartbeat", self.base_url);
         let body = HeartbeatRequest {
             peer_id,
             wg_listen_port,
+            hosted_app_ulas: hosted_app_ulas.to_vec(),
         };
         let resp = self
             .http
@@ -303,9 +318,9 @@ impl CoordinatorClient {
 /// Decode a 32-byte X25519 public key from the coordinator's base64
 /// representation, surfacing a typed error on malformed input.
 pub fn decode_pubkey(s: &str) -> Result<[u8; 32]> {
-    let bytes = B64.decode(s).map_err(|e| {
-        JoinerError::MalformedPeer(format!("wg_public_key base64: {e}"))
-    })?;
+    let bytes = B64
+        .decode(s)
+        .map_err(|e| JoinerError::MalformedPeer(format!("wg_public_key base64: {e}")))?;
     if bytes.len() != 32 {
         return Err(JoinerError::MalformedPeer(format!(
             "wg_public_key length {} != 32",
@@ -330,9 +345,10 @@ pub fn decode_pubkey(s: &str) -> Result<[u8; 32]> {
 /// advertising a name resolvable in the consumer's environment.
 pub async fn remote_to_info(r: &RemotePeer) -> Result<PeerInfo> {
     let wg_public_key = decode_pubkey(&r.wg_public_key)?;
-    let ula = r.ula.parse().map_err(|e| {
-        JoinerError::MalformedPeer(format!("ula {:?}: {e}", r.ula))
-    })?;
+    let ula = r
+        .ula
+        .parse()
+        .map_err(|e| JoinerError::MalformedPeer(format!("ula {:?}: {e}", r.ula)))?;
     // `listen_endpoint` resolution. Three outcomes:
     //   * `None` (or empty) — peer registered without one (passive / NAT).
     //   * Valid SocketAddr literal — use as-is, no I/O.
@@ -363,6 +379,20 @@ pub async fn remote_to_info(r: &RemotePeer) -> Result<PeerInfo> {
             }
         }
     };
+    // Parse hosted app-ULAs (per-app-ULA routing). A malformed literal is
+    // dropped with a warning rather than failing the whole peer record —
+    // one bad app-ULA must not cost us the peer's session.
+    let mut hosted_app_ulas = Vec::with_capacity(r.hosted_app_ulas.len());
+    for s in &r.hosted_app_ulas {
+        match s.parse::<Ipv6Addr>() {
+            Ok(addr) => hosted_app_ulas.push(addr),
+            Err(e) => tracing::warn!(
+                app_ula = %s,
+                error = %e,
+                "remote_to_info: skipping malformed hosted app-ULA"
+            ),
+        }
+    }
     Ok(PeerInfo {
         peer_id: r.peer_id,
         wg_public_key,
@@ -370,6 +400,7 @@ pub async fn remote_to_info(r: &RemotePeer) -> Result<PeerInfo> {
         listen_endpoint,
         display_name: r.display_name.clone(),
         tags: r.tags.clone(),
+        hosted_app_ulas,
         joined_at_micros: r.joined_at_micros,
     })
 }
@@ -455,10 +486,7 @@ fn build_mtls_client_builder(
         ))
     })?;
     let root_ca = reqwest::Certificate::from_pem(&ca_pem).map_err(|e| {
-        JoinerError::HttpTransport(format!(
-            "parse tls_ca {}: {e}",
-            ca_path.display()
-        ))
+        JoinerError::HttpTransport(format!("parse tls_ca {}: {e}", ca_path.display()))
     })?;
 
     // `tls_built_in_root_certs(false)` — drop the OS / webpki bundle
@@ -517,6 +545,7 @@ mod tests {
             listen_endpoint: Some("127.0.0.1:51820".into()),
             display_name: "alice".into(),
             tags: vec!["dev".into()],
+            hosted_app_ulas: vec![],
             joined_at_micros: 1_700_000_000_000_000,
         };
         let info = remote_to_info(&remote).await.unwrap();
@@ -526,6 +555,70 @@ mod tests {
         assert_eq!(info.listen_endpoint.unwrap().to_string(), "127.0.0.1:51820");
         assert_eq!(info.display_name, "alice");
         assert_eq!(info.tags, vec!["dev".to_string()]);
+    }
+
+    /// `remote_to_info` parses well-formed hosted app-ULAs into typed
+    /// addresses (per-app-ULA routing). A peer hosting no apps yields an
+    /// empty vec.
+    #[tokio::test]
+    async fn remote_to_info_parses_hosted_app_ulas() {
+        let (b64, _) = sample_pubkey_b64();
+        let remote = RemotePeer {
+            peer_id: Uuid::nil(),
+            wg_public_key: b64,
+            ula: "fd5a:1f00:1::1".into(),
+            listen_endpoint: None,
+            display_name: "supervisor".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![
+                "fd5a:1f02:dead:beef:cafe:0:0:1".into(),
+                "fd5a:1f02:dead:beef:cafe:0:0:2".into(),
+            ],
+            joined_at_micros: 0,
+        };
+        let info = remote_to_info(&remote).await.unwrap();
+        assert_eq!(
+            info.hosted_app_ulas,
+            vec![
+                "fd5a:1f02:dead:beef:cafe:0:0:1"
+                    .parse::<Ipv6Addr>()
+                    .unwrap(),
+                "fd5a:1f02:dead:beef:cafe:0:0:2"
+                    .parse::<Ipv6Addr>()
+                    .unwrap(),
+            ]
+        );
+    }
+
+    /// A malformed hosted app-ULA literal is SKIPPED (logged), not fatal —
+    /// the peer's session must survive one bad app-ULA. Good ones in the
+    /// same record still parse.
+    #[tokio::test]
+    async fn remote_to_info_skips_malformed_hosted_app_ula() {
+        let (b64, _) = sample_pubkey_b64();
+        let remote = RemotePeer {
+            peer_id: Uuid::nil(),
+            wg_public_key: b64,
+            ula: "fd5a:1f00:1::1".into(),
+            listen_endpoint: None,
+            display_name: "supervisor".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![
+                "not-an-ipv6".into(),
+                "fd5a:1f02:dead:beef:cafe:0:0:9".into(),
+            ],
+            joined_at_micros: 0,
+        };
+        let info = remote_to_info(&remote).await.unwrap();
+        // The bad one is dropped; the good one survives.
+        assert_eq!(
+            info.hosted_app_ulas,
+            vec![
+                "fd5a:1f02:dead:beef:cafe:0:0:9"
+                    .parse::<Ipv6Addr>()
+                    .unwrap()
+            ]
+        );
     }
 
     /// A peer behind NAT registers with an empty `listen_endpoint`; we
@@ -541,6 +634,7 @@ mod tests {
             listen_endpoint: Some(String::new()),
             display_name: "bob".into(),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 0,
         };
         let info = remote_to_info(&remote).await.unwrap();
@@ -557,6 +651,7 @@ mod tests {
             listen_endpoint: None,
             display_name: "x".into(),
             tags: vec![],
+            hosted_app_ulas: vec![],
             joined_at_micros: 0,
         };
         let err = remote_to_info(&remote).await.unwrap_err();
@@ -640,7 +735,14 @@ mod tests {
 
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         let resp = client
-            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], Some("my-join-jwt"))
+            .register(
+                &[0xAAu8; 32],
+                None,
+                Some(51820),
+                "alice",
+                &[],
+                Some("my-join-jwt"),
+            )
             .await
             .expect("register with bearer should succeed");
         assert_eq!(resp.ula, "fd5a:1f00:1::1");
@@ -663,7 +765,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/mesh/register"))
             // Requires wg_listen_port == 51820 in the JSON body.
-            .and(body_partial_json(serde_json::json!({ "wg_listen_port": 51820 })))
+            .and(body_partial_json(
+                serde_json::json!({ "wg_listen_port": 51820 }),
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/json")
@@ -683,6 +787,7 @@ mod tests {
             wg_listen_port: Some(51820),
             display_name: "alice".into(),
             tags: vec![],
+            hosted_app_ulas: vec![],
         })
         .unwrap();
         assert!(
@@ -817,8 +922,59 @@ mod tests {
             .mount(&server)
             .await;
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
-        let resp = client.heartbeat(Uuid::nil(), Some(51820)).await.unwrap();
+        let resp = client
+            .heartbeat(Uuid::nil(), Some(51820), &[])
+            .await
+            .unwrap();
         assert!(resp.peers.is_empty());
+    }
+
+    /// Per-app-ULA routing: when the joiner hosts app-ULAs, the heartbeat
+    /// body must carry them as `hosted_app_ulas`. A body matcher proves the
+    /// set is on the wire.
+    #[tokio::test]
+    async fn heartbeat_sends_hosted_app_ulas() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        let response_body = serde_json::json!({ "peers": [] });
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/heartbeat"))
+            .and(body_partial_json(serde_json::json!({
+                "hosted_app_ulas": ["fd5a:1f02:dead:beef:cafe:0:0:1"]
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(response_body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        client
+            .heartbeat(
+                Uuid::nil(),
+                Some(51820),
+                &["fd5a:1f02:dead:beef:cafe:0:0:1".to_owned()],
+            )
+            .await
+            .expect("heartbeat with hosted app-ULAs should match the body");
+    }
+
+    /// Back-compat: an EMPTY hosted set is omitted from the heartbeat body
+    /// (serde `skip_serializing_if`), so older coordinators see no new key.
+    #[tokio::test]
+    async fn heartbeat_omits_empty_hosted_app_ulas() {
+        let body = serde_json::to_value(HeartbeatRequest {
+            peer_id: Uuid::nil(),
+            wg_listen_port: Some(51820),
+            hosted_app_ulas: vec![],
+        })
+        .unwrap();
+        assert!(
+            body.get("hosted_app_ulas").is_none(),
+            "empty hosted_app_ulas must be omitted: {body}"
+        );
     }
 
     #[tokio::test]
@@ -880,14 +1036,7 @@ mod tests {
 
     #[test]
     fn base_url_trims_trailing_slash() {
-        let c = CoordinatorClient::new(
-            "http://127.0.0.1:8888/",
-            None,
-            None,
-            None,
-            true,
-        )
-        .unwrap();
+        let c = CoordinatorClient::new("http://127.0.0.1:8888/", None, None, None, true).unwrap();
         assert_eq!(c.base_url(), "http://127.0.0.1:8888");
     }
 
@@ -896,13 +1045,7 @@ mod tests {
     /// joiner can hit a plaintext coordinator without ceremony.
     #[test]
     fn new_insecure_skips_tls() {
-        let c = CoordinatorClient::new(
-            "http://example.com".to_owned(),
-            None,
-            None,
-            None,
-            true,
-        );
+        let c = CoordinatorClient::new("http://example.com".to_owned(), None, None, None, true);
         assert!(c.is_ok(), "expected ok, got {:?}", c.err());
     }
 
@@ -953,8 +1096,7 @@ mod tests {
     #[test]
     fn new_secure_builds_client_with_valid_pems() {
         let dir = tempfile::TempDir::new().unwrap();
-        let cert =
-            rcgen::generate_simple_self_signed(vec!["mesh-joiner".to_owned()]).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["mesh-joiner".to_owned()]).unwrap();
         let cert_pem = cert.cert.pem();
         let key_pem = cert.key_pair.serialize_pem();
 
@@ -973,10 +1115,6 @@ mod tests {
             Some(ca_path.as_path()),
             false,
         );
-        assert!(
-            client.is_ok(),
-            "expected ok, got error: {:?}",
-            client.err()
-        );
+        assert!(client.is_ok(), "expected ok, got error: {:?}", client.err());
     }
 }

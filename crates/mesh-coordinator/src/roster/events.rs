@@ -38,6 +38,14 @@ pub struct PeerJoined {
     pub network: String,
     /// Role hints: `["dev-machine", "wasm-host", ...]`.
     pub tags: Vec<String>,
+    /// App-ULAs (IPv6 literals, `fd5a:1f02:...`) this peer hosts at
+    /// register time. The coordinator stays app-agnostic — these are
+    /// opaque `/128`s the peer declares it serves, advertised to all
+    /// viewers exactly like [`Self::ula`] so other peers learn to route
+    /// to it (per-app-ULA routing). `#[serde(default)]` keeps replay /
+    /// older events back-compatible.
+    #[serde(default)]
+    pub hosted_app_ulas: Vec<String>,
     /// Joined-at, wall-clock micros.
     pub joined_at_micros: i64,
 }
@@ -57,6 +65,13 @@ pub struct PeerHeartbeat {
     pub peer_id: String,
     /// Socket addr the coordinator saw on the heartbeat request.
     pub observed_external: String,
+    /// The peer's CURRENT full set of hosted app-ULAs (IPv6 literals,
+    /// `fd5a:1f02:...`). A supervisor re-sends its entire hosted set on
+    /// every heartbeat; the coordinator REPLACES the peer's stored set
+    /// with this one (per-app-ULA routing). `#[serde(default)]` keeps
+    /// replay / older heartbeats back-compatible.
+    #[serde(default)]
+    pub hosted_app_ulas: Vec<String>,
     /// Heartbeat wall-clock micros.
     pub at_micros: i64,
 }

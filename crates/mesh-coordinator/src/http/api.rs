@@ -47,6 +47,13 @@ pub struct PeerInfo {
     pub network: String,
     /// Role hint labels.
     pub tags: Vec<String>,
+    /// App-ULAs (IPv6 literals, `fd5a:1f02:...`) this peer currently
+    /// hosts. Advertised to every viewer exactly like [`Self::ula`] so a
+    /// consuming peer learns to route app-bound traffic to this host
+    /// (per-app-ULA routing). `#[serde(default)]` keeps the wire format
+    /// back-compatible with peers/coordinators that omit it.
+    #[serde(default)]
+    pub hosted_app_ulas: Vec<String>,
     /// Joined-at wall-clock micros.
     pub joined_at_micros: i64,
 }
@@ -80,6 +87,12 @@ pub struct RegisterRequest {
     /// Role hints. Pre-E4 joiner-supplied; E4 replaces with JWT claims.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// App-ULAs (IPv6 literals, `fd5a:1f02:...`) the registrant already
+    /// hosts at register time. Stored as the peer's initial hosted set
+    /// and advertised to other viewers (per-app-ULA routing).
+    /// `#[serde(default)]` keeps older joiners (which omit it) working.
+    #[serde(default)]
+    pub hosted_app_ulas: Vec<String>,
 }
 
 /// Body of `POST /v1/mesh/register` response.
@@ -118,6 +131,15 @@ pub struct HeartbeatRequest {
     /// `#[serde(default)]` for back-compat with older joiners.
     #[serde(default)]
     pub wg_listen_port: Option<u16>,
+    /// The supervisor's CURRENT full set of hosted app-ULAs (IPv6
+    /// literals, `fd5a:1f02:...`), re-sent on every heartbeat. The
+    /// coordinator REPLACES the peer's stored set with this one and, if
+    /// it changed, re-broadcasts the peer so viewers re-learn the routes
+    /// (per-app-ULA routing). `#[serde(default)]` keeps older joiners
+    /// (which omit it) working — they are simply treated as hosting no
+    /// apps.
+    #[serde(default)]
+    pub hosted_app_ulas: Vec<String>,
 }
 
 /// Body of `POST /v1/mesh/heartbeat` response.
@@ -292,11 +314,9 @@ async fn heartbeat_handler(
     // case keeps the publish path lossless for production while not
     // forcing test plumbing to fake a SocketAddr.
     let observed_addr = connect_info.as_ref().map(|c| c.0);
-    let observed = observed_addr
-        .map(|a| a.to_string())
-        .unwrap_or_default();
+    let observed = observed_addr.map(|a| a.to_string()).unwrap_or_default();
     match coordinator
-        .heartbeat(peer_id, observed, req.wg_listen_port)
+        .heartbeat(peer_id, observed, req.wg_listen_port, req.hosted_app_ulas)
         .await
     {
         Ok(entry) => {
@@ -478,11 +498,7 @@ fn peer_event_stream(
             None => Some(to_sse_frame(&PeerEvent::Added(p))),
         })
         .collect();
-    let initial = futures::stream::iter(
-        initial_frames
-            .into_iter()
-            .map(Ok::<SseFrame, Infallible>),
-    );
+    let initial = futures::stream::iter(initial_frames.into_iter().map(Ok::<SseFrame, Infallible>));
 
     let live = BroadcastStream::new(receiver).filter_map(move |next| {
         // `filter` is moved into the closure; updated in place per frame.
@@ -509,7 +525,9 @@ fn to_sse_frame(event: &PeerEvent) -> SseFrame {
         Ok(json) => SseFrame::default().event(event.event_name()).data(json),
         Err(e) => {
             warn!(error = %e, "failed to serialise peer event");
-            SseFrame::default().event("error").data("serialisation failed")
+            SseFrame::default()
+                .event("error")
+                .data("serialisation failed")
         }
     }
 }
@@ -563,5 +581,36 @@ mod tests {
         // We are only the target of someone else's initiate → dropped.
         assert!(filter.apply(holepunch_for(other, viewer)).is_none());
     }
-}
 
+    /// Back-compat: a register/heartbeat body from an older joiner that
+    /// omits `hosted_app_ulas` must still deserialize (serde default →
+    /// empty). A regression here would 400 every legacy joiner.
+    #[test]
+    fn requests_deserialize_without_hosted_app_ulas() {
+        let reg: RegisterRequest = serde_json::from_value(serde_json::json!({
+            "wg_public_key": "AAAA",
+            "display_name": "legacy",
+        }))
+        .expect("legacy register body must parse");
+        assert!(reg.hosted_app_ulas.is_empty());
+
+        let hb: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+            "peer_id": "01910f10-0000-7000-8000-000000000001",
+        }))
+        .expect("legacy heartbeat body must parse");
+        assert!(hb.hosted_app_ulas.is_empty());
+    }
+
+    /// And a NEW joiner's body carrying `hosted_app_ulas` round-trips the
+    /// set through deserialization.
+    #[test]
+    fn requests_carry_hosted_app_ulas_when_present() {
+        let reg: RegisterRequest = serde_json::from_value(serde_json::json!({
+            "wg_public_key": "AAAA",
+            "display_name": "supervisor",
+            "hosted_app_ulas": ["fd5a:1f02:dead:beef:cafe:0:0:1"],
+        }))
+        .expect("register body parses");
+        assert_eq!(reg.hosted_app_ulas, vec!["fd5a:1f02:dead:beef:cafe:0:0:1"]);
+    }
+}
