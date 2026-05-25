@@ -594,6 +594,7 @@ impl Coordinator {
         for b in candidates {
             try_emit_pair(
                 self.inner.publisher.as_ref(),
+                &self.inner.broadcaster,
                 &self.inner.punch_tracker,
                 &a,
                 &b,
@@ -994,6 +995,47 @@ mod tests {
             2,
             "dedup must prevent re-emit on subsequent heartbeats"
         );
+    }
+
+    /// The hole-punch pair must reach live SSE subscribers over the
+    /// broadcast channel — not just the event-log publisher. Without this
+    /// the joiner (which consumes the SSE stream) never learns to punch.
+    #[tokio::test]
+    async fn heartbeat_broadcasts_holepunch_pair_to_sse_subscribers() {
+        let pub_ = StdArc::new(CapturingPublisher::new());
+        let c = coordinator_with(pub_.clone());
+        let (alice, _) = c.register(req(70, "alice")).await.expect("a");
+        let (bob, _) = c.register(req(71, "bob")).await.expect("b");
+
+        // Subscribe AFTER register so the channel only carries the
+        // heartbeat-time frames we care about.
+        let mut rx = c.broadcaster().subscribe();
+        c.heartbeat(alice.peer_id, "203.0.113.70:11111".into(), None)
+            .await
+            .expect("a hb");
+        c.heartbeat(bob.peer_id, "198.51.100.71:22222".into(), None)
+            .await
+            .expect("b hb");
+
+        // Drain the channel and keep only the hole-punch frames.
+        let mut punches = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let PeerEvent::HolePunch(hp) = ev {
+                punches.push(hp);
+            }
+        }
+        assert_eq!(
+            punches.len(),
+            2,
+            "expected the hole-punch pair on the broadcast channel"
+        );
+        // Each event points the initiator at the OTHER peer's external.
+        assert!(punches
+            .iter()
+            .any(|p| p.target_external_endpoint == "203.0.113.70:11111"));
+        assert!(punches
+            .iter()
+            .any(|p| p.target_external_endpoint == "198.51.100.71:22222"));
     }
 
     #[tokio::test]

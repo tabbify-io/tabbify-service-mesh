@@ -68,6 +68,11 @@ pub enum PeerEventKind {
     Updated,
     /// Peer deregistered or timed out.
     Removed,
+    /// Stage 2 — a coordinator-driven instruction to fire UDP at a peer's
+    /// external endpoint and punch a NAT hole. Not a roster mutation; the
+    /// SSE consumer forwards it to the hole-punch task instead of touching
+    /// the session table.
+    HolePunch,
 }
 
 impl PeerEventKind {
@@ -78,6 +83,7 @@ impl PeerEventKind {
             "peer_added" => Some(Self::Added),
             "peer_updated" => Some(Self::Updated),
             "peer_removed" => Some(Self::Removed),
+            "holepunch_initiate" => Some(Self::HolePunch),
             _ => None,
         }
     }
@@ -116,5 +122,17 @@ mod tests {
     fn ignores_unknown_event_names() {
         assert!(PeerEventKind::from_event_name("heartbeat").is_none());
         assert!(PeerEventKind::from_event_name("").is_none());
+    }
+
+    /// The joiner must recognise the coordinator's Stage 2 hole-punch
+    /// frame so the SSE consumer can route it to the punch task. The
+    /// event name must match the coordinator's `HolePunchInitiate`
+    /// `event_type` (`holepunch_initiate`) exactly.
+    #[test]
+    fn parses_holepunch_event_name() {
+        assert_eq!(
+            PeerEventKind::from_event_name("holepunch_initiate"),
+            Some(PeerEventKind::HolePunch)
+        );
     }
 }

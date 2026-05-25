@@ -30,6 +30,7 @@
 //! every other peer `B` that also has a non-empty external endpoint and
 //! emit the pair if `(min(A,B), max(A,B))` isn't yet in the punched set.
 
+use crate::http::sse::{PeerBroadcaster, PeerEvent};
 use crate::publisher::{EventPublisher, publish_event};
 use crate::roster::coordinator::PEER_SEGMENT;
 use crate::roster::events::HolePunchInitiate;
@@ -115,6 +116,7 @@ impl PunchTracker {
 /// best-effort), `false` when no work was done.
 pub async fn try_emit_pair(
     publisher: &dyn EventPublisher,
+    broadcaster: &PeerBroadcaster,
     tracker: &PunchTracker,
     a: &PunchPeer,
     b: &PunchPeer,
@@ -144,7 +146,11 @@ pub async fn try_emit_pair(
         target_external_endpoint: b.observed_external.clone(),
         timestamp_micros: now_micros,
     };
+    // Persist (audit/event-log) AND broadcast to live SSE subscribers —
+    // the broadcast is what actually delivers the punch instruction to the
+    // initiator's joiner; the per-viewer SSE filter routes it by initiator.
     publish_event(publisher, PEER_SEGMENT, &ev_a).await;
+    broadcaster.broadcast(PeerEvent::HolePunch(ev_a));
     // Event 2: B is initiator, A is target. B sends first to A's external.
     let ev_b = HolePunchInitiate {
         initiator_peer_id: b.peer_id.to_string(),
@@ -153,6 +159,7 @@ pub async fn try_emit_pair(
         timestamp_micros: now_micros,
     };
     publish_event(publisher, PEER_SEGMENT, &ev_b).await;
+    broadcaster.broadcast(PeerEvent::HolePunch(ev_b));
     true
 }
 
@@ -221,7 +228,7 @@ mod tests {
         let tracker = PunchTracker::new();
         let a = peer(1, "203.0.113.1:34567");
         let b = peer(2, "198.51.100.42:51820");
-        let emitted = try_emit_pair(&pub_, &tracker, &a, &b, 1_000).await;
+        let emitted = try_emit_pair(&pub_, &PeerBroadcaster::new(), &tracker, &a, &b, 1_000).await;
         assert!(emitted, "expected pair to be emitted");
         let events = pub_.events();
         assert_eq!(events.len(), 2, "expected two HolePunchInitiate events");
@@ -258,7 +265,7 @@ mod tests {
         let tracker = PunchTracker::new();
         let a = peer(1, "203.0.113.1:34567");
         let b = peer(2, ""); // no external known
-        let emitted = try_emit_pair(&pub_, &tracker, &a, &b, 0).await;
+        let emitted = try_emit_pair(&pub_, &PeerBroadcaster::new(), &tracker, &a, &b, 0).await;
         assert!(!emitted);
         assert!(pub_.events().is_empty(), "no events should fire");
         assert!(tracker.is_empty(), "tracker must stay empty");
@@ -270,10 +277,10 @@ mod tests {
         let tracker = PunchTracker::new();
         let a = peer(1, "203.0.113.1:34567");
         let b = peer(2, "198.51.100.42:51820");
-        let first = try_emit_pair(&pub_, &tracker, &a, &b, 1).await;
-        let second = try_emit_pair(&pub_, &tracker, &a, &b, 2).await;
+        let first = try_emit_pair(&pub_, &PeerBroadcaster::new(), &tracker, &a, &b, 1).await;
+        let second = try_emit_pair(&pub_, &PeerBroadcaster::new(), &tracker, &a, &b, 2).await;
         // Swap order — should still be deduped via canonical_pair.
-        let third = try_emit_pair(&pub_, &tracker, &b, &a, 3).await;
+        let third = try_emit_pair(&pub_, &PeerBroadcaster::new(), &tracker, &b, &a, 3).await;
         assert!(first);
         assert!(!second);
         assert!(!third);
@@ -286,7 +293,7 @@ mod tests {
         let pub_ = CapturingPublisher::new();
         let tracker = PunchTracker::new();
         let a = peer(7, "203.0.113.1:34567");
-        let emitted = try_emit_pair(&pub_, &tracker, &a, &a, 0).await;
+        let emitted = try_emit_pair(&pub_, &PeerBroadcaster::new(), &tracker, &a, &a, 0).await;
         assert!(!emitted);
         assert!(pub_.events().is_empty());
     }

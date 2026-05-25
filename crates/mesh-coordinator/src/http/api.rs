@@ -436,6 +436,17 @@ impl ViewerFilter {
                     None
                 }
             }
+            // A hole-punch instruction goes only to the peer told to fire
+            // (its initiator). Routed by id, not tags — and never gated by
+            // `revealed`, since a punch can be needed before either peer
+            // has appeared in the other's roster view.
+            PeerEvent::HolePunch(ref hp) => {
+                if hp.initiator_peer_id == self.viewer_id.to_string() {
+                    Some(to_sse_frame(&event))
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -500,6 +511,57 @@ fn to_sse_frame(event: &PeerEvent) -> SseFrame {
             warn!(error = %e, "failed to serialise peer event");
             SseFrame::default().event("error").data("serialisation failed")
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::publisher::EventPublisher;
+    use crate::roster::events::HolePunchInitiate;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct NoopPublisher;
+    #[async_trait]
+    impl EventPublisher for NoopPublisher {
+        async fn publish(&self, _t: &str, _s: &str, _p: Vec<u8>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn test_coordinator() -> Coordinator {
+        Coordinator::new(Arc::new(NoopPublisher), Duration::from_secs(60))
+    }
+
+    fn holepunch_for(initiator: Uuid, target: Uuid) -> PeerEvent {
+        PeerEvent::HolePunch(HolePunchInitiate {
+            initiator_peer_id: initiator.to_string(),
+            target_peer_id: target.to_string(),
+            target_external_endpoint: "203.0.113.9:51820".into(),
+            timestamp_micros: 1,
+        })
+    }
+
+    /// The per-viewer SSE filter forwards a hole-punch frame ONLY to the
+    /// peer named as its initiator — that peer is the one instructed to
+    /// fire UDP. A viewer named as initiator gets the frame; the same
+    /// viewer named only as a target (someone else's initiate) does not.
+    #[test]
+    fn viewer_filter_forwards_holepunch_only_to_initiator() {
+        let viewer = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        let mut filter = ViewerFilter {
+            coordinator: test_coordinator(),
+            viewer_id: viewer,
+            viewer_tags: vec![],
+            revealed: HashSet::new(),
+        };
+        // We are the initiator → forwarded.
+        assert!(filter.apply(holepunch_for(viewer, other)).is_some());
+        // We are only the target of someone else's initiate → dropped.
+        assert!(filter.apply(holepunch_for(other, viewer)).is_none());
     }
 }
 

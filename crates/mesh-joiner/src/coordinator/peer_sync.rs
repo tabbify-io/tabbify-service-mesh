@@ -16,13 +16,14 @@
 //! reconciliation.
 
 use crate::coordinator::client::{remote_to_info, CoordinatorClient};
+use crate::nat::holepunch::HolePunchInitiate;
 use crate::peer::{PeerEventKind, PeerRemovedPayload, RemotePeer};
 use crate::wg::session::SessionTable;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 use x25519_dalek::StaticSecret;
 
@@ -39,6 +40,7 @@ pub async fn run(
     client: Arc<CoordinatorClient>,
     sessions: SessionTable,
     our_private: StaticSecret,
+    punch_tx: Option<mpsc::UnboundedSender<HolePunchInitiate>>,
     peer_id: Uuid,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -49,8 +51,15 @@ pub async fn run(
         if *shutdown.borrow() {
             return;
         }
-        let stream_result =
-            consume_once(&client, &sessions, &our_private, peer_id, &mut shutdown).await;
+        let stream_result = consume_once(
+            &client,
+            &sessions,
+            &our_private,
+            punch_tx.as_ref(),
+            peer_id,
+            &mut shutdown,
+        )
+        .await;
         match stream_result {
             StreamOutcome::ShutdownRequested => return,
             StreamOutcome::EndOfStream => {
@@ -104,6 +113,7 @@ async fn consume_once(
     client: &CoordinatorClient,
     sessions: &SessionTable,
     our_private: &StaticSecret,
+    punch_tx: Option<&mpsc::UnboundedSender<HolePunchInitiate>>,
     peer_id: Uuid,
     shutdown: &mut watch::Receiver<bool>,
 ) -> StreamOutcome {
@@ -141,7 +151,7 @@ async fn consume_once(
                             // SSE comment / heartbeat — ignore.
                             continue;
                         };
-                        apply_event(sessions, our_private, kind, &ev.data).await;
+                        apply_event(sessions, our_private, punch_tx, kind, &ev.data).await;
                     }
                 }
             }
@@ -149,10 +159,17 @@ async fn consume_once(
     }
 }
 
-/// Apply one parsed SSE event to the session table.
+/// Apply one parsed SSE event.
+///
+/// Roster events (`Added`/`Updated`/`Removed`) mutate the session table.
+/// A `HolePunch` event is instead forwarded verbatim to the hole-punch
+/// task over `punch_tx` (when wired) — the consumer does no session work
+/// for it. `punch_tx` is `None` in tests and in any build that hasn't
+/// wired the punch task.
 pub async fn apply_event(
     sessions: &SessionTable,
     our_private: &StaticSecret,
+    punch_tx: Option<&mpsc::UnboundedSender<HolePunchInitiate>>,
     kind: PeerEventKind,
     data: &str,
 ) {
@@ -200,6 +217,27 @@ pub async fn apply_event(
             for s in candidates {
                 tracing::info!(peer_id = %s.peer_id, ula = %s.ula, "peer-stream: removing peer");
                 sessions.remove(s.ula);
+            }
+        }
+        PeerEventKind::HolePunch => {
+            let Some(tx) = punch_tx else {
+                // No punch task wired (tests / Stage-1-only build) — drop.
+                return;
+            };
+            match serde_json::from_str::<HolePunchInitiate>(data) {
+                Ok(ev) => {
+                    tracing::info!(
+                        initiator = %ev.initiator_peer_id,
+                        target = %ev.target_peer_id,
+                        target_endpoint = %ev.target_external_endpoint,
+                        "peer-stream: forwarding hole-punch to punch task"
+                    );
+                    // Best-effort: if the punch task has gone away, drop it.
+                    let _ = tx.send(ev);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, body = %data, "peer-stream: bad holepunch json");
+                }
             }
         }
     }
@@ -254,6 +292,7 @@ mod tests {
         apply_event(
             &sessions,
             &me,
+            None,
             PeerEventKind::Added,
             &remote_json("fd5a:1f00:1::1", 1),
         )
@@ -271,6 +310,7 @@ mod tests {
         apply_event(
             &sessions,
             &me,
+            None,
             PeerEventKind::Added,
             &remote_json("fd5a:1f00:1::1", 1),
         )
@@ -283,6 +323,7 @@ mod tests {
         apply_event(
             &sessions,
             &me,
+            None,
             PeerEventKind::Updated,
             &serde_json::to_string(&updated).unwrap(),
         )
@@ -301,13 +342,14 @@ mod tests {
         let me = StaticSecret::from([0xAA; 32]);
         let json = remote_json("fd5a:1f00:1::1", 1);
         let parsed: RemotePeer = serde_json::from_str(&json).unwrap();
-        apply_event(&sessions, &me, PeerEventKind::Added, &json).await;
+        apply_event(&sessions, &me, None, PeerEventKind::Added, &json).await;
         assert_eq!(sessions.len(), 1);
         let removed_payload =
             serde_json::json!({ "peer_id": parsed.peer_id }).to_string();
         apply_event(
             &sessions,
             &me,
+            None,
             PeerEventKind::Removed,
             &removed_payload,
         )
@@ -320,8 +362,42 @@ mod tests {
     async fn apply_event_swallows_bad_json() {
         let sessions = SessionTable::new();
         let me = StaticSecret::from([0xAA; 32]);
-        apply_event(&sessions, &me, PeerEventKind::Added, "not json").await;
+        apply_event(&sessions, &me, None, PeerEventKind::Added, "not json").await;
         assert!(sessions.is_empty());
+    }
+
+    /// A `holepunch_initiate` frame must be parsed and forwarded to the
+    /// punch task's channel verbatim — the SSE consumer itself does no
+    /// session work for it (that's the punch task's job).
+    #[tokio::test]
+    async fn apply_holepunch_forwards_to_channel() {
+        let sessions = SessionTable::new();
+        let me = StaticSecret::from([0xAA; 32]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let body = serde_json::to_string(&crate::nat::holepunch::HolePunchInitiate {
+            initiator_peer_id: "aaaaaaaa-0000-7000-8000-000000000001".into(),
+            target_peer_id: "bbbbbbbb-0000-7000-8000-000000000002".into(),
+            target_external_endpoint: "203.0.113.1:51820".into(),
+            timestamp_micros: 7,
+        })
+        .unwrap();
+        apply_event(&sessions, &me, Some(&tx), PeerEventKind::HolePunch, &body).await;
+        let received = rx.try_recv().expect("event forwarded to punch task");
+        assert_eq!(received.target_external_endpoint, "203.0.113.1:51820");
+        assert_eq!(received.timestamp_micros, 7);
+        // The session table is untouched by a hole-punch frame.
+        assert!(sessions.is_empty());
+    }
+
+    /// Malformed hole-punch JSON must be swallowed (log + skip), not
+    /// forwarded, and must never panic the consumer loop.
+    #[tokio::test]
+    async fn apply_holepunch_swallows_bad_json() {
+        let sessions = SessionTable::new();
+        let me = StaticSecret::from([0xAA; 32]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        apply_event(&sessions, &me, Some(&tx), PeerEventKind::HolePunch, "not json").await;
+        assert!(rx.try_recv().is_err(), "nothing forwarded on bad json");
     }
 
     /// Sanity: `PeerEventKind` ↔ event-name parsing round-trips for all

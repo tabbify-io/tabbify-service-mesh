@@ -25,9 +25,13 @@
 //! decided — gives downstream code the right import path now without
 //! requiring SSE-extension work today.
 
+use crate::wg::session::{classify_tunn_result, PeerSession, SessionTable, WgAction};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -50,22 +54,111 @@ pub struct HolePunchInitiate {
     pub timestamp_micros: i64,
 }
 
-/// Run the hole-punch subscriber task until `shutdown` flips to `true`.
+/// Buffer for a single handshake-initiation. A `WireGuard` handshake-init is
+/// 148 bytes; 256 leaves margin without allocating a full MTU frame on
+/// every burst packet.
+const HANDSHAKE_BUF_LEN: usize = 256;
+
+/// How many handshake-initiations to fire per punch, and the gap between
+/// them. A short burst covers the race where our first packet reaches the
+/// peer's NAT before it has punched back; once any pair crosses, the
+/// session is up and boringtun's own rekey timer keeps it alive.
+const PUNCH_BURST: usize = 5;
+const PUNCH_INTERVAL: Duration = Duration::from_millis(300);
+
+/// A resolved punch action: which peer session to drive, and the external
+/// endpoint to fire handshake-initiations at.
+#[derive(Debug, Clone)]
+pub struct PunchPlan {
+    /// The target peer's session (its `Tunn` + routing metadata).
+    pub session: Arc<PeerSession>,
+    /// The reflexive endpoint to dial.
+    pub endpoint: SocketAddr,
+}
+
+/// Decide whether and where to punch for one `HolePunchInitiate`.
 ///
-/// Currently a placeholder: parks on a long-sleep loop so it joins the
-/// rest of the joiner's background tasks with the same shutdown semantics.
-/// When the SSE mechanism for `HolePunchInitiate` events lands, replace
-/// the body with a stream consumer that calls
-/// [`handle_holepunch_initiate`] for each parsed event.
-pub async fn run(my_peer_id: Uuid, mut shutdown: watch::Receiver<bool>) {
-    info!(
-        peer_id = %my_peer_id,
-        "holepunch: subscriber started (Stage 2 skeleton — real impl deferred)",
-    );
+/// Returns `Some` only when ALL hold: we are the named initiator, the
+/// target endpoint parses, and we already have a session for the target
+/// peer (built from the roster). Otherwise `None` — we either aren't the
+/// one to fire (we'll get our own initiator-side event from the swapped
+/// pair) or have nothing to fire at yet.
+#[must_use]
+pub fn plan_punch(
+    sessions: &SessionTable,
+    my_peer_id: Uuid,
+    event: &HolePunchInitiate,
+) -> Option<PunchPlan> {
+    if event.initiator_peer_id != my_peer_id.to_string() {
+        return None;
+    }
+    let endpoint: SocketAddr = event.target_external_endpoint.parse().ok()?;
+    let target_id = Uuid::parse_str(&event.target_peer_id).ok()?;
+    let session = sessions
+        .snapshot()
+        .into_iter()
+        .find(|s| s.peer_id == target_id)?;
+    Some(PunchPlan { session, endpoint })
+}
+
+/// Force a fresh `WireGuard` handshake-initiation for `session` and return
+/// the datagram to send. `force_resend = true` so a burst actually emits
+/// repeated inits (boringtun would otherwise suppress one sent recently).
+/// `None` if boringtun produced nothing to send.
+async fn build_handshake_packet(session: &Arc<PeerSession>) -> Option<Vec<u8>> {
+    let mut out = vec![0u8; HANDSHAKE_BUF_LEN];
+    let mut tunn = session.tunn.lock().await;
+    match classify_tunn_result(tunn.format_handshake_initiation(&mut out, true)) {
+        WgAction::SendToPeer(bytes) => Some(bytes),
+        _ => None,
+    }
+}
+
+/// Execute a planned punch.
+///
+/// Repoints the session's outbound endpoint at the reflexive target, then
+/// fires a short burst of handshake-initiations so our `NAT` mapping opens
+/// and crosses with the peer's simultaneous burst.
+pub async fn execute_punch(socket: &UdpSocket, plan: &PunchPlan, burst: usize, interval: Duration) {
+    // Adopt the coordinator-provided reflexive endpoint as the outbound
+    // default — it is authoritative (same source as an advertised endpoint).
+    *plan.session.endpoint.write() = Some(plan.endpoint);
+    for i in 0..burst {
+        if let Some(bytes) = build_handshake_packet(&plan.session).await {
+            if let Err(e) = socket.send_to(&bytes, plan.endpoint).await {
+                tracing::warn!(error = %e, endpoint = %plan.endpoint, "holepunch: send failed");
+            } else {
+                tracing::debug!(
+                    endpoint = %plan.endpoint,
+                    peer = %plan.session.peer_id,
+                    "holepunch: fired handshake-init"
+                );
+            }
+        }
+        if i + 1 < burst {
+            tokio::time::sleep(interval).await;
+        }
+    }
+}
+
+/// Run the hole-punch task until `shutdown` flips or the punch channel
+/// closes.
+///
+/// Consumes `HolePunchInitiate` events forwarded by the SSE consumer. For
+/// each event where we are the initiator (and have a session for the
+/// target), it fires a short burst of handshake-initiations at the
+/// target's reflexive endpoint — opening our NAT mapping so the peer's
+/// simultaneous burst crosses and the `WireGuard` session establishes. The
+/// coordinator emits a swapped pair, so the other side punches back at us.
+pub async fn run(
+    my_peer_id: Uuid,
+    socket: Arc<UdpSocket>,
+    sessions: SessionTable,
+    mut punch_rx: mpsc::UnboundedReceiver<HolePunchInitiate>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    info!(peer_id = %my_peer_id, "holepunch: subscriber started");
     loop {
-        // Long idle interval — this loop is here purely so the parent
-        // can `join` it on graceful shutdown. We don't poll anything;
-        // when the real subscriber lands it'll select! on stream + shutdown.
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
@@ -74,50 +167,30 @@ pub async fn run(my_peer_id: Uuid, mut shutdown: watch::Receiver<bool>) {
                     return;
                 }
             }
-            () = tokio::time::sleep(Duration::from_secs(30)) => {
-                debug!(peer_id = %my_peer_id, "holepunch: stub still alive (no-op tick)");
+            maybe = punch_rx.recv() => {
+                let Some(event) = maybe else {
+                    debug!("holepunch: punch channel closed, exiting");
+                    return;
+                };
+                match plan_punch(&sessions, my_peer_id, &event) {
+                    Some(plan) => {
+                        info!(
+                            target = %event.target_peer_id,
+                            endpoint = %plan.endpoint,
+                            "holepunch: punching",
+                        );
+                        execute_punch(&socket, &plan, PUNCH_BURST, PUNCH_INTERVAL).await;
+                    }
+                    None => {
+                        debug!(
+                            initiator = %event.initiator_peer_id,
+                            target = %event.target_peer_id,
+                            "holepunch: skip (not initiator / no session / bad endpoint)",
+                        );
+                    }
+                }
             }
         }
-    }
-}
-
-/// Stub handler for one decoded `HolePunchInitiate` event.
-///
-/// The real implementation will fire UDP packets here; for now we just log
-/// that we received an initiate request, with enough detail (peer ids +
-/// target endpoint) to verify the protocol shape end-to-end in tests.
-/// Returns `true` when the event was intended for us (one of the peer
-/// ids matched), `false` otherwise. Lets callers tally "events skipped"
-/// for diagnostics without adding observability hooks to this stub.
-pub fn handle_holepunch_initiate(
-    my_peer_id: Uuid,
-    event: &HolePunchInitiate,
-) -> bool {
-    let me = my_peer_id.to_string();
-    if event.initiator_peer_id == me {
-        info!(
-            initiator = %event.initiator_peer_id,
-            target = %event.target_peer_id,
-            target_endpoint = %event.target_external_endpoint,
-            timestamp_micros = event.timestamp_micros,
-            "holepunch_initiate received (initiator role) — real impl deferred (Stage 2)",
-        );
-        true
-    } else if event.target_peer_id == me {
-        info!(
-            initiator = %event.initiator_peer_id,
-            target = %event.target_peer_id,
-            timestamp_micros = event.timestamp_micros,
-            "holepunch_initiate received (target role) — real impl deferred (Stage 2)",
-        );
-        true
-    } else {
-        debug!(
-            initiator = %event.initiator_peer_id,
-            target = %event.target_peer_id,
-            "holepunch_initiate received for other peers — ignoring",
-        );
-        false
     }
 }
 
@@ -125,6 +198,103 @@ pub fn handle_holepunch_initiate(
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::peer::PeerInfo;
+    use crate::wg::session::SessionTable;
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    /// Build a session table holding exactly one peer session keyed by
+    /// `peer_id`, so `plan_punch` has something to find.
+    fn session_table_with(peer_id: Uuid, ula: &str, endpoint: Option<&str>) -> SessionTable {
+        let t = SessionTable::new();
+        let me = StaticSecret::from([7u8; 32]);
+        let peer_pub = *PublicKey::from(&StaticSecret::from([9u8; 32])).as_bytes();
+        let info = PeerInfo {
+            peer_id,
+            wg_public_key: peer_pub,
+            ula: ula.parse().expect("ula"),
+            listen_endpoint: endpoint.map(|s| s.parse().expect("endpoint")),
+            display_name: "target".into(),
+            tags: vec![],
+            joined_at_micros: 0,
+        };
+        t.upsert(&me, &info);
+        t
+    }
+
+    /// When we are the initiator and have a session for the target, the
+    /// plan points at the event's external endpoint and that peer's session.
+    #[test]
+    fn plan_punch_targets_session_when_we_are_initiator() {
+        let me = Uuid::from_u128(1);
+        let target = Uuid::from_u128(2);
+        let sessions = session_table_with(target, "fd5a:1f00:1::2", Some("198.51.100.2:51820"));
+        let plan = plan_punch(&sessions, me, &ev(me, target, "203.0.113.2:40000"))
+            .expect("a plan");
+        assert_eq!(plan.endpoint, "203.0.113.2:40000".parse().expect("addr"));
+        assert_eq!(plan.session.peer_id, target);
+    }
+
+    /// We only fire when WE are the initiator. An event whose initiator is
+    /// some other peer (we'd be the target) yields no plan — we'll get our
+    /// own initiator-side event from the coordinator's swapped pair.
+    #[test]
+    fn plan_punch_skips_when_not_initiator() {
+        let me = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        let target = Uuid::from_u128(3);
+        let sessions = session_table_with(target, "fd5a:1f00:1::3", None);
+        assert!(plan_punch(&sessions, me, &ev(other, target, "203.0.113.3:1")).is_none());
+    }
+
+    /// No session for the named target → nothing to punch (roster hasn't
+    /// caught up yet); skip rather than fabricate a session.
+    #[test]
+    fn plan_punch_skips_when_no_session_for_target() {
+        let me = Uuid::from_u128(1);
+        let target = Uuid::from_u128(2);
+        let sessions = SessionTable::new();
+        assert!(plan_punch(&sessions, me, &ev(me, target, "203.0.113.2:1")).is_none());
+    }
+
+    /// A malformed external endpoint string must be skipped, not panic.
+    #[test]
+    fn plan_punch_skips_on_unparseable_endpoint() {
+        let me = Uuid::from_u128(1);
+        let target = Uuid::from_u128(2);
+        let sessions = session_table_with(target, "fd5a:1f00:1::2", None);
+        assert!(plan_punch(&sessions, me, &ev(me, target, "not-an-addr")).is_none());
+    }
+
+    /// Executing a plan must (a) repoint the session's outbound endpoint
+    /// at the reflexive target and (b) actually emit a `WireGuard`
+    /// handshake-initiation datagram to that endpoint — that datagram is
+    /// the "punch" that opens our NAT mapping.
+    #[tokio::test]
+    async fn execute_punch_sends_handshake_init_to_endpoint() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
+        let target_addr = receiver.local_addr().expect("recv addr");
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind send"));
+
+        let me = Uuid::from_u128(1);
+        let target = Uuid::from_u128(2);
+        let sessions = session_table_with(target, "fd5a:1f00:1::2", None);
+        let plan = plan_punch(&sessions, me, &ev(me, target, &target_addr.to_string()))
+            .expect("a plan");
+
+        execute_punch(&sender, &plan, 2, Duration::from_millis(1)).await;
+
+        let mut buf = [0u8; 256];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .expect("a datagram within timeout")
+            .expect("recv ok");
+        assert!(n >= 148, "WireGuard handshake-init is 148 bytes, got {n}");
+        assert_eq!(buf[0], 1, "first byte is the WG handshake-init message type");
+        // The session now targets the reflexive endpoint for outbound.
+        assert_eq!(plan.session.endpoint(), Some(target_addr));
+    }
 
     fn ev(initiator: Uuid, target: Uuid, endpoint: &str) -> HolePunchInitiate {
         HolePunchInitiate {
@@ -135,48 +305,58 @@ mod tests {
         }
     }
 
-    #[test]
-    fn handle_recognises_initiator_role() {
-        let me = Uuid::from_u128(1);
-        let other = Uuid::from_u128(2);
-        assert!(handle_holepunch_initiate(
-            me,
-            &ev(me, other, "203.0.113.1:1234"),
-        ));
-    }
-
-    #[test]
-    fn handle_recognises_target_role() {
-        let me = Uuid::from_u128(1);
-        let other = Uuid::from_u128(2);
-        assert!(handle_holepunch_initiate(
-            me,
-            &ev(other, me, "198.51.100.1:1234"),
-        ));
-    }
-
-    #[test]
-    fn handle_ignores_other_peers() {
-        let me = Uuid::from_u128(1);
-        let a = Uuid::from_u128(2);
-        let b = Uuid::from_u128(3);
-        assert!(!handle_holepunch_initiate(
-            me,
-            &ev(a, b, "203.0.113.1:1234"),
-        ));
-    }
-
     #[tokio::test]
     async fn run_exits_on_shutdown() {
         let (tx, rx) = watch::channel(false);
+        let (_punch_tx, punch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
         let me = Uuid::from_u128(7);
         let handle = tokio::spawn(async move {
-            run(me, rx).await;
+            run(me, socket, SessionTable::new(), punch_rx, rx).await;
         });
         tx.send(true).expect("shutdown send");
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("task exited within timeout")
+            .expect("task ran to completion");
+    }
+
+    /// An initiate event naming us as initiator drives a real punch: the
+    /// task fires a handshake-init at the target's endpoint. A loopback
+    /// receiver stands in for the target's reflexive endpoint.
+    #[tokio::test]
+    async fn run_punches_on_initiator_event() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
+        let target_addr = receiver.local_addr().expect("recv addr");
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind send"));
+
+        let me = Uuid::from_u128(1);
+        let target = Uuid::from_u128(2);
+        let sessions = session_table_with(target, "fd5a:1f00:1::2", None);
+        let (punch_tx, punch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let task = tokio::spawn(async move {
+            run(me, socket, sessions, punch_rx, sd_rx).await;
+        });
+
+        punch_tx
+            .send(ev(me, target, &target_addr.to_string()))
+            .expect("send initiate");
+
+        let mut buf = [0u8; 256];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+            .await
+            .expect("a datagram within timeout")
+            .expect("recv ok");
+        assert!(n >= 148, "expected a WG handshake-init, got {n} bytes");
+        assert_eq!(buf[0], 1, "first byte is the WG handshake-init type");
+
+        // Closing the sender ends the run loop cleanly.
+        drop(punch_tx);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("task exits when channel closes")
             .expect("task ran to completion");
     }
 }

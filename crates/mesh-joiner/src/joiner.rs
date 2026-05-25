@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tabbify_mesh_fabric::tun::{self as fabric_tun, TunDevice, TunOptions};
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -364,47 +364,53 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
 
     // Timer loop — keeps each `Tunn` alive (rekey, keepalives).
     tasks.push(tokio::spawn(timer_loop(
-        socket,
+        socket.clone(),
         sessions.clone(),
         shutdown_rx.clone(),
     )));
 
-    // SSE consumer. Passes our own `peer_id` so the coordinator returns
-    // an ACL-filtered peer stream (spec §5.3 / 5a decision #3).
+    // Punch channel: the SSE consumer forwards `HolePunchInitiate` frames
+    // to the hole-punch task, which fires the UDP burst (Stage 2).
+    let (punch_tx, punch_rx) = mpsc::unbounded_channel::<holepunch::HolePunchInitiate>();
+
+    // SSE consumer. Passes our own `peer_id` so the coordinator returns an
+    // ACL-filtered peer stream (spec §5.3 / 5a decision #3), and the punch
+    // sender so hole-punch frames reach the punch task.
     {
         let sessions = sessions.clone();
         let our_private = our_private.clone();
         let client = client.clone();
         let shutdown_rx = shutdown_rx.clone();
         tasks.push(tokio::spawn(async move {
-            peer_sync::run(client, sessions, our_private, peer_id, shutdown_rx).await;
+            peer_sync::run(client, sessions, our_private, Some(punch_tx), peer_id, shutdown_rx)
+                .await;
         }));
     }
 
-    // Heartbeat.
+    // Stage 2 hole-punch task. Receives forwarded initiate events and fires
+    // handshake-init bursts at the target's reflexive endpoint. `socket` is
+    // moved in here (its last use); `sessions` is cloned because the
+    // heartbeat task below still needs the original.
     {
+        let sessions = sessions.clone();
         let shutdown_rx = shutdown_rx.clone();
         tasks.push(tokio::spawn(async move {
-            heartbeat::run(
-                client,
-                sessions,
-                our_private,
-                peer_id,
-                wg_listen_port,
-                heartbeat_interval,
-                shutdown_rx,
-            )
-            .await;
+            holepunch::run(peer_id, socket, sessions, punch_rx, shutdown_rx).await;
         }));
     }
 
-    // Stage 2 hole-punch subscriber stub. Currently a no-op loop; once
-    // the SSE / event-stream mechanism for `HolePunchInitiate` events
-    // lands, swap the body for a real subscriber. The task is spawned
-    // now so the joiner's shutdown plumbing already covers it and a
-    // future wire-up doesn't need to touch joiner.rs.
+    // Heartbeat — the last task, so it moves the remaining handles.
     tasks.push(tokio::spawn(async move {
-        holepunch::run(peer_id, shutdown_rx).await;
+        heartbeat::run(
+            client,
+            sessions,
+            our_private,
+            peer_id,
+            wg_listen_port,
+            heartbeat_interval,
+            shutdown_rx,
+        )
+        .await;
     }));
 
     tasks

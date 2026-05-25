@@ -174,13 +174,21 @@ Out of scope for this iteration; left as a clear follow-up:
    UDP socket and report the STUN-observed `ip:port`. This makes the
    reflexive port correct under address-dependent mappings, and improves
    accuracy for some symmetric NATs.
-2. **UDP hole punching.** A coordinator-driven simultaneous-open. The
-   protocol shape already exists as a skeleton: the coordinator emits a
-   pair of `HolePunchInitiate` events (one per peer, initiator/target
-   swapped) once both peers have a known observed external addr
-   (`nat::holepunch`), and the joiner has a subscriber stub
-   (`mesh-joiner::nat::holepunch`). The real timing/retry state machine and
-   the event-delivery wire (an SSE extension or a sibling stream) are TODO.
+2. **UDP hole punching — IMPLEMENTED (2026-05-25 follow-up).**
+   Coordinator-driven simultaneous-open for two cone-NAT peers (the case
+   where neither side is a public anchor). Delivery reuses the existing
+   stream rather than a sibling endpoint: the coordinator broadcasts the
+   `HolePunchInitiate` pair as a new `PeerEvent::HolePunch` over
+   `/v1/mesh/peers/stream`, and the per-viewer SSE filter routes each event
+   to the peer named as its initiator. The joiner's SSE consumer forwards
+   the frame to a hole-punch task (`mesh-joiner::nat::holepunch::run`) that
+   repoints the target session's endpoint at the reflexive address and
+   fires a short burst of *forced* handshake-initiations
+   (`Tunn::format_handshake_initiation(.., true)`) to open its NAT mapping;
+   the coordinator's swapped pair makes the other side punch back, so the
+   bursts cross and the session establishes. Remaining refinement (not
+   blocking cone↔cone): the burst is fixed (5 × 300 ms), not an adaptive
+   retry/back-off state machine, and there is no NAT-type detection yet.
 3. **Relay fallback (TURN-like).** For symmetric-to-symmetric pairs that
    hole punching can't solve, relay WireGuard UDP through the coordinator
    or a dedicated relay. Not designed yet.

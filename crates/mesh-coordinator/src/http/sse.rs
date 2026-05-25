@@ -6,6 +6,7 @@
 //! rather than blocking the coordinator.
 
 use crate::http::api::PeerInfo;
+use crate::roster::events::HolePunchInitiate;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
@@ -39,6 +40,13 @@ pub enum PeerEvent {
         #[serde(skip)]
         tags: Vec<String>,
     },
+    /// Stage 2 — a coordinator-driven hole-punch instruction. Unlike the
+    /// roster events this is addressed to a single peer (the initiator):
+    /// the per-viewer SSE filter forwards it only to the peer whose id
+    /// matches `initiator_peer_id`, so each side is told to fire UDP at
+    /// the other's external endpoint. Carried on the same broadcast
+    /// channel + stream as roster frames rather than a sibling endpoint.
+    HolePunch(HolePunchInitiate),
 }
 
 impl PeerEvent {
@@ -49,6 +57,18 @@ impl PeerEvent {
             Self::Added(_) => "peer_added",
             Self::Updated(_) => "peer_updated",
             Self::Removed { .. } => "peer_removed",
+            Self::HolePunch(_) => "holepunch_initiate",
+        }
+    }
+
+    /// The initiator peer id of a [`PeerEvent::HolePunch`] (the peer that
+    /// should fire UDP first), or `None` for roster events. The per-viewer
+    /// SSE filter routes a hole-punch frame to exactly this peer.
+    #[must_use]
+    pub fn holepunch_initiator(&self) -> Option<&str> {
+        match self {
+            Self::HolePunch(hp) => Some(hp.initiator_peer_id.as_str()),
+            _ => None,
         }
     }
 
@@ -59,6 +79,8 @@ impl PeerEvent {
         match self {
             Self::Added(p) | Self::Updated(p) => &p.tags,
             Self::Removed { tags, .. } => tags,
+            // HolePunch is routed by initiator id, not tags.
+            Self::HolePunch(_) => &[],
         }
     }
 
@@ -74,6 +96,7 @@ impl PeerEvent {
             Self::Removed { peer_id, .. } => serde_json::to_string(&serde_json::json!({
                 "peer_id": peer_id,
             })),
+            Self::HolePunch(hp) => serde_json::to_string(hp),
         }
     }
 }
@@ -112,5 +135,51 @@ impl PeerBroadcaster {
 impl Default for PeerBroadcaster {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::roster::events::HolePunchInitiate;
+
+    fn sample_holepunch() -> HolePunchInitiate {
+        HolePunchInitiate {
+            initiator_peer_id: "aaaaaaaa-0000-7000-8000-000000000001".into(),
+            target_peer_id: "bbbbbbbb-0000-7000-8000-000000000002".into(),
+            target_external_endpoint: "203.0.113.1:51820".into(),
+            timestamp_micros: 99,
+        }
+    }
+
+    /// A `HolePunch` event must surface on the wire as `holepunch_initiate`
+    /// with a JSON body that round-trips back to the original event — that
+    /// is the contract the joiner's SSE consumer parses against.
+    #[test]
+    fn holepunch_event_name_and_payload_round_trip() {
+        let hp = sample_holepunch();
+        let ev = PeerEvent::HolePunch(hp.clone());
+        assert_eq!(ev.event_name(), "holepunch_initiate");
+        let payload = ev.data_payload().expect("payload serialises");
+        let decoded: HolePunchInitiate =
+            serde_json::from_str(&payload).expect("payload round-trips");
+        assert_eq!(decoded, hp);
+    }
+
+    /// The per-viewer SSE filter routes a hole-punch event to its initiator
+    /// only, so `PeerEvent` must expose the initiator id for `HolePunch` and
+    /// `None` for roster events (which are tag-filtered instead).
+    #[test]
+    fn holepunch_initiator_exposed_for_filtering() {
+        let hp = sample_holepunch();
+        let ev = PeerEvent::HolePunch(hp.clone());
+        assert_eq!(ev.holepunch_initiator(), Some(hp.initiator_peer_id.as_str()));
+
+        let removed = PeerEvent::Removed {
+            peer_id: "x".into(),
+            tags: vec![],
+        };
+        assert_eq!(removed.holepunch_initiator(), None);
     }
 }
