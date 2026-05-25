@@ -150,8 +150,11 @@ jobs:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
         run: |
           set -euo pipefail
+          # NOTE: SSM AWS-RunShellScript runs this with /bin/sh (dash on
+          # Ubuntu), so it must be POSIX — no `pipefail`. `set -e` still aborts
+          # on a failed `docker login` (empty creds -> login fails -> exit).
           DEPLOY_SCRIPT=$(cat <<EOF
-          set -euo pipefail
+          set -eu
           aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REGISTRY}
           cd /opt/tabbify && docker compose pull && docker compose up -d
           EOF
