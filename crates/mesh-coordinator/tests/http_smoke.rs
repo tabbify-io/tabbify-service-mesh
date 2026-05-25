@@ -207,6 +207,106 @@ async fn http_heartbeat_and_deregister_flow() {
     assert_eq!(peers[0]["peer_id"].as_str().expect("peer_id"), peer_id_b);
 }
 
+/// End-to-end reflexive-endpoint wire contract over a real TCP socket
+/// (so `ConnectInfo` is populated). The connection is loopback, so the
+/// observed source IP is `127.0.0.1` (private) — the reflexive override
+/// does NOT fire and a self-reported PUBLIC endpoint is preserved while
+/// the response still echoes the peer its observed IP. This locks the new
+/// `wg_listen_port` request field + `observed_ip` / `observed_endpoint`
+/// response fields through the HTTP layer. (The reflexive *rewrite* itself
+/// can't be exercised over loopback; it is covered by the coordinator unit
+/// tests that inject a synthetic public observed addr.)
+#[tokio::test]
+async fn http_register_reflects_observed_fields() {
+    let (addr, _server) = spawn_server().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Register with an explicit PUBLIC advertise-endpoint + a WG port.
+    let body = json_body(
+        post_json(
+            &client,
+            &format!("{base}/v1/mesh/register"),
+            serde_json::json!({
+                "wg_public_key": pubkey(1),
+                "listen_endpoint": "203.0.113.50:51820",
+                "wg_listen_port": 51820,
+                "display_name": "public-peer",
+                "tags": ["dev-machine"],
+            }),
+        )
+        .await,
+    )
+    .await;
+    let peer_id = body["peer_id"].as_str().expect("peer_id").to_owned();
+    // The coordinator echoes our observed source IP (loopback over a local
+    // TCP connection) ...
+    assert_eq!(
+        body["observed_ip"].as_str(),
+        Some("127.0.0.1"),
+        "observed_ip should echo the loopback source: {body}"
+    );
+    // ... and the stored reflexive endpoint, which here equals the
+    // self-reported PUBLIC endpoint (preserved, not clobbered).
+    assert_eq!(
+        body["observed_endpoint"].as_str(),
+        Some("203.0.113.50:51820"),
+        "explicit public advertise-endpoint must be preserved: {body}"
+    );
+
+    // The peer's roster entry carries that same endpoint for other peers.
+    let resp = client
+        .get(format!("{base}/v1/mesh/peers"))
+        .send()
+        .await
+        .expect("get peers");
+    let body = json_body(resp).await;
+    let peer = &body["peers"].as_array().expect("peers")[0];
+    assert_eq!(peer["listen_endpoint"].as_str(), Some("203.0.113.50:51820"));
+
+    // Heartbeat carrying wg_listen_port must succeed + echo observed_ip.
+    let resp = post_json(
+        &client,
+        &format!("{base}/v1/mesh/heartbeat"),
+        serde_json::json!({ "peer_id": peer_id, "wg_listen_port": 51820 }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let hb = json_body(resp).await;
+    assert_eq!(hb["observed_ip"].as_str(), Some("127.0.0.1"));
+    assert_eq!(hb["observed_endpoint"].as_str(), Some("203.0.113.50:51820"));
+}
+
+/// Back-compat: a register body WITHOUT the new `wg_listen_port` field (an
+/// older joiner) must still succeed and behave as before — the field is
+/// `#[serde(default)]`.
+#[tokio::test]
+async fn http_register_back_compat_without_wg_port() {
+    let (addr, _server) = spawn_server().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = post_json(
+        &client,
+        &format!("{base}/v1/mesh/register"),
+        // No wg_listen_port, no listen_endpoint — pre-NAT-traversal shape.
+        serde_json::json!({
+            "wg_public_key": pubkey(2),
+            "display_name": "legacy",
+            "tags": [],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "old-shape register must still work");
+    let body = json_body(resp).await;
+    assert!(body["peer_id"].as_str().is_some());
+    // No self-report, observed is loopback (private), no port → passive.
+    assert!(
+        body["observed_endpoint"].is_null() || body.get("observed_endpoint").is_none(),
+        "no endpoint derivable → passive: {body}"
+    );
+}
+
 #[tokio::test]
 async fn sse_stream_bootstraps_existing_peers() {
     let (addr, _server) = spawn_server().await;
