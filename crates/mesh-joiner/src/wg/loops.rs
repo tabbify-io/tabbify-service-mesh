@@ -290,7 +290,14 @@ async fn encapsulate_and_send(
     packet: &[u8],
 ) {
     let action: WgAction = {
-        let mut out = vec![0u8; packet.len() + 64];
+        // Size for the largest WireGuard message, NOT the input packet. When no
+        // session exists yet, encapsulate() emits a 148-byte handshake-init
+        // whose size is independent of `packet`. `packet.len() + 64` starved it
+        // for small packets (a 56-byte ping -> a 120-byte buffer < 148) ->
+        // DestinationBufferTooSmall -> the handshake never went out, so no
+        // session ever formed and all data-plane traffic hung. MAX_UDP_FRAME is
+        // the largest encapsulated frame we'd ever send.
+        let mut out = vec![0u8; MAX_UDP_FRAME];
         let mut tunn = session.tunn.lock().await;
         classify_tunn_result(tunn.encapsulate(packet, &mut out))
     };
