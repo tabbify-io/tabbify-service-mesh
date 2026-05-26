@@ -124,6 +124,16 @@ pub struct RegisterRequest {
     /// peers. `#[serde(default)]` for backward compatibility.
     #[serde(default)]
     pub app_uuid: Option<String>,
+    /// Explicit IPv6 ULA the peer wants to be assigned (e.g.
+    /// `"fd5a:1f02:aaaa::1"`). When present, well-formed, and unclaimed (or
+    /// claimed by THIS same peer — re-join / sticky identity), the
+    /// coordinator assigns it verbatim. When absent the coordinator falls
+    /// back to the standard idx-based derivation. A different peer holding
+    /// the same ULA causes the register to be rejected with
+    /// [`CoordinatorError::UlaConflict`].
+    /// `#[serde(default)]` keeps older joiners (which omit this field) working.
+    #[serde(default)]
+    pub requested_ula: Option<String>,
 }
 
 /// Body of `POST /v1/mesh/register` response.
@@ -220,6 +230,8 @@ fn coord_err_to_response(err: &CoordinatorError) -> Response {
         // A failed join-token validation (missing / invalid / revoked /
         // wrong-kind / validator unreachable) rejects the register.
         CoordinatorError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+        // A different peer already holds the requested ULA.
+        CoordinatorError::UlaConflict(_) => StatusCode::CONFLICT,
     };
     (
         status,

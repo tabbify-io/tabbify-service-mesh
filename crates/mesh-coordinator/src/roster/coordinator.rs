@@ -140,6 +140,11 @@ pub enum CoordinatorError {
     /// the status code).
     #[error("unauthorized join: {0}")]
     Unauthorized(String),
+    /// The `requested_ula` is already held by a DIFFERENT peer. The HTTP
+    /// layer maps this to `409 Conflict`. The string carries the conflicting
+    /// ULA so the coordinator log can surface it.
+    #[error("requested ULA already claimed by another peer: {0}")]
+    UlaConflict(String),
 }
 
 /// Outcome of `register`: whether the peer was new or already in the
@@ -362,10 +367,11 @@ impl Coordinator {
         // validated claims win when present (production), else the request
         // (escape hatch). See `crate::roster::identity::stamp_identity`.
         let identity = stamp_identity(&req, claims.as_ref());
-        // First-time path. Allocate the ULA from the node's network block
-        // *before* building the event so a failed allocation doesn't emit a
-        // half-formed PeerJoined.
-        let (peer_index, ula) = self.inner.allocator.allocate(&identity.network)?;
+        // First-time path. Resolve the ULA: honour `requested_ula` when it
+        // is present, well-formed, and unclaimed (or claimed by this same
+        // peer — prevented from reaching here by the re-registration guard
+        // above). Fall back to idx-based allocation otherwise.
+        let (peer_index, ula) = self.resolve_ula(&identity.network, req.requested_ula.as_deref())?;
         let peer_id = Uuid::now_v7();
         let now_micros = now_unix_micros();
         let event = PeerJoined {
@@ -774,6 +780,53 @@ impl Coordinator {
         info!(peer_id = %peer_id, "peer re-registered (idempotent)");
         Ok(entry)
     }
+
+    /// Resolve the ULA and peer-index for a first-time register.
+    ///
+    /// When `requested_ula` is `Some` and parses as a valid `Ipv6Addr`:
+    /// - If another peer in the roster already holds that ULA → `UlaConflict`.
+    /// - Otherwise → assign it verbatim. The allocator is bumped past the
+    ///   address's embedded index so future idx-based allocations in the same
+    ///   network block don't collide. The returned `peer_index` is derived
+    ///   from the address layout (`segments()[3]`), matching `apply_peer_joined`.
+    ///
+    /// When `requested_ula` is `None` or malformed → fall back to the
+    /// normal sequential idx-based allocation (malformed ULA silently falls
+    /// through to idx-based; the caller learns the assigned address from the
+    /// returned `PeerEntry`, not the request).
+    fn resolve_ula(
+        &self,
+        network: &str,
+        requested_ula: Option<&str>,
+    ) -> Result<(u16, std::net::Ipv6Addr), CoordinatorError> {
+        if let Some(raw) = requested_ula {
+            if let Ok(addr) = raw.parse::<std::net::Ipv6Addr>() {
+                // Uniqueness check: scan the roster for any peer already
+                // holding this exact ULA. The re-registration path (same
+                // wg_public_key) was already handled above — so if we find
+                // a match here it MUST be a different peer.
+                let already_claimed = self
+                    .inner
+                    .roster
+                    .iter()
+                    .any(|kv| kv.value().ula == addr);
+                if already_claimed {
+                    return Err(CoordinatorError::UlaConflict(raw.to_owned()));
+                }
+                // Honour the requested address. Derive the index from the
+                // address layout (`fd5a:1f00:<slot>:<idx>::1`) so the
+                // PeerEntry and the allocator stay consistent.
+                let peer_index = addr.segments()[3];
+                let slot = addr.segments()[2];
+                // Advance the allocator so subsequent idx-based allocations
+                // in this network block skip past the manually-assigned index.
+                self.inner.allocator.bump_slot_at_least(slot, peer_index);
+                return Ok((peer_index, addr));
+            }
+        }
+        // Fall back to the standard sequential idx-based allocation.
+        Ok(self.inner.allocator.allocate(network)?)
+    }
 }
 
 fn decode_pubkey(s: &str) -> Result<Vec<u8>, CoordinatorError> {
@@ -824,6 +877,7 @@ mod tests {
             kind: "peer".into(),
             parent: None,
             app_uuid: None,
+            requested_ula: None,
         }
     }
 
@@ -927,6 +981,7 @@ mod tests {
                 kind: "peer".into(),
                 parent: None,
                 app_uuid: None,
+                requested_ula: None,
             })
             .await
             .expect_err("invalid pubkey");
@@ -1253,6 +1308,7 @@ mod tests {
             kind: "peer".into(),
             parent: None,
             app_uuid: None,
+            requested_ula: None,
         };
         let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
         let (entry, _) = c
@@ -1327,6 +1383,7 @@ mod tests {
             kind: "peer".into(),
             parent: None,
             app_uuid: None,
+            requested_ula: None,
         };
         let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
         let (entry, _) = c
@@ -1615,6 +1672,106 @@ mod tests {
         assert!(snap[0].parent.is_none());
         assert!(snap[0].app_uuid.is_none());
     }
+
+    // -----------------------------------------------------------------
+    // Task 0.2 — requested_ula: peers can request a specific ULA instead
+    // of the idx-derived one. The coordinator honours it if it is
+    // well-formed AND unclaimed (or claimed by the SAME peer on re-join).
+    // A DIFFERENT peer trying to claim an already-held ULA is rejected.
+    // -----------------------------------------------------------------
+
+    fn req_with_requested_ula(seed: u8, name: &str, requested_ula: &str) -> RegisterRequest {
+        RegisterRequest {
+            requested_ula: Some(requested_ula.into()),
+            ..req(seed, name)
+        }
+    }
+
+    /// A peer that supplies a valid, unclaimed `requested_ula` receives
+    /// exactly that address — not an idx-derived one.
+    #[tokio::test]
+    async fn register_honours_requested_ula_when_unclaimed() {
+        let c = coordinator();
+        let want = "fd5a:1f02:aaaa::1";
+        let (entry, outcome) = c
+            .register(req_with_requested_ula(90, "runner-a", want))
+            .await
+            .expect("register");
+        assert_eq!(outcome, RegisterOutcome::Created);
+        assert_eq!(
+            entry.ula.to_string(),
+            want,
+            "assigned ULA must be exactly the requested one"
+        );
+        // The snapshot must also reflect it.
+        let snap = c.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].ula, want);
+    }
+
+    /// A second, DIFFERENT peer requesting the same ULA that a prior peer
+    /// already holds must be rejected with a clear conflict error.
+    #[tokio::test]
+    async fn register_rejects_requested_ula_claimed_by_different_peer() {
+        let c = coordinator();
+        let want = "fd5a:1f02:bbbb::1";
+        // Peer A claims it first.
+        c.register(req_with_requested_ula(91, "peer-a", want))
+            .await
+            .expect("peer-a register");
+        // Peer B (different pubkey / identity) tries the same ULA.
+        let err = c
+            .register(req_with_requested_ula(92, "peer-b", want))
+            .await
+            .expect_err("peer-b must be rejected");
+        assert!(
+            matches!(err, CoordinatorError::UlaConflict(_)),
+            "expected UlaConflict, got {err:?}"
+        );
+        // Only one peer in the roster.
+        assert_eq!(c.snapshot().len(), 1);
+    }
+
+    /// The SAME peer re-registering with its own previously-assigned ULA
+    /// (sticky identity on restart) must succeed — outcome Existed, same
+    /// peer_id, same ULA.
+    #[tokio::test]
+    async fn register_allows_same_peer_to_reclaim_its_own_ula() {
+        let c = coordinator();
+        let want = "fd5a:1f02:cccc::1";
+        let (first, o1) = c
+            .register(req_with_requested_ula(93, "runner-c", want))
+            .await
+            .expect("first register");
+        assert_eq!(o1, RegisterOutcome::Created);
+        assert_eq!(first.ula.to_string(), want);
+
+        // Same pubkey (seed 93) re-registers, requesting the same ULA.
+        let (second, o2) = c
+            .register(req_with_requested_ula(93, "runner-c-restart", want))
+            .await
+            .expect("re-register");
+        assert_eq!(o2, RegisterOutcome::Existed);
+        assert_eq!(first.peer_id, second.peer_id, "peer_id must be stable");
+        assert_eq!(
+            second.ula.to_string(),
+            want,
+            "re-registered peer keeps its ULA"
+        );
+    }
+
+    /// When no `requested_ula` is supplied, the coordinator falls back to
+    /// the original idx-based assignment (regression guard).
+    #[tokio::test]
+    async fn register_fallback_to_idx_when_no_requested_ula() {
+        let c = coordinator();
+        let (p1, _) = c.register(req(94, "plain-a")).await.expect("ok");
+        let (p2, _) = c.register(req(95, "plain-b")).await.expect("ok");
+        // Both get idx-derived addresses (sequential within the default network).
+        assert_ne!(p1.ula, p2.ula);
+        assert_eq!(p1.peer_index, 1);
+        assert_eq!(p2.peer_index, 2);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1657,6 +1814,7 @@ mod jwt_tests {
             kind: "peer".into(),
             parent: None,
             app_uuid: None,
+            requested_ula: None,
         }
     }
 

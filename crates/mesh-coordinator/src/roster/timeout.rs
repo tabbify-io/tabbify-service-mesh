@@ -85,6 +85,7 @@ mod tests {
                 kind: "peer".into(),
                 parent: None,
                 app_uuid: None,
+                requested_ula: None,
             })
             .await
             .expect("ok");
@@ -100,6 +101,7 @@ mod tests {
                 kind: "peer".into(),
                 parent: None,
                 app_uuid: None,
+                requested_ula: None,
             })
             .await
             .expect("ok");

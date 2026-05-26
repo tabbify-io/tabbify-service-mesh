@@ -216,6 +216,7 @@ mod tests {
             kind: "peer".into(),
             parent: None,
             app_uuid: None,
+            requested_ula: None,
         };
         let (entry, _) = coord.register(req).await.expect("register");
         assert_eq!(entry.peer_index, 8);
