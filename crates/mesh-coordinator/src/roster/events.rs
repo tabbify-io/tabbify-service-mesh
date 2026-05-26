@@ -48,6 +48,22 @@ pub struct PeerJoined {
     pub hosted_app_ulas: Vec<String>,
     /// Joined-at, wall-clock micros.
     pub joined_at_micros: i64,
+    /// Peer role: `"peer"` or `"runner"`. `#[serde(default)]` keeps
+    /// replay of older events back-compatible (defaults to `"peer"`).
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// ULA of the supervisor that owns this runner. `None` for plain peers.
+    /// `#[serde(default)]` keeps older events back-compatible.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// UUID of the app this runner serves. `None` for plain peers.
+    /// `#[serde(default)]` keeps older events back-compatible.
+    #[serde(default)]
+    pub app_uuid: Option<String>,
+}
+
+fn default_kind() -> String {
+    "peer".to_owned()
 }
 
 impl MeshEvent for PeerJoined {

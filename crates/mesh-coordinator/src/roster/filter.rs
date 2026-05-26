@@ -123,6 +123,9 @@ mod tests {
             network: network.into(),
             tags: tags.iter().map(|s| (*s).to_owned()).collect(),
             hosted_app_ulas: vec![],
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
         }
     }
 

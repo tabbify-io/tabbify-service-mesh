@@ -82,6 +82,9 @@ mod tests {
                 network: String::new(),
                 tags: vec![],
                 hosted_app_ulas: vec![],
+                kind: "peer".into(),
+                parent: None,
+                app_uuid: None,
             })
             .await
             .expect("ok");
@@ -94,6 +97,9 @@ mod tests {
                 network: String::new(),
                 tags: vec![],
                 hosted_app_ulas: vec![],
+                kind: "peer".into(),
+                parent: None,
+                app_uuid: None,
             })
             .await
             .expect("ok");

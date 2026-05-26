@@ -63,6 +63,9 @@ impl Coordinator {
             // means a replayed endpoint won't auto-roam until the next
             // live register).
             endpoint_is_reflexive: false,
+            kind: event.kind.clone(),
+            parent: event.parent.clone(),
+            app_uuid: event.app_uuid.clone(),
         };
         self.inner.roster.insert(peer_id, entry.clone());
         self.inner
@@ -137,6 +140,9 @@ mod tests {
             tags: vec!["t1".into()],
             hosted_app_ulas: vec![],
             joined_at_micros: 1,
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
         };
         let entry = coord.apply_peer_joined(&joined).expect("apply joined");
         assert_eq!(entry.peer_index, 5);
@@ -190,6 +196,9 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             joined_at_micros: 1,
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
         };
         coord.apply_peer_joined(&joined).expect("apply");
         // Next live register in net7 should land on index 8.
@@ -204,6 +213,9 @@ mod tests {
             network: "net7".into(),
             tags: vec![],
             hosted_app_ulas: vec![],
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
         };
         let (entry, _) = coord.register(req).await.expect("register");
         assert_eq!(entry.peer_index, 8);
@@ -222,6 +234,9 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             joined_at_micros: 1,
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
         };
         let err = coord.apply_peer_joined(&bad).expect_err("bad uuid");
         assert!(matches!(

@@ -56,6 +56,24 @@ pub struct PeerInfo {
     pub hosted_app_ulas: Vec<String>,
     /// Joined-at wall-clock micros.
     pub joined_at_micros: i64,
+    /// Peer role. `"peer"` for a normal supervisor/joiner; `"runner"` for
+    /// a per-app runner process that joins as its own mesh peer.
+    /// Defaults to `"peer"` for backward compatibility — existing joiners
+    /// that omit this field are treated as plain peers.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// ULA of the supervisor that owns this runner. `None` for a plain
+    /// peer. Set by runner peers so `tabbify-node` can build the
+    /// supervisor → runners topology tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// UUID of the app this runner serves. `None` for a plain peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_uuid: Option<String>,
+}
+
+fn default_kind() -> String {
+    "peer".to_owned()
 }
 
 /// Body of `POST /v1/mesh/register`.
@@ -93,6 +111,19 @@ pub struct RegisterRequest {
     /// `#[serde(default)]` keeps older joiners (which omit it) working.
     #[serde(default)]
     pub hosted_app_ulas: Vec<String>,
+    /// Peer role. `"peer"` (default) for a normal joiner/supervisor;
+    /// `"runner"` for a per-app runner. `#[serde(default)]` keeps
+    /// existing joiners that omit it working — they default to `"peer"`.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// ULA of the supervisor that owns this runner. Omitted (→ `None`)
+    /// for plain peers. `#[serde(default)]` for backward compatibility.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// UUID of the app this runner serves. Omitted (→ `None`) for plain
+    /// peers. `#[serde(default)]` for backward compatibility.
+    #[serde(default)]
+    pub app_uuid: Option<String>,
 }
 
 /// Body of `POST /v1/mesh/register` response.

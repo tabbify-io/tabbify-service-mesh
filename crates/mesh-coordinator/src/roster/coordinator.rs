@@ -79,6 +79,14 @@ pub struct PeerEntry {
     /// by a heartbeat's observed source. Both land in `listen_endpoint` as
     /// opaque strings, so we can't tell them apart without this flag.
     pub endpoint_is_reflexive: bool,
+    /// Peer role. `"peer"` for a normal supervisor/joiner; `"runner"` for
+    /// a per-app runner that joins the mesh as its own peer. Defaults to
+    /// `"peer"` for existing joiners that do not supply the field.
+    pub kind: String,
+    /// ULA of the supervisor that owns this runner. `None` for plain peers.
+    pub parent: Option<String>,
+    /// UUID of the app this runner serves. `None` for plain peers.
+    pub app_uuid: Option<String>,
 }
 
 impl PeerEntry {
@@ -100,6 +108,9 @@ impl PeerEntry {
             tags: self.tags.clone(),
             hosted_app_ulas: self.hosted_app_ulas.clone(),
             joined_at_micros: self.joined_at_micros,
+            kind: self.kind.clone(),
+            parent: self.parent.clone(),
+            app_uuid: self.app_uuid.clone(),
         }
     }
 }
@@ -372,6 +383,9 @@ impl Coordinator {
             // the peer's own ULA (per-app-ULA routing).
             hosted_app_ulas: req.hosted_app_ulas.clone(),
             joined_at_micros: now_micros,
+            kind: req.kind.clone(),
+            parent: req.parent.clone(),
+            app_uuid: req.app_uuid.clone(),
         };
         // Publish first so the sink sees the event before in-memory state
         // changes; then apply the event to in-memory state from the same
@@ -746,6 +760,11 @@ impl Coordinator {
             // so a re-register reflects the supervisor's current hosting
             // state, mirroring the heartbeat replace semantics.
             e.hosted_app_ulas.clone_from(&req.hosted_app_ulas);
+            // Refresh peer metadata — a re-register can update kind/parent/
+            // app_uuid if the runner restarts with a different role.
+            e.kind.clone_from(&req.kind);
+            e.parent.clone_from(&req.parent);
+            e.app_uuid.clone_from(&req.app_uuid);
             e.last_heartbeat = Instant::now();
             if let Some(obs) = observed {
                 e.observed_external = obs.to_string();
@@ -802,6 +821,9 @@ mod tests {
             network: String::new(),
             tags: vec!["dev-machine".into()],
             hosted_app_ulas: vec![],
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
         }
     }
 
@@ -902,6 +924,9 @@ mod tests {
                 network: String::new(),
                 tags: vec![],
                 hosted_app_ulas: vec![],
+                kind: "peer".into(),
+                parent: None,
+                app_uuid: None,
             })
             .await
             .expect_err("invalid pubkey");
@@ -1225,6 +1250,9 @@ mod tests {
             network: String::new(),
             tags: vec!["dev-machine".into()],
             hosted_app_ulas: vec![],
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
         };
         let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
         let (entry, _) = c
@@ -1296,6 +1324,9 @@ mod tests {
             network: String::new(),
             tags: vec![],
             hosted_app_ulas: vec![],
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
         };
         let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
         let (entry, _) = c
@@ -1525,6 +1556,65 @@ mod tests {
         let (entry, _) = c.register(req(5, "legacy")).await.expect("register");
         assert!(entry.hosted_app_ulas.is_empty());
     }
+
+    // -----------------------------------------------------------------
+    // Per-app-runner peer metadata (kind / parent / app_uuid).
+    //
+    // A runner peer joins with kind="runner", parent=<supervisor ULA>,
+    // app_uuid=<uuid>. A plain supervisor peer joins without those fields
+    // and gets the defaults. Both round-trip through the roster snapshot
+    // (GET /v1/mesh/peers → PeerInfo). This is Task 0.1 of the per-app-
+    // runner architecture refactor.
+    // -----------------------------------------------------------------
+
+    fn req_runner(seed: u8, name: &str, parent: &str, app_uuid: &str) -> RegisterRequest {
+        RegisterRequest {
+            kind: "runner".into(),
+            parent: Some(parent.into()),
+            app_uuid: Some(app_uuid.into()),
+            ..req(seed, name)
+        }
+    }
+
+    /// A peer registered with kind="runner", parent, and app_uuid must
+    /// appear in the roster snapshot with those exact values.
+    #[tokio::test]
+    async fn runner_peer_metadata_round_trips_through_roster() {
+        let c = coordinator();
+        let parent_ula = "fd5a:1f00:0:1::1";
+        let app_id = "01910f10-0000-7000-8000-000000000001";
+        let (entry, outcome) = c
+            .register(req_runner(80, "runner-1", parent_ula, app_id))
+            .await
+            .expect("register");
+        assert_eq!(outcome, RegisterOutcome::Created);
+        // PeerEntry carries the fields.
+        assert_eq!(entry.kind, "runner");
+        assert_eq!(entry.parent.as_deref(), Some(parent_ula));
+        assert_eq!(entry.app_uuid.as_deref(), Some(app_id));
+        // PeerInfo (the wire/roster snapshot) must carry them too.
+        let snap = c.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].kind, "runner");
+        assert_eq!(snap[0].parent.as_deref(), Some(parent_ula));
+        assert_eq!(snap[0].app_uuid.as_deref(), Some(app_id));
+    }
+
+    /// A plain peer (no kind/parent/app_uuid in request) defaults to
+    /// kind="peer" and absent parent/app_uuid in the roster.
+    #[tokio::test]
+    async fn plain_peer_defaults_to_kind_peer_with_no_parent_or_app_uuid() {
+        let c = coordinator();
+        let (entry, _) = c.register(req(81, "plain")).await.expect("register");
+        assert_eq!(entry.kind, "peer");
+        assert!(entry.parent.is_none());
+        assert!(entry.app_uuid.is_none());
+        // Wire snapshot agrees.
+        let snap = c.snapshot();
+        assert_eq!(snap[0].kind, "peer");
+        assert!(snap[0].parent.is_none());
+        assert!(snap[0].app_uuid.is_none());
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1564,6 +1654,9 @@ mod jwt_tests {
             network: network.into(),
             tags: tags.iter().map(|s| (*s).to_owned()).collect(),
             hosted_app_ulas: vec![],
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
         }
     }
 
