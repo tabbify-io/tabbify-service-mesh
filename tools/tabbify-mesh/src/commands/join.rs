@@ -56,6 +56,10 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         tls_key,
         tls_ca,
         insecure_no_mtls,
+        // Runner-specific fields are not exposed via CLI — plain join is
+        // always a plain peer. Per-app-runner processes set these
+        // programmatically via JoinConfig directly.
+        ..JoinConfig::default()
     };
 
     let joiner = Joiner::join(config)

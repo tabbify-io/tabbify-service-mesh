@@ -82,6 +82,25 @@ pub struct JoinConfig {
     /// and the joiner talks plain HTTP — must match the coordinator's
     /// `--insecure-no-mtls`, otherwise the handshake fails.
     pub insecure_no_mtls: bool,
+    /// Explicit IPv6 ULA to request from the coordinator (Task 0.2
+    /// per-app-runner architecture). When `Some`, the coordinator attempts
+    /// to honor it; on conflict it returns 409. `None` (default) = let
+    /// the coordinator derive the ULA from the peer index. Used by runner
+    /// peers that pre-derive their ULA as `derive_app_ula(uuid)` so the
+    /// address is known before joining.
+    pub requested_ula: Option<String>,
+    /// Peer role for the coordinator roster. `Some("runner")` for a
+    /// per-app runner; `None` (default) = plain supervisor / joiner peer.
+    /// Omitted from the wire when `None` for backward compat with
+    /// coordinators that predate Task 0.1.
+    pub kind: Option<String>,
+    /// ULA of the supervisor that owns this runner. `None` (default) for
+    /// plain peers. Set by runner peers so `tabbify-node` can build the
+    /// supervisor → runners topology tree. Omitted from the wire when `None`.
+    pub parent: Option<String>,
+    /// UUID of the app this runner serves. `None` (default) for plain
+    /// peers. Omitted from the wire when `None`.
+    pub app_uuid: Option<String>,
 }
 
 impl Default for JoinConfig {
@@ -104,6 +123,10 @@ impl Default for JoinConfig {
             // both speak plaintext. CLI / operator opt in by clearing
             // this flag and supplying the three cert paths.
             insecure_no_mtls: true,
+            requested_ula: None,
+            kind: None,
+            parent: None,
+            app_uuid: None,
         }
     }
 }
@@ -142,6 +165,10 @@ mod tests {
             tls_key: Some(PathBuf::from("/tmp/key.pem")),
             tls_ca: Some(PathBuf::from("/tmp/ca.pem")),
             insecure_no_mtls: false,
+            requested_ula: Some("fd5a:1f02:aabb::1".into()),
+            kind: Some("runner".into()),
+            parent: Some("fd5a:1f00:1::1".into()),
+            app_uuid: Some("01910f10-0000-7000-8000-000000000099".into()),
         };
         let cloned = cfg.clone();
         assert_eq!(cloned.coordinator_url, cfg.coordinator_url);
@@ -154,5 +181,9 @@ mod tests {
         assert_eq!(cloned.tls_key, cfg.tls_key);
         assert_eq!(cloned.tls_ca, cfg.tls_ca);
         assert_eq!(cloned.insecure_no_mtls, cfg.insecure_no_mtls);
+        assert_eq!(cloned.requested_ula, cfg.requested_ula);
+        assert_eq!(cloned.kind, cfg.kind);
+        assert_eq!(cloned.parent, cfg.parent);
+        assert_eq!(cloned.app_uuid, cfg.app_uuid);
     }
 }

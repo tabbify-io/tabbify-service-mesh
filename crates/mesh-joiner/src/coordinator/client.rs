@@ -54,6 +54,26 @@ pub struct RegisterRequest {
     /// body (per-app-ULA routing).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosted_app_ulas: Vec<String>,
+    /// Explicit IPv6 ULA the peer wants to be assigned (e.g.
+    /// `"fd5a:1f02:aabb::1"`). When `Some`, the coordinator attempts to
+    /// honor it; when `None` (default) the coordinator derives the ULA
+    /// from the peer index. Omitted from the wire when `None` for back-compat
+    /// with coordinators that predate Task 0.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_ula: Option<String>,
+    /// Peer role. `Some("runner")` for a per-app runner; `None` (default)
+    /// for a plain supervisor/joiner — omitted from the wire so older
+    /// coordinators are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// ULA of the supervisor that owns this runner. `None` for plain peers.
+    /// Omitted from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// UUID of the app this runner serves. `None` for plain peers.
+    /// Omitted from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_uuid: Option<String>,
 }
 
 /// Body of `POST /v1/mesh/register`'s response.
@@ -224,6 +244,12 @@ impl CoordinatorClient {
     /// auth header is sent and the coordinator trusts `tags` verbatim. The
     /// `tags` we send are advisory either way — a validating coordinator
     /// ignores them in favor of the claims.
+    ///
+    /// `requested_ula` — explicit IPv6 ULA to request from the coordinator
+    /// (Task 0.2). `None` = coordinator-derived. `kind` / `parent` /
+    /// `app_uuid` — runner peer metadata (Task 0.1/0.3). All `None` for
+    /// plain peers — omitted from the wire for backward compat.
+    #[allow(clippy::too_many_arguments)]
     pub async fn register(
         &self,
         wg_public_key: &[u8; 32],
@@ -232,6 +258,10 @@ impl CoordinatorClient {
         display_name: &str,
         tags: &[String],
         join_token: Option<&str>,
+        requested_ula: Option<String>,
+        kind: Option<String>,
+        parent: Option<String>,
+        app_uuid: Option<String>,
     ) -> Result<RegisterResponse> {
         let body = RegisterRequest {
             wg_public_key: B64.encode(wg_public_key),
@@ -244,6 +274,10 @@ impl CoordinatorClient {
             // heartbeat (per-app-ULA routing). The field exists on the wire
             // for forward-compat + symmetry with heartbeat.
             hosted_app_ulas: Vec::new(),
+            requested_ula,
+            kind,
+            parent,
+            app_uuid,
         };
         let url = format!("{}/v1/mesh/register", self.base_url);
         let mut builder = self.http.post(&url).json(&body);
@@ -701,6 +735,10 @@ mod tests {
                 "alice",
                 &["dev-machine".to_owned()],
                 None,
+                None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -742,6 +780,10 @@ mod tests {
                 "alice",
                 &[],
                 Some("my-join-jwt"),
+                None,
+                None,
+                None,
+                None,
             )
             .await
             .expect("register with bearer should succeed");
@@ -788,6 +830,10 @@ mod tests {
             display_name: "alice".into(),
             tags: vec![],
             hosted_app_ulas: vec![],
+            requested_ula: None,
+            kind: None,
+            parent: None,
+            app_uuid: None,
         })
         .unwrap();
         assert!(
@@ -797,7 +843,7 @@ mod tests {
         assert_eq!(body["wg_listen_port"], 51820);
 
         client
-            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None)
+            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None, None, None, None, None)
             .await
             .expect("register should succeed and match the wg_listen_port body");
     }
@@ -826,7 +872,7 @@ mod tests {
             .await;
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         let resp = client
-            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None)
+            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None, None, None, None, None)
             .await
             .expect("register");
         assert_eq!(resp.observed_ip.as_deref(), Some("203.0.113.7"));
@@ -854,7 +900,7 @@ mod tests {
             .await;
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         let resp = client
-            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None)
+            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None, None, None, None, None)
             .await
             .expect("register");
         assert!(resp.observed_ip.is_none());
@@ -899,7 +945,7 @@ mod tests {
 
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         client
-            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None)
+            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None, None, None, None, None)
             .await
             .expect("tokenless register should succeed");
         // The `.expect(0)` on the header-requiring mock is verified on
@@ -1028,10 +1074,101 @@ mod tests {
             .await;
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         let err = client
-            .register(&[0u8; 32], None, Some(51820), "x", &[], None)
+            .register(&[0u8; 32], None, Some(51820), "x", &[], None, None, None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, JoinerError::JsonCodec(_)), "{err:?}");
+    }
+
+    /// When `requested_ula`, `kind`, `parent`, and `app_uuid` are set on the
+    /// register request, they must all appear in the JSON body sent to the
+    /// coordinator, and the coordinator-returned ULA (which mirrors the
+    /// requested one when honored) must be returned in the response.
+    #[tokio::test]
+    async fn register_sends_requested_ula_and_peer_metadata() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        let app_uuid_str = "01910f10-0000-7000-8000-000000000099";
+        let sup_ula = "fd5a:1f00:1::1";
+        let runner_ula = "fd5a:1f02:aabb::1";
+        let response_body = serde_json::json!({
+            "peer_id": "01910f10-0000-7000-8000-000000000002",
+            // Coordinator honors the requested ULA and echoes it back.
+            "ula": runner_ula,
+            "peers": []
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .and(body_partial_json(serde_json::json!({
+                "requested_ula": runner_ula,
+                "kind": "runner",
+                "parent": sup_ula,
+                "app_uuid": app_uuid_str,
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(response_body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        let resp = client
+            .register(
+                &[0xAAu8; 32],
+                None,
+                Some(51820),
+                "runner-abc",
+                &[],
+                None,
+                Some(runner_ula.to_owned()),
+                Some("runner".to_owned()),
+                Some(sup_ula.to_owned()),
+                Some(app_uuid_str.to_owned()),
+            )
+            .await
+            .expect("register with requested_ula + metadata should succeed");
+        // The coordinator echoed back the requested ULA.
+        assert_eq!(resp.ula, runner_ula);
+    }
+
+    /// Backward compat: existing callers that pass `None` for all four new
+    /// fields must NOT have `requested_ula` / `kind` / `parent` /
+    /// `app_uuid` in the body (omitted by `skip_serializing_if`). This
+    /// keeps the wire format unchanged for plain peer joiners.
+    #[test]
+    fn register_request_omits_optional_runner_fields_when_none() {
+        let body = serde_json::to_value(RegisterRequest {
+            wg_public_key: B64.encode([0xAAu8; 32]),
+            listen_endpoint: None,
+            wg_listen_port: Some(51820),
+            display_name: "alice".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            requested_ula: None,
+            kind: None,
+            parent: None,
+            app_uuid: None,
+        })
+        .unwrap();
+        assert!(
+            body.get("requested_ula").is_none(),
+            "requested_ula must be omitted when None: {body}"
+        );
+        assert!(
+            body.get("kind").is_none(),
+            "kind must be omitted when None: {body}"
+        );
+        assert!(
+            body.get("parent").is_none(),
+            "parent must be omitted when None: {body}"
+        );
+        assert!(
+            body.get("app_uuid").is_none(),
+            "app_uuid must be omitted when None: {body}"
+        );
     }
 
     #[test]

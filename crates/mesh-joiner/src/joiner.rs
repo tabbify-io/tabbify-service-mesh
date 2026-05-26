@@ -166,6 +166,10 @@ impl Joiner {
                 &config.display_name,
                 &config.tags,
                 config.join_token.as_deref(),
+                config.requested_ula.clone(),
+                config.kind.clone(),
+                config.parent.clone(),
+                config.app_uuid.clone(),
             )
             .await?;
         let peer_id = resp.peer_id;
