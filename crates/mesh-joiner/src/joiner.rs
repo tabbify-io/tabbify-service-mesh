@@ -19,6 +19,7 @@ use crate::nat::holepunch;
 use crate::peer::PeerInfo;
 use crate::platform;
 use crate::wg::loops::{timer_loop, tun_read_loop, udp_recv_loop};
+use crate::wg::persistent_identity;
 use crate::wg::session::{PeerSession, SessionTable};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -93,18 +94,51 @@ impl Joiner {
     /// HTTP, TUN setup, UDP bind, and sudo all share this path. The
     /// underlying error is a [`JoinerError`] variant in every case.
     pub async fn join(config: JoinConfig) -> anyhow::Result<Self> {
-        let kp_path = config
-            .keypair_path
-            .clone()
-            .unwrap_or_else(default_keypair_path);
-        let keypair = crate::wg::persistent_keypair::load_or_generate(&kp_path)
-            .map_err(|e| anyhow::anyhow!("load keypair {}: {}", kp_path.display(), e))?;
-        tracing::info!(
-            display_name = %config.display_name,
-            tags = ?config.tags,
-            keypair_path = %kp_path.display(),
-            "joiner: starting registration"
-        );
+        // ── Keypair + optional sticky identity ────────────────────────────
+        // When `identity_path` is set we use the richer identity file
+        // (keypair + ULA). When absent we fall back to the legacy
+        // keypair-only path. Both paths are backward-compatible.
+        let (keypair, sticky_ula) = if let Some(id_path) = config.identity_path.as_ref() {
+            let (kp, sticky) = persistent_identity::load_or_fresh(id_path)
+                .map_err(|e| anyhow::anyhow!("load identity {}: {}", id_path.display(), e))?;
+            if let Some(ula) = sticky {
+                tracing::info!(
+                    display_name = %config.display_name,
+                    identity_path = %id_path.display(),
+                    %ula,
+                    "joiner: loaded persisted identity (will re-request sticky ULA)"
+                );
+            } else {
+                tracing::info!(
+                    display_name = %config.display_name,
+                    identity_path = %id_path.display(),
+                    "joiner: no prior identity file, joining fresh (will persist after registration)"
+                );
+            }
+            (kp, sticky)
+        } else {
+            let kp_path = config
+                .keypair_path
+                .clone()
+                .unwrap_or_else(default_keypair_path);
+            let kp = crate::wg::persistent_keypair::load_or_generate(&kp_path)
+                .map_err(|e| anyhow::anyhow!("load keypair {}: {}", kp_path.display(), e))?;
+            tracing::info!(
+                display_name = %config.display_name,
+                tags = ?config.tags,
+                keypair_path = %kp_path.display(),
+                "joiner: starting registration"
+            );
+            (kp, None)
+        };
+
+        // Merge sticky ULA into `requested_ula`: if a sticky ULA was loaded
+        // from the identity file it takes precedence (this is the re-request
+        // path). An explicit `config.requested_ula` is honored only when no
+        // identity file was loaded.
+        let effective_requested_ula = sticky_ula
+            .map(|u| u.to_string())
+            .or_else(|| config.requested_ula.clone());
 
         // 1) Open the UDP socket. We bind to v4 wildcard because the
         //    overlay rides on top of v4 transport, exactly like the
@@ -166,7 +200,7 @@ impl Joiner {
                 &config.display_name,
                 &config.tags,
                 config.join_token.as_deref(),
-                config.requested_ula.clone(),
+                effective_requested_ula,
                 config.kind.clone(),
                 config.parent.clone(),
                 config.app_uuid.clone(),
@@ -184,6 +218,24 @@ impl Joiner {
             observed_endpoint = ?resp.observed_endpoint,
             "joiner: registered (reflexive endpoint from coordinator)"
         );
+
+        // ── Persist identity after a fresh join ───────────────────────────
+        // Only persist when an identity_path was configured AND we didn't
+        // already have a loaded identity (sticky_ula was None → fresh join).
+        // On a restart with an existing file we would have loaded it above
+        // (sticky_ula was Some), so there is nothing new to write.
+        if let Some(id_path) = config.identity_path.as_ref() {
+            if sticky_ula.is_none() {
+                persistent_identity::store(id_path, &keypair, my_ula).map_err(|e| {
+                    anyhow::anyhow!("persist identity {}: {}", id_path.display(), e)
+                })?;
+                tracing::info!(
+                    identity_path = %id_path.display(),
+                    %my_ula,
+                    "joiner: persisted identity (keypair + ULA)"
+                );
+            }
+        }
 
         // 3) Open + configure the TUN device. The fabric crate already
         //    has a polished cross-platform open() that returns

@@ -101,6 +101,17 @@ pub struct JoinConfig {
     /// UUID of the app this runner serves. `None` (default) for plain
     /// peers. Omitted from the wire when `None`.
     pub app_uuid: Option<String>,
+    /// Path to the persistent identity file `{private_key, ula}` (Task 0.4).
+    /// When `Some` and the file exists, the joiner reuses the persisted
+    /// keypair and re-requests the same ULA (`requested_ula` is set
+    /// automatically — do not set both). When the file is absent the joiner
+    /// joins fresh, then persists `{keypair, assigned_ula}` to this path.
+    /// `None` (default) — no identity persistence, each restart gets a fresh
+    /// identity; backward-compatible with all existing callers. Runners that
+    /// derive their ULA deterministically from `app_uuid` (via
+    /// `derive_app_ula`) should leave this `None` and set `requested_ula`
+    /// directly instead.
+    pub identity_path: Option<PathBuf>,
 }
 
 impl Default for JoinConfig {
@@ -127,6 +138,7 @@ impl Default for JoinConfig {
             kind: None,
             parent: None,
             app_uuid: None,
+            identity_path: None,
         }
     }
 }
@@ -169,6 +181,7 @@ mod tests {
             kind: Some("runner".into()),
             parent: Some("fd5a:1f00:1::1".into()),
             app_uuid: Some("01910f10-0000-7000-8000-000000000099".into()),
+            identity_path: Some(PathBuf::from("/tmp/id.json")),
         };
         let cloned = cfg.clone();
         assert_eq!(cloned.coordinator_url, cfg.coordinator_url);
@@ -185,5 +198,6 @@ mod tests {
         assert_eq!(cloned.kind, cfg.kind);
         assert_eq!(cloned.parent, cfg.parent);
         assert_eq!(cloned.app_uuid, cfg.app_uuid);
+        assert_eq!(cloned.identity_path, cfg.identity_path);
     }
 }
