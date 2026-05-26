@@ -1,4 +1,4 @@
-//! Persistent peer identity: WireGuard keypair + assigned ULA in a single
+//! Persistent peer identity: `WireGuard` keypair + assigned ULA in a single
 //! JSON file.
 //!
 //! This module extends the keypair-persistence story from
@@ -46,7 +46,7 @@ struct IdentityFile {
     ula: String,
 }
 
-/// A loaded peer identity: the WireGuard keypair and the sticky ULA.
+/// A loaded peer identity: the `WireGuard` keypair and the sticky ULA.
 #[derive(Debug, Clone)]
 pub struct PeerIdentity {
     /// The X25519 keypair loaded from the identity file.
@@ -233,7 +233,7 @@ mod tests {
     }
 
     /// Simulates a peer restart: two calls to `load_or_fresh` with the same
-    /// path and a `store` in between (as Joiner::join would do after the
+    /// path and a `store` in between (as `Joiner::join` would do after the
     /// first registration) return the SAME keypair bytes and ULA.
     ///
     /// This is the core property: a long-lived supervisor keeps its mesh

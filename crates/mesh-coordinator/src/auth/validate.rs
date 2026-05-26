@@ -296,7 +296,10 @@ mod tests {
 
         let validator = AuthValidator::new(server.uri()).unwrap();
         let err = validator.validate("user-token").await.unwrap_err();
-        assert!(matches!(err, ValidationError::WrongKind(ref k) if k == "auth"), "{err:?}");
+        assert!(
+            matches!(err, ValidationError::WrongKind(ref k) if k == "auth"),
+            "{err:?}"
+        );
     }
 
     /// Transport failure (nothing listening) is a `Transport` error.

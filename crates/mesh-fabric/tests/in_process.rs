@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, unsafe_code)]
 
 use std::net::Ipv6Addr;
-use tabbify_mesh_fabric::{in_process::InProcessFabric, FabricError, MeshFabric, Ula, UlaPrefix};
+use tabbify_mesh_fabric::{FabricError, MeshFabric, Ula, UlaPrefix, in_process::InProcessFabric};
 
 #[tokio::test]
 async fn register_send_recv_roundtrip() {
@@ -9,14 +9,23 @@ async fn register_send_recv_roundtrip() {
     let ula_a: Ipv6Addr = "fd5a:1f00:0001:0000:0000:0000:0000:0001".parse().unwrap();
     let ula_b: Ipv6Addr = "fd5a:1f00:0001:0000:0000:0000:0000:0002".parse().unwrap();
 
-    let mut a_rx = fabric.register_local(ula_a, "endpoint-a".into()).await.unwrap();
-    let mut b_rx = fabric.register_local(ula_b, "endpoint-b".into()).await.unwrap();
+    let mut a_rx = fabric
+        .register_local(ula_a, "endpoint-a".into())
+        .await
+        .unwrap();
+    let mut b_rx = fabric
+        .register_local(ula_b, "endpoint-b".into())
+        .await
+        .unwrap();
 
     fabric.send(ula_b, b"hello from a".to_vec()).await.unwrap();
     fabric.send(ula_a, b"hello from b".to_vec()).await.unwrap();
 
     let (dst, msg) = b_rx.recv().await.unwrap();
-    assert_eq!(dst, ula_b, "messages addressed to ula_b arrive on b_rx with dst=ula_b");
+    assert_eq!(
+        dst, ula_b,
+        "messages addressed to ula_b arrive on b_rx with dst=ula_b"
+    );
     assert_eq!(msg, b"hello from a");
 
     let (dst, msg) = a_rx.recv().await.unwrap();
@@ -54,9 +63,20 @@ async fn routing_snapshot_lists_local_endpoints() {
 
     let snap = fabric.routing_snapshot();
     assert_eq!(snap.local_endpoints.len(), 2);
-    assert!(snap.local_endpoints.iter().any(|(addr, id)| *addr == ula1 && id == "ep-1"));
-    assert!(snap.local_endpoints.iter().any(|(addr, id)| *addr == ula2 && id == "ep-2"));
-    assert!(snap.remote_routes.is_empty(), "InProcessFabric never has remote routes");
+    assert!(
+        snap.local_endpoints
+            .iter()
+            .any(|(addr, id)| *addr == ula1 && id == "ep-1")
+    );
+    assert!(
+        snap.local_endpoints
+            .iter()
+            .any(|(addr, id)| *addr == ula2 && id == "ep-2")
+    );
+    assert!(
+        snap.remote_routes.is_empty(),
+        "InProcessFabric never has remote routes"
+    );
 }
 
 #[test]
@@ -67,7 +87,11 @@ fn ula_from_uuid_components_is_deterministic() {
     let b = Ula::from_components(&prefix, app_uuid, 1);
     assert_eq!(a.address(), b.address(), "deterministic for same inputs");
     let c = Ula::from_components(&prefix, app_uuid, 2);
-    assert_ne!(a.address(), c.address(), "different instance => different addr");
+    assert_ne!(
+        a.address(),
+        c.address(),
+        "different instance => different addr"
+    );
 }
 
 #[test]
@@ -117,7 +141,10 @@ fn ula_address_distinguishes_uuids_differing_only_in_byte_4_to_7() {
     let segs_b = ula_b.address().segments();
     assert_eq!(segs_a[3], segs_b[3], "byte 0..1 still identical");
     assert_eq!(segs_a[4], segs_b[4], "byte 2..3 still identical");
-    assert_ne!(segs_a[5], segs_b[5], "byte 4..5 diverges (this is the upgrade payoff)");
+    assert_ne!(
+        segs_a[5], segs_b[5],
+        "byte 4..5 diverges (this is the upgrade payoff)"
+    );
 }
 
 #[test]

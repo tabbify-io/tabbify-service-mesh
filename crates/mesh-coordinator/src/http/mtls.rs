@@ -114,8 +114,7 @@ mod tests {
     #[test]
     fn build_server_config_accepts_valid_certs() {
         let dir = tempfile::TempDir::new().unwrap();
-        let cert =
-            rcgen::generate_simple_self_signed(vec!["mesh-ca".to_string()]).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["mesh-ca".to_string()]).unwrap();
         let cert_pem = cert.cert.pem();
         let key_pem = cert.key_pair.serialize_pem();
 

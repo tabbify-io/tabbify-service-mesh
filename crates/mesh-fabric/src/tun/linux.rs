@@ -76,8 +76,8 @@ use std::net::Ipv6Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::Command;
 use std::sync::Arc;
-use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 use super::{TunDevice, TunError, TunOptions};
 
@@ -447,9 +447,8 @@ impl TunDevice for LinuxTunDevice {
                 // buffer is borrowed for the duration of the
                 // syscall; the fd is non-blocking so this either
                 // completes or returns EAGAIN immediately.
-                let rc = unsafe {
-                    libc::write(raw_fd, buf.as_ptr().cast::<libc::c_void>(), buf.len())
-                };
+                let rc =
+                    unsafe { libc::write(raw_fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
                 if rc < 0 {
                     Err(io::Error::last_os_error())
                 } else {

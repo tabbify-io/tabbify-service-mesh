@@ -3,18 +3,15 @@
 use std::net::Ipv6Addr;
 use std::time::Duration;
 use tabbify_mesh_fabric::{
-    loopback::{LoopbackFabric, LoopbackPeerSpec},
     FabricError, MeshFabric,
+    loopback::{LoopbackFabric, LoopbackPeerSpec},
 };
 use tokio::time::timeout;
 
 async fn fresh_fabric(port: u16, node_id: &str) -> LoopbackFabric {
-    LoopbackFabric::bind(
-        format!("127.0.0.1:{port}").parse().unwrap(),
-        node_id.into(),
-    )
-    .await
-    .unwrap()
+    LoopbackFabric::bind(format!("127.0.0.1:{port}").parse().unwrap(), node_id.into())
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -54,7 +51,10 @@ async fn cross_node_delivery_via_tcp() {
     let mut rx_b = beta.register_local(ula_b, "ep-b".into()).await.unwrap();
 
     alpha.add_remote_route(ula_b, "beta".into());
-    alpha.send(ula_b, b"hello from alpha".to_vec()).await.unwrap();
+    alpha
+        .send(ula_b, b"hello from alpha".to_vec())
+        .await
+        .unwrap();
 
     let (dst, msg) = timeout(Duration::from_secs(2), rx_b.recv())
         .await
@@ -131,14 +131,16 @@ async fn routing_snapshot_includes_remote_routes() {
     alpha.add_remote_route(ula_remote, "beta".into());
 
     let snap = alpha.routing_snapshot();
-    assert!(snap
-        .local_endpoints
-        .iter()
-        .any(|(addr, id)| *addr == ula_local && id == "ep-local"));
-    assert!(snap
-        .remote_routes
-        .iter()
-        .any(|(addr, node)| *addr == ula_remote && node == "beta"));
+    assert!(
+        snap.local_endpoints
+            .iter()
+            .any(|(addr, id)| *addr == ula_local && id == "ep-local")
+    );
+    assert!(
+        snap.remote_routes
+            .iter()
+            .any(|(addr, node)| *addr == ula_remote && node == "beta")
+    );
 }
 
 #[tokio::test]

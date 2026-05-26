@@ -35,19 +35,27 @@ fn shared_service_policy() -> Policy {
     ])
 }
 
-async fn spawn(policy: Policy, admin_token: Option<String>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn spawn(
+    policy: Policy,
+    admin_token: Option<String>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let coord = Coordinator::with_policy(
         Arc::new(NoopPublisher),
         Duration::from_secs(60),
         PolicyStore::new(policy),
     );
     let router = build_router_with_admin(coord, admin_token);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let handle = tokio::spawn(async move {
-        axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .expect("serve");
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("serve");
     });
     (addr, handle)
 }
@@ -103,18 +111,42 @@ async fn register_response_is_acl_filtered_isolation() {
     // a2 registers: must see a1 + svc, never b1.
     let a2 = register(&client, &base, 2, "a2", "a", &["tag:user-a"]).await;
     let a2_peers = peer_names(&a2);
-    assert!(a2_peers.contains(&"a1".to_owned()), "a2 sees a1: {a2_peers:?}");
-    assert!(a2_peers.contains(&"svc1".to_owned()), "a2 sees svc: {a2_peers:?}");
-    assert!(!a2_peers.contains(&"b1".to_owned()), "a2 must NOT see b1: {a2_peers:?}");
-    assert!(!a2_peers.contains(&"a2".to_owned()), "a2 not in its own roster");
+    assert!(
+        a2_peers.contains(&"a1".to_owned()),
+        "a2 sees a1: {a2_peers:?}"
+    );
+    assert!(
+        a2_peers.contains(&"svc1".to_owned()),
+        "a2 sees svc: {a2_peers:?}"
+    );
+    assert!(
+        !a2_peers.contains(&"b1".to_owned()),
+        "a2 must NOT see b1: {a2_peers:?}"
+    );
+    assert!(
+        !a2_peers.contains(&"a2".to_owned()),
+        "a2 not in its own roster"
+    );
 
     // b2 registers: must see b1 + svc, never a1/a2 (symmetric isolation).
     let b2 = register(&client, &base, 5, "b2", "b", &["tag:user-b"]).await;
     let b2_peers = peer_names(&b2);
-    assert!(b2_peers.contains(&"b1".to_owned()), "b2 sees b1: {b2_peers:?}");
-    assert!(b2_peers.contains(&"svc1".to_owned()), "b2 sees svc: {b2_peers:?}");
-    assert!(!b2_peers.contains(&"a1".to_owned()), "b2 must NOT see a1: {b2_peers:?}");
-    assert!(!b2_peers.contains(&"a2".to_owned()), "b2 must NOT see a2: {b2_peers:?}");
+    assert!(
+        b2_peers.contains(&"b1".to_owned()),
+        "b2 sees b1: {b2_peers:?}"
+    );
+    assert!(
+        b2_peers.contains(&"svc1".to_owned()),
+        "b2 sees svc: {b2_peers:?}"
+    );
+    assert!(
+        !b2_peers.contains(&"a1".to_owned()),
+        "b2 must NOT see a1: {b2_peers:?}"
+    );
+    assert!(
+        !b2_peers.contains(&"a2".to_owned()),
+        "b2 must NOT see a2: {b2_peers:?}"
+    );
 }
 
 #[tokio::test]
@@ -145,15 +177,13 @@ async fn sse_stream_is_acl_filtered_per_viewer() {
     // intermittently false-positive. Keying on the display_name field is
     // exact and stable.
     let has_name = |b: &str, n: &str| b.contains(&format!("\"display_name\":\"{n}\""));
-    let buf = read_sse_until(
-        &mut resp,
-        |b| has_name(b, "svc1") && has_name(b, "a2"),
-        2,
-    )
-    .await;
+    let buf = read_sse_until(&mut resp, |b| has_name(b, "svc1") && has_name(b, "a2"), 2).await;
     assert!(has_name(&buf, "a2"), "a1 stream must include a2: {buf}");
     assert!(has_name(&buf, "svc1"), "a1 stream must include svc: {buf}");
-    assert!(!has_name(&buf, "b1"), "a1 stream must NOT include b1: {buf}");
+    assert!(
+        !has_name(&buf, "b1"),
+        "a1 stream must NOT include b1: {buf}"
+    );
     assert!(!has_name(&buf, "a1"), "a1 not in own stream");
 }
 
@@ -179,7 +209,10 @@ async fn policy_put_converges_sse_subscribers() {
         .expect("stream");
     // Drain the initial burst briefly; svc should be absent.
     let early = read_sse_until(&mut resp, |_| false, 1).await;
-    assert!(!early.contains("svc1"), "svc must be hidden before PUT: {early}");
+    assert!(
+        !early.contains("svc1"),
+        "svc must be hidden before PUT: {early}"
+    );
 
     // Fetch current ETag, then widen the policy to add user-*→svc.
     let get = client
@@ -231,7 +264,11 @@ async fn get_policy_requires_admin_token() {
     let client = reqwest::Client::new();
 
     // No token → 401.
-    let resp = client.get(format!("{base}/v1/policy")).send().await.expect("get");
+    let resp = client
+        .get(format!("{base}/v1/policy"))
+        .send()
+        .await
+        .expect("get");
     assert_eq!(resp.status(), 401, "missing token must be 401");
 
     // Wrong token → 401.
@@ -269,7 +306,13 @@ async fn put_policy_enforces_etag_concurrency() {
         .send()
         .await
         .expect("get");
-    let etag = get.headers().get("etag").unwrap().to_str().unwrap().to_owned();
+    let etag = get
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
 
     let new_policy = serde_json::json!({
         "acls": [ { "action": "accept", "src": ["tag:user-*"], "dst": ["tag:svc"] } ]
@@ -306,7 +349,13 @@ async fn put_policy_enforces_etag_concurrency() {
         .await
         .expect("put fresh");
     assert_eq!(resp.status(), 200);
-    let new_etag = resp.headers().get("etag").unwrap().to_str().unwrap().to_owned();
+    let new_etag = resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
     assert_ne!(new_etag, etag, "ETag must change after a successful PUT");
 
     // The now-stale original ETag fails a second PUT (lost-update guard).
@@ -349,7 +398,11 @@ async fn policy_api_disabled_when_no_admin_token() {
         .send()
         .await
         .expect("get");
-    assert_eq!(resp.status(), 401, "disabled admin API must reject all calls");
+    assert_eq!(
+        resp.status(),
+        401,
+        "disabled admin API must reject all calls"
+    );
 }
 
 // ---------------------------------------------------------------------

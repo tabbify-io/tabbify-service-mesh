@@ -285,7 +285,10 @@ mod tests {
         // Reflexive endpoint pairs the OBSERVED IP with the REPORTED WG
         // port — NOT the HTTP source port 34812.
         assert_eq!(got.endpoint.as_deref(), Some("203.0.113.7:51820"));
-        assert!(got.reflexive, "loopback→reflexive must be flagged reflexive");
+        assert!(
+            got.reflexive,
+            "loopback→reflexive must be flagged reflexive"
+        );
     }
 
     /// A LAN self-report (private 192.168) is likewise replaced by the

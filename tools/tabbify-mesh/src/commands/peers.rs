@@ -47,11 +47,7 @@ pub async fn run(args: PeersArgs) -> Result<()> {
     Ok(())
 }
 
-fn print_peers(
-    peers: &[PeerInfo],
-    self_peer_id: Option<uuid::Uuid>,
-    now: DateTime<Utc>,
-) {
+fn print_peers(peers: &[PeerInfo], self_peer_id: Option<uuid::Uuid>, now: DateTime<Utc>) {
     println!(
         "{:<20} {:<26} {:<22} {:<22} {:<12}",
         "NAME", "ULA", "ENDPOINT", "TAGS", "LAST_SEEN"
@@ -86,10 +82,9 @@ fn print_peers(
 }
 
 fn joined_at_relative(micros: i64, now: DateTime<Utc>) -> String {
-    Utc.timestamp_micros(micros).single().map_or_else(
-        || "?".to_string(),
-        |then| time_format::relative(then, now),
-    )
+    Utc.timestamp_micros(micros)
+        .single()
+        .map_or_else(|| "?".to_string(), |then| time_format::relative(then, now))
 }
 
 fn truncate(s: &str, max: usize) -> String {

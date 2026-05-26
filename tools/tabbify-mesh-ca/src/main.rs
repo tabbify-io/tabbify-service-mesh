@@ -36,7 +36,7 @@ fn main() -> Result<()> {
 }
 
 fn init_ca(out: &std::path::Path) -> Result<()> {
-    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyUsagePurpose, IsCa};
+    use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyUsagePurpose};
     std::fs::create_dir_all(out)?;
     let mut params = CertificateParams::new(vec!["tabbify-mesh-ca".to_string()])?;
     params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -55,7 +55,7 @@ fn init_ca(out: &std::path::Path) -> Result<()> {
 }
 
 fn issue_peer(name: &str, ca_dir: &std::path::Path, out: &std::path::Path) -> Result<()> {
-    use rcgen::{CertificateParams, KeyPair, DistinguishedName, DnType};
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
     let ca_cert_pem = std::fs::read_to_string(ca_dir.join("ca.crt"))?;
     let ca_key_pem = std::fs::read_to_string(ca_dir.join("ca.key"))?;
     let ca_key = KeyPair::from_pem(&ca_key_pem)?;

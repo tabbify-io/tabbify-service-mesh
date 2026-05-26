@@ -30,6 +30,6 @@ pub use ula::{Ula, UlaPrefix};
 
 #[cfg(feature = "wireguard")]
 pub use wireguard::{
-    generate_keypair, PeerPublicKey, PeerStaticSecret, WireGuardFabric, WireGuardKeypair,
-    WireGuardPeerSpec,
+    PeerPublicKey, PeerStaticSecret, WireGuardFabric, WireGuardKeypair, WireGuardPeerSpec,
+    generate_keypair,
 };

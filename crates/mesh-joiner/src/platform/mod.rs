@@ -43,7 +43,7 @@ pub mod route;
 // (spec §5.5 — TX route scoping) lives in [`route`]. Re-exported here so
 // callers keep using `platform::TunRouteSink` / `platform::add_peer_route`
 // regardless of the internal split.
-pub use route::{add_peer_route, del_peer_route, TunRouteSink};
+pub use route::{TunRouteSink, add_peer_route, del_peer_route};
 
 /// The full overlay prefix covered by tabbify's coordinator.
 ///
@@ -57,11 +57,7 @@ pub const OVERLAY_ROUTE_PREFIX: &str = "fd5a:1f00:1::/48";
 pub async fn assign_ula(iface: &str, ula: Ipv6Addr) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        run_command(
-            "ifconfig",
-            &[iface, "inet6", &format!("{ula}/64"), "alias"],
-        )
-        .await
+        run_command("ifconfig", &[iface, "inet6", &format!("{ula}/64"), "alias"]).await
     }
     #[cfg(target_os = "linux")]
     {

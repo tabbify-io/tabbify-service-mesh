@@ -14,10 +14,8 @@
 use std::net::Ipv6Addr;
 use std::time::Duration;
 use tabbify_mesh_fabric::{
-    wireguard::{
-        generate_keypair, WireGuardFabric, WireGuardPeerSpec,
-    },
     MeshFabric,
+    wireguard::{WireGuardFabric, WireGuardPeerSpec, generate_keypair},
 };
 use tokio::time::timeout;
 
@@ -180,10 +178,7 @@ async fn unknown_ula_returns_no_route() {
 
     let ghost: Ipv6Addr = "fd5a:1f00:dead::1".parse().expect("parse");
     let err = fabric.send(ghost, b"nope".to_vec()).await.unwrap_err();
-    assert!(matches!(
-        err,
-        tabbify_mesh_fabric::FabricError::NoRoute(_)
-    ));
+    assert!(matches!(err, tabbify_mesh_fabric::FabricError::NoRoute(_)));
 }
 
 /// Local endpoint delivery on a single `WireGuardFabric` instance
@@ -243,8 +238,5 @@ async fn oversized_payload_rejected() {
 
     let huge = vec![0u8; MAX_APP_PAYLOAD + 1];
     let err = fabric.send(ula, huge).await.unwrap_err();
-    assert!(matches!(
-        err,
-        tabbify_mesh_fabric::FabricError::Encoding(_)
-    ));
+    assert!(matches!(err, tabbify_mesh_fabric::FabricError::Encoding(_)));
 }

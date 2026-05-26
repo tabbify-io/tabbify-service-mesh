@@ -33,7 +33,7 @@ struct Args {
     #[arg(
         long,
         env = "TABBIFY_MESH_HEARTBEAT_TIMEOUT_SECS",
-        default_value_t = 60,
+        default_value_t = 60
     )]
     heartbeat_timeout_secs: u64,
 

@@ -56,7 +56,13 @@ struct ApiError {
 }
 
 fn err(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, Json(ApiError { error: message.into() })).into_response()
+    (
+        status,
+        Json(ApiError {
+            error: message.into(),
+        }),
+    )
+        .into_response()
 }
 
 /// Verify the `Authorization: Bearer <token>` header against the configured
@@ -80,7 +86,10 @@ fn check_admin(state: &PolicyApiState, headers: &HeaderMap) -> Option<Response> 
         .and_then(|v| v.strip_prefix("Bearer "));
     match presented {
         Some(tok) if tok == expected => None,
-        _ => Some(err(StatusCode::UNAUTHORIZED, "invalid or missing admin token")),
+        _ => Some(err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing admin token",
+        )),
     }
 }
 

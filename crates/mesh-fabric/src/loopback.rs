@@ -33,7 +33,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 /// Maximum frame body length (header + payload), in bytes. Frames
 /// advertising more than this are rejected and the connection is closed.
@@ -83,10 +83,7 @@ impl LoopbackFabric {
     /// let the OS choose a port) with the stable identifier
     /// `local_node_id`. Spawns a background tokio task that accepts
     /// inbound TCP connections and dispatches frames to local endpoints.
-    pub async fn bind(
-        local_addr: SocketAddr,
-        local_node_id: String,
-    ) -> Result<Self, FabricError> {
+    pub async fn bind(local_addr: SocketAddr, local_node_id: String) -> Result<Self, FabricError> {
         let listener = TcpListener::bind(local_addr)
             .await
             .map_err(|e| FabricError::Transport(format!("bind {local_addr}: {e}")))?;
@@ -209,9 +206,9 @@ impl LoopbackFabric {
                 return Ok(Arc::clone(existing));
             }
         }
-        let stream = TcpStream::connect(addr).await.map_err(|e| {
-            FabricError::Transport(format!("connect {node_id} ({addr}): {e}"))
-        })?;
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| FabricError::Transport(format!("connect {node_id} ({addr}): {e}")))?;
         if let Err(e) = stream.set_nodelay(true) {
             tracing::debug!(node_id, error = %e, "set_nodelay failed");
         }
@@ -331,9 +328,9 @@ const fn fallback_source_ula() -> Ipv6Addr {
 }
 
 fn encode_frame(dst: Ipv6Addr, src: Ipv6Addr, payload: &[u8]) -> Result<Vec<u8>, FabricError> {
-    let body_len = HEADER_LEN.checked_add(payload.len()).ok_or_else(|| {
-        FabricError::Encoding(format!("payload too large: {}", payload.len()))
-    })?;
+    let body_len = HEADER_LEN
+        .checked_add(payload.len())
+        .ok_or_else(|| FabricError::Encoding(format!("payload too large: {}", payload.len())))?;
     if body_len > MAX_FRAME_BODY {
         return Err(FabricError::Encoding(format!(
             "frame body {body_len} exceeds max {MAX_FRAME_BODY}"

@@ -215,7 +215,9 @@ mod tests {
     fn second_replace_needs_the_new_etag() {
         let store = PolicyStore::new(sample_policy());
         let e0 = store.etag();
-        let snap = store.replace(&e0, Policy::default()).expect("first replace");
+        let snap = store
+            .replace(&e0, Policy::default())
+            .expect("first replace");
         // The old etag is now stale.
         assert!(store.replace(&e0, sample_policy()).is_err());
         // The fresh etag works.

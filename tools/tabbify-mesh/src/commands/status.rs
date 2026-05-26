@@ -47,9 +47,10 @@ pub async fn run() -> Result<()> {
             }
             // anyhow wraps the io::Error one layer deep — check the
             // chain too.
-            if e.chain()
-                .any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == ErrorKind::NotFound))
-            {
+            if e.chain().any(|c| {
+                c.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == ErrorKind::NotFound)
+            }) {
                 eprintln!("not running (no status file at {})", path.display());
                 std::process::exit(1);
             }

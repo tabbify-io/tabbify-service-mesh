@@ -91,9 +91,10 @@ impl Policy {
     /// **and** a destination matching any of `dst_tags`? This is the raw
     /// directional check; [`Self::can_see`] symmetrises it.
     fn allows_directed(&self, src_tags: &[String], dst_tags: &[String]) -> bool {
-        self.acls.iter().filter(|r| r.is_accept()).any(|rule| {
-            tags_match_any(&rule.src, src_tags) && tags_match_any(&rule.dst, dst_tags)
-        })
+        self.acls
+            .iter()
+            .filter(|r| r.is_accept())
+            .any(|rule| tags_match_any(&rule.src, src_tags) && tags_match_any(&rule.dst, dst_tags))
     }
 
     /// SYMMETRIC visibility check: may a node carrying `a_tags` and a node

@@ -50,7 +50,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Maximum encapsulated datagram size we'll ever read from UDP.
@@ -235,10 +235,10 @@ impl WireGuardFabric {
         let tunn = Tunn::new(
             self.inner.static_private.clone(),
             peer.public_key,
-            None,         // no PSK
-            Some(25),     // 25s keepalive
+            None,     // no PSK
+            Some(25), // 25s keepalive
             index,
-            None,         // default rate limiter
+            None, // default rate limiter
         );
         let state = Arc::new(PeerState {
             endpoint: peer.endpoint,
@@ -303,9 +303,7 @@ impl WireGuardFabric {
             .inner
             .peers
             .get(node_id)
-            .ok_or_else(|| {
-                FabricError::Transport(format!("peer {node_id} not registered"))
-            })?
+            .ok_or_else(|| FabricError::Transport(format!("peer {node_id} not registered")))?
             .clone();
         let outbound: Option<Vec<u8>> = {
             let mut dst = vec![0u8; 256];
@@ -316,12 +314,12 @@ impl WireGuardFabric {
                 TunnResult::Err(e) => {
                     return Err(FabricError::Transport(format!(
                         "boringtun handshake error: {e:?}"
-                    )))
+                    )));
                 }
                 other => {
                     return Err(FabricError::Transport(format!(
                         "unexpected boringtun handshake result: {other:?}"
-                    )))
+                    )));
                 }
             }
         };
@@ -354,9 +352,7 @@ impl WireGuardFabric {
             .inner
             .peers
             .get(node_id)
-            .ok_or_else(|| {
-                FabricError::Transport(format!("peer {node_id} not registered"))
-            })?
+            .ok_or_else(|| FabricError::Transport(format!("peer {node_id} not registered")))?
             .clone();
 
         // Wrap the payload in a synthetic IPv6 packet so boringtun's
@@ -524,17 +520,9 @@ impl MeshFabricMutators for WireGuardFabric {
 /// [24-39]  Destination address
 /// [40..]   Payload
 /// ```
-fn build_ipv6_packet(
-    src: Ipv6Addr,
-    dst: Ipv6Addr,
-    payload: &[u8],
-) -> Result<Vec<u8>, FabricError> {
-    let payload_len: u16 = u16::try_from(payload.len()).map_err(|_| {
-        FabricError::Encoding(format!(
-            "payload {} > u16::MAX",
-            payload.len()
-        ))
-    })?;
+fn build_ipv6_packet(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> Result<Vec<u8>, FabricError> {
+    let payload_len: u16 = u16::try_from(payload.len())
+        .map_err(|_| FabricError::Encoding(format!("payload {} > u16::MAX", payload.len())))?;
     let mut out = Vec::with_capacity(IPV6_HEADER_LEN + payload.len());
     // version = 6, TC = 0, FL = 0
     out.push(0x60);
@@ -719,35 +707,33 @@ async fn apply_action(inner: &Arc<Inner>, peer: &Arc<PeerState>, action: DecapAc
                 "received ipv4 packet — not supported by mesh-fabric, dropping"
             );
         }
-        DecapAction::DeliverV6(bytes) => {
-            match parse_ipv6_packet(&bytes) {
-                Ok((_src, dst_ula, payload)) => {
-                    if let Some(entry) = inner.endpoints.get(&dst_ula) {
-                        if let Err(e) = entry.tx.send((dst_ula, payload)) {
-                            tracing::trace!(
-                                node_id = %inner.local_node_id,
-                                %dst_ula,
-                                error = %e,
-                                "endpoint receiver dropped — frame discarded"
-                            );
-                        }
-                    } else {
+        DecapAction::DeliverV6(bytes) => match parse_ipv6_packet(&bytes) {
+            Ok((_src, dst_ula, payload)) => {
+                if let Some(entry) = inner.endpoints.get(&dst_ula) {
+                    if let Err(e) = entry.tx.send((dst_ula, payload)) {
                         tracing::trace!(
                             node_id = %inner.local_node_id,
                             %dst_ula,
-                            "inbound frame for unknown local ULA — dropped"
+                            error = %e,
+                            "endpoint receiver dropped — frame discarded"
                         );
                     }
-                }
-                Err(e) => {
-                    tracing::debug!(
+                } else {
+                    tracing::trace!(
                         node_id = %inner.local_node_id,
-                        ?e,
-                        "ipv6 wrapper parse failed"
+                        %dst_ula,
+                        "inbound frame for unknown local ULA — dropped"
                     );
                 }
             }
-        }
+            Err(e) => {
+                tracing::debug!(
+                    node_id = %inner.local_node_id,
+                    ?e,
+                    "ipv6 wrapper parse failed"
+                );
+            }
+        },
     }
 }
 

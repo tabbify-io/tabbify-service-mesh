@@ -130,8 +130,7 @@ mod tests {
             display_name: "leo-mac".to_string(),
             tags: vec!["dev-machine".to_string(), "wasm-host".to_string()],
             peer_count: 3,
-            last_heartbeat_at: DateTime::from_timestamp(1_700_000_000, 0)
-                .expect("valid timestamp"),
+            last_heartbeat_at: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
             pid: 12_345,
         }
     }

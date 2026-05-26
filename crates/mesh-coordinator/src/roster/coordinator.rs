@@ -371,7 +371,8 @@ impl Coordinator {
         // is present, well-formed, and unclaimed (or claimed by this same
         // peer — prevented from reaching here by the re-registration guard
         // above). Fall back to idx-based allocation otherwise.
-        let (peer_index, ula) = self.resolve_ula(&identity.network, req.requested_ula.as_deref())?;
+        let (peer_index, ula) =
+            self.resolve_ula(&identity.network, req.requested_ula.as_deref())?;
         let peer_id = Uuid::now_v7();
         let now_micros = now_unix_micros();
         let event = PeerJoined {
@@ -805,11 +806,7 @@ impl Coordinator {
                 // holding this exact ULA. The re-registration path (same
                 // wg_public_key) was already handled above — so if we find
                 // a match here it MUST be a different peer.
-                let already_claimed = self
-                    .inner
-                    .roster
-                    .iter()
-                    .any(|kv| kv.value().ula == addr);
+                let already_claimed = self.inner.roster.iter().any(|kv| kv.value().ula == addr);
                 if already_claimed {
                     return Err(CoordinatorError::UlaConflict(raw.to_owned()));
                 }
@@ -1633,7 +1630,7 @@ mod tests {
         }
     }
 
-    /// A peer registered with kind="runner", parent, and app_uuid must
+    /// A peer registered with kind="runner", parent, and `app_uuid` must
     /// appear in the roster snapshot with those exact values.
     #[tokio::test]
     async fn runner_peer_metadata_round_trips_through_roster() {
@@ -1657,8 +1654,8 @@ mod tests {
         assert_eq!(snap[0].app_uuid.as_deref(), Some(app_id));
     }
 
-    /// A plain peer (no kind/parent/app_uuid in request) defaults to
-    /// kind="peer" and absent parent/app_uuid in the roster.
+    /// A plain peer (no `kind/parent/app_uuid` in request) defaults to
+    /// kind="peer" and absent `parent/app_uuid` in the roster.
     #[tokio::test]
     async fn plain_peer_defaults_to_kind_peer_with_no_parent_or_app_uuid() {
         let c = coordinator();
@@ -1734,7 +1731,7 @@ mod tests {
 
     /// The SAME peer re-registering with its own previously-assigned ULA
     /// (sticky identity on restart) must succeed — outcome Existed, same
-    /// peer_id, same ULA.
+    /// `peer_id`, same ULA.
     #[tokio::test]
     async fn register_allows_same_peer_to_reclaim_its_own_ula() {
         let c = coordinator();

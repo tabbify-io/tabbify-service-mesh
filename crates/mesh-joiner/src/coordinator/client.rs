@@ -843,7 +843,18 @@ mod tests {
         assert_eq!(body["wg_listen_port"], 51820);
 
         client
-            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None, None, None, None, None)
+            .register(
+                &[0xAAu8; 32],
+                None,
+                Some(51820),
+                "alice",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("register should succeed and match the wg_listen_port body");
     }
@@ -872,7 +883,18 @@ mod tests {
             .await;
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         let resp = client
-            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None, None, None, None, None)
+            .register(
+                &[0xAAu8; 32],
+                None,
+                Some(51820),
+                "alice",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("register");
         assert_eq!(resp.observed_ip.as_deref(), Some("203.0.113.7"));
@@ -900,7 +922,18 @@ mod tests {
             .await;
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         let resp = client
-            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None, None, None, None, None)
+            .register(
+                &[0xAAu8; 32],
+                None,
+                Some(51820),
+                "alice",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("register");
         assert!(resp.observed_ip.is_none());
@@ -945,7 +978,18 @@ mod tests {
 
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         client
-            .register(&[0xAAu8; 32], None, Some(51820), "alice", &[], None, None, None, None, None)
+            .register(
+                &[0xAAu8; 32],
+                None,
+                Some(51820),
+                "alice",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("tokenless register should succeed");
         // The `.expect(0)` on the header-requiring mock is verified on
@@ -1074,7 +1118,18 @@ mod tests {
             .await;
         let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
         let err = client
-            .register(&[0u8; 32], None, Some(51820), "x", &[], None, None, None, None, None)
+            .register(
+                &[0u8; 32],
+                None,
+                Some(51820),
+                "x",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, JoinerError::JsonCodec(_)), "{err:?}");

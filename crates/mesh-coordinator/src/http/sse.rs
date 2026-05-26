@@ -174,7 +174,10 @@ mod tests {
     fn holepunch_initiator_exposed_for_filtering() {
         let hp = sample_holepunch();
         let ev = PeerEvent::HolePunch(hp.clone());
-        assert_eq!(ev.holepunch_initiator(), Some(hp.initiator_peer_id.as_str()));
+        assert_eq!(
+            ev.holepunch_initiator(),
+            Some(hp.initiator_peer_id.as_str())
+        );
 
         let removed = PeerEvent::Removed {
             peer_id: "x".into(),

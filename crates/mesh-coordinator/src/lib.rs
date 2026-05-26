@@ -23,17 +23,15 @@ pub mod roster;
 // physically lives under `roster/`.
 pub use roster::timeout;
 
+pub use auth::{AuthValidator, ValidatedClaims, ValidationError};
 pub use http::api::{PeerInfo, build_router, build_router_with_admin};
-pub use http::policy_api::PolicyApiState;
 pub use http::mtls::{MtlsServerConfig, build_server_config};
+pub use http::policy_api::PolicyApiState;
 pub use http::sse::PeerEvent;
 pub use nat::holepunch::{PunchPair, PunchPeer, PunchTracker, canonical_pair, try_emit_pair};
 pub use policy::{AclRule, Policy, PolicyReplaceError, PolicySnapshot, PolicyStore};
 pub use publisher::{EventPublisher, NoopPublisher};
-pub use roster::allocator::{
-    DEFAULT_NETWORK_SLOT, ULA_PREFIX_LITERAL, UlaAllocator, network_slot,
-};
-pub use auth::{AuthValidator, ValidatedClaims, ValidationError};
+pub use roster::allocator::{DEFAULT_NETWORK_SLOT, ULA_PREFIX_LITERAL, UlaAllocator, network_slot};
 pub use roster::coordinator::{Coordinator, CoordinatorError, PeerEntry};
 pub use roster::events::{HolePunchInitiate, MeshEvent, PeerHeartbeat, PeerJoined, PeerLeft};
 pub use roster::identity::{NodeIdentity, stamp_identity};

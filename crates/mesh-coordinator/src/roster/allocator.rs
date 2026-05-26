@@ -85,7 +85,10 @@ impl UlaAllocator {
     /// # Errors
     /// [`AllocError::Exhausted`] when the slot's u16 index space is full.
     pub fn allocate_in_slot(&self, slot: u16) -> Result<(u16, Ipv6Addr), AllocError> {
-        let counter = self.per_network.entry(slot).or_insert_with(|| AtomicU16::new(0));
+        let counter = self
+            .per_network
+            .entry(slot)
+            .or_insert_with(|| AtomicU16::new(0));
         // compare-exchange loop: refuse allocation past u16::MAX instead of
         // wrapping back to 0 (which would re-issue an existing ULA).
         loop {
@@ -130,7 +133,10 @@ impl UlaAllocator {
     /// concurrent advances: loses races where another thread bumped
     /// higher, never regresses.
     pub fn bump_slot_at_least(&self, slot: u16, idx: u16) {
-        let counter = self.per_network.entry(slot).or_insert_with(|| AtomicU16::new(0));
+        let counter = self
+            .per_network
+            .entry(slot)
+            .or_insert_with(|| AtomicU16::new(0));
         let mut current = counter.load(Ordering::Acquire);
         while current < idx {
             match counter.compare_exchange(current, idx, Ordering::AcqRel, Ordering::Acquire) {
@@ -247,7 +253,11 @@ mod tests {
         let alloc = UlaAllocator::new();
         let slot = network_slot("svc");
         let (idx, addr) = alloc.allocate("svc").expect("ok");
-        assert_eq!(addr.segments()[2], slot, "block hextet matches network slot");
+        assert_eq!(
+            addr.segments()[2],
+            slot,
+            "block hextet matches network slot"
+        );
         assert_eq!(addr.segments()[3], idx, "idx hextet matches returned index");
     }
 
@@ -271,7 +281,11 @@ mod tests {
         // Sweep a batch of names; none may collide with the reserved 0.
         for i in 0..2000 {
             let name = format!("network-{i}");
-            assert_ne!(network_slot(&name), DEFAULT_NETWORK_SLOT, "name {name} hit slot 0");
+            assert_ne!(
+                network_slot(&name),
+                DEFAULT_NETWORK_SLOT,
+                "name {name} hit slot 0"
+            );
         }
     }
 

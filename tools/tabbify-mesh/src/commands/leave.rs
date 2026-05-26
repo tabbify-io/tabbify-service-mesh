@@ -23,7 +23,10 @@ const LEAVE_ENDPOINT: &str = "/v1/mesh/deregister";
 pub async fn run(args: LeaveArgs) -> Result<()> {
     let snapshot = status_file::read().ok();
 
-    let peer_id: Uuid = match args.peer_id.or_else(|| snapshot.as_ref().map(|s| s.peer_id)) {
+    let peer_id: Uuid = match args
+        .peer_id
+        .or_else(|| snapshot.as_ref().map(|s| s.peer_id))
+    {
         Some(id) => id,
         None => {
             anyhow::bail!(
@@ -37,10 +40,7 @@ pub async fn run(args: LeaveArgs) -> Result<()> {
         .or_else(|| snapshot.as_ref().map(|s| s.coordinator_url.clone()))
         .unwrap_or_else(|| DEFAULT_COORDINATOR_URL.to_string());
 
-    let url = format!(
-        "{}{LEAVE_ENDPOINT}",
-        coordinator.trim_end_matches('/')
-    );
+    let url = format!("{}{LEAVE_ENDPOINT}", coordinator.trim_end_matches('/'));
 
     println!("leaving peer_id={peer_id} via {coordinator}");
 
