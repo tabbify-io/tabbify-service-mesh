@@ -10,6 +10,7 @@
 //! Segment: `platform.mesh.peers`.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Canonical wire string for a mesh event, used as the `event_type` label
 /// passed to an [`crate::publisher::EventPublisher`].
@@ -125,7 +126,7 @@ impl MeshEvent for PeerLeft {
 /// state machine (timing / retries / NAT-type detection) is deferred to a
 /// real-NAT cloud rollout; this type pins the protocol shape now so joiner
 /// subscribers don't churn when the real impl lands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct HolePunchInitiate {
     /// Peer that should send first.
     pub initiator_peer_id: String,

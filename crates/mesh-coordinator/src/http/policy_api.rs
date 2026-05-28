@@ -18,6 +18,7 @@
 //!   the existing `peers/stream` SSE — nodes converge without
 //!   re-registering. See [`Coordinator::resync_all_peers`].
 
+use crate::http::api::ApiError;
 use crate::policy::{Policy, PolicyReplaceError};
 use crate::roster::coordinator::Coordinator;
 use axum::{
@@ -27,6 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+use utoipa::ToSchema;
 
 /// State carried by the policy admin handlers: the coordinator (for the
 /// store + roster resync) plus the configured admin token.
@@ -41,18 +43,12 @@ pub struct PolicyApiState {
 
 /// JSON body of `GET /v1/policy` — the policy plus its current version tag
 /// (the same value also lands in the `ETag` response header).
-#[derive(Debug, Serialize)]
-struct PolicyResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PolicyResponse {
     /// Current policy document.
-    policy: Policy,
+    pub policy: Policy,
     /// Current version tag (mirrors the `ETag` header).
-    etag: String,
-}
-
-/// JSON error envelope, matching the peer API's shape.
-#[derive(Debug, Serialize)]
-struct ApiError {
-    error: String,
+    pub etag: String,
 }
 
 fn err(status: StatusCode, message: impl Into<String>) -> Response {
@@ -93,7 +89,22 @@ fn check_admin(state: &PolicyApiState, headers: &HeaderMap) -> Option<Response> 
     }
 }
 
-/// `GET /v1/policy` — fetch the current policy + `ETag` (admin-gated).
+/// Fetch the current ACL policy + its `ETag` (admin-gated).
+///
+/// Returns the live policy snapshot, with the version tag mirrored as
+/// both the JSON `etag` field and the `ETag` response header. The
+/// returned `ETag` is required as `If-Match` on any subsequent `PUT`
+/// (optimistic concurrency).
+#[utoipa::path(
+    get,
+    path = "/v1/policy",
+    tag = "policy",
+    responses(
+        (status = 200, description = "Current policy + ETag (mirrored in the ETag response header)", body = PolicyResponse),
+        (status = 401, description = "Missing / invalid admin token (or admin API disabled)", body = ApiError),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn get_policy_handler(
     State(state): State<PolicyApiState>,
     headers: HeaderMap,
@@ -109,13 +120,26 @@ pub async fn get_policy_handler(
     ([(header::ETAG, snap.etag)], Json(body)).into_response()
 }
 
-/// `PUT /v1/policy` — replace the policy (admin-gated, `If-Match` required).
+/// Replace the ACL policy (admin-gated, `If-Match` required).
 ///
-/// - `401` — bad/missing admin token.
-/// - `428 Precondition Required` — missing `If-Match` header.
-/// - `412 Precondition Failed` — `If-Match` `ETag` is stale.
-/// - `200` — replaced; body carries the new policy + `ETag`, and the roster
-///   is re-filtered + pushed over SSE.
+/// Requires both `Authorization: Bearer <MESH_ADMIN_TOKEN>` and the
+/// current `ETag` echoed in `If-Match` for optimistic concurrency. On
+/// success the roster is re-filtered and the deltas pushed over the
+/// existing `/v1/mesh/peers/stream` SSE — connected nodes converge
+/// without re-registering.
+#[utoipa::path(
+    put,
+    path = "/v1/policy",
+    tag = "policy",
+    request_body = Policy,
+    responses(
+        (status = 200, description = "Replaced; body carries the new policy + ETag (also in header)", body = PolicyResponse),
+        (status = 401, description = "Missing / invalid admin token (or admin API disabled)", body = ApiError),
+        (status = 412, description = "If-Match ETag stale; current ETag returned in header", body = ApiError),
+        (status = 428, description = "Missing If-Match header", body = ApiError),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn put_policy_handler(
     State(state): State<PolicyApiState>,
     headers: HeaderMap,

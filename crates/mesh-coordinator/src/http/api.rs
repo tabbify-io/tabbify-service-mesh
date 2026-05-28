@@ -25,11 +25,12 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 use tracing::warn;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// JSON shape returned to clients for every peer. Mirrors the proto
 /// `PeerJoined` payload, except `wg_public_key` is base64-encoded.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PeerInfo {
     /// Coordinator-assigned UUID v7 (string form).
     pub peer_id: String,
@@ -77,7 +78,7 @@ fn default_kind() -> String {
 }
 
 /// Body of `POST /v1/mesh/register`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct RegisterRequest {
     /// 32-byte X25519 public key, base64-encoded.
     pub wg_public_key: String,
@@ -137,7 +138,7 @@ pub struct RegisterRequest {
 }
 
 /// Body of `POST /v1/mesh/register` response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RegisterResponse {
     /// Coordinator-assigned UUID v7.
     pub peer_id: String,
@@ -161,7 +162,7 @@ pub struct RegisterResponse {
 }
 
 /// Body of `POST /v1/mesh/heartbeat`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct HeartbeatRequest {
     /// Peer id originally returned by `register`.
     pub peer_id: String,
@@ -184,7 +185,7 @@ pub struct HeartbeatRequest {
 }
 
 /// Body of `POST /v1/mesh/heartbeat` response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct HeartbeatResponse {
     /// Snapshot of the current roster.
     pub peers: Vec<PeerInfo>,
@@ -199,14 +200,14 @@ pub struct HeartbeatResponse {
 }
 
 /// Body of `POST /v1/mesh/deregister`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct DeregisterRequest {
     /// Peer id to remove.
     pub peer_id: String,
 }
 
 /// Body of `GET /v1/mesh/peers` response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RosterResponse {
     /// All currently-registered peers, ordered by peer index.
     pub peers: Vec<PeerInfo>,
@@ -214,9 +215,10 @@ pub struct RosterResponse {
 
 /// JSON error envelope. Kept dead simple — there's no public-facing
 /// error code taxonomy yet.
-#[derive(Debug, Clone, Serialize)]
-struct ApiError {
-    error: String,
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ApiError {
+    /// Human-readable error description.
+    pub error: String,
 }
 
 /// Convert coordinator errors into `(status, body)` pairs for axum.
@@ -296,10 +298,38 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
         )
         .with_state(policy_state);
 
-    peer_routes.merge(policy_routes)
+    peer_routes
+        .merge(policy_routes)
+        // Swagger UI at `/swagger-ui` + the raw spec at `/openapi.json`.
+        // Unauthenticated, so operators can browse the contract before
+        // they hold a join token / admin token.
+        .merge(crate::openapi::swagger_routes())
 }
 
-async fn register_handler(
+/// Register a peer with the coordinator.
+///
+/// The joiner submits its `WireGuard` public key + intended display name
+/// and gets back a coordinator-assigned `peer_id` + IPv6 ULA plus an
+/// ACL-filtered snapshot of currently-visible peers. When the coordinator
+/// is configured with an `AUTH_URL` (production), every request MUST
+/// present a valid `Authorization: Bearer <join-token>`; the joiner's
+/// `network` + `tags` are then taken from the validated claims
+/// (authoritative). In dev (no `AUTH_URL`) the Bearer header is ignored.
+#[utoipa::path(
+    post,
+    path = "/v1/mesh/register",
+    tag = "mesh",
+    request_body = RegisterRequest,
+    responses(
+        (status = 200, description = "Registered; returns peer_id, ULA, observed endpoint, and filtered roster", body = RegisterResponse),
+        (status = 400, description = "Malformed wg_public_key or peer_id", body = ApiError),
+        (status = 401, description = "Missing / invalid / revoked join-token (when AUTH_URL configured)", body = ApiError),
+        (status = 409, description = "Requested ULA is held by a different peer", body = ApiError),
+        (status = 503, description = "ULA allocation exhausted", body = ApiError),
+    ),
+    security(("bearer" = []))
+)]
+pub(crate) async fn register_handler(
     State(coordinator): State<Coordinator>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
@@ -343,7 +373,25 @@ async fn register_handler(
     }
 }
 
-async fn heartbeat_handler(
+/// Keepalive — refresh the peer's last-seen timestamp + reflexive endpoint.
+///
+/// The supervisor re-sends its CURRENT set of hosted app-ULAs on every
+/// heartbeat; the coordinator REPLACES the stored set and re-broadcasts
+/// when it changes (per-app-ULA routing). A peer that misses heartbeats
+/// for longer than `--heartbeat-timeout-secs` is swept by the timeout
+/// task. Auth: transport-level mTLS only — no application bearer.
+#[utoipa::path(
+    post,
+    path = "/v1/mesh/heartbeat",
+    tag = "mesh",
+    request_body = HeartbeatRequest,
+    responses(
+        (status = 200, description = "Roster snapshot + the peer's observed endpoint", body = HeartbeatResponse),
+        (status = 400, description = "Malformed peer_id", body = ApiError),
+        (status = 404, description = "peer_id not registered", body = ApiError),
+    ),
+)]
+pub(crate) async fn heartbeat_handler(
     State(coordinator): State<Coordinator>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     Json(req): Json<HeartbeatRequest>,
@@ -378,7 +426,20 @@ async fn heartbeat_handler(
     }
 }
 
-async fn deregister_handler(
+/// Gracefully remove a peer from the roster. Idempotent — removing an
+/// already-absent peer still returns `204`. Auth: transport-level mTLS
+/// only — no application bearer.
+#[utoipa::path(
+    post,
+    path = "/v1/mesh/deregister",
+    tag = "mesh",
+    request_body = DeregisterRequest,
+    responses(
+        (status = 204, description = "Peer removed (idempotent)"),
+        (status = 400, description = "Malformed peer_id", body = ApiError),
+    ),
+)]
+pub(crate) async fn deregister_handler(
     State(coordinator): State<Coordinator>,
     Json(req): Json<DeregisterRequest>,
 ) -> Response {
@@ -391,7 +452,19 @@ async fn deregister_handler(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn peers_handler(State(coordinator): State<Coordinator>) -> Response {
+/// Roster snapshot — UNFILTERED, ordered by peer index. Intended for
+/// admin / debug / observability tooling; joiners use the per-viewer
+/// ACL-filtered stream at `/v1/mesh/peers/stream` instead. Auth:
+/// transport-level mTLS only — no application bearer.
+#[utoipa::path(
+    get,
+    path = "/v1/mesh/peers",
+    tag = "mesh",
+    responses(
+        (status = 200, description = "Full roster snapshot (admin / debug view)", body = RosterResponse),
+    ),
+)]
+pub(crate) async fn peers_handler(State(coordinator): State<Coordinator>) -> Response {
     Json(RosterResponse {
         peers: coordinator.snapshot(),
     })
@@ -399,7 +472,7 @@ async fn peers_handler(State(coordinator): State<Coordinator>) -> Response {
 }
 
 /// Query parameters for `GET /v1/mesh/peers/stream`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct StreamQuery {
     /// The subscribing peer's id. When present, the stream is ACL-filtered
     /// to the peers that viewer is policy-permitted to see (and converges
@@ -410,7 +483,33 @@ pub struct StreamQuery {
     pub peer_id: Option<String>,
 }
 
-async fn stream_handler(
+/// Live SSE stream of peer-lifecycle + hole-punch events. The connection
+/// opens with a bootstrap burst of the current roster (one `peer_added`
+/// frame per peer), then forwards `peer_added` / `peer_updated` /
+/// `peer_removed` / `holepunch_initiate` frames as they happen. When
+/// `peer_id` is provided, the stream is per-viewer ACL-filtered + the
+/// hole-punch frame is routed only to its initiator. Auth:
+/// transport-level mTLS only — no application bearer.
+///
+/// SSE wire format: `event: <kind>` + `data: <json>` per frame. The
+/// per-event payload schema is [`PeerEvent`] (mirrored here as a
+/// documentation-only schema — the streaming body itself can't be a
+/// single `OpenAPI` body type).
+#[utoipa::path(
+    get,
+    path = "/v1/mesh/peers/stream",
+    tag = "mesh",
+    params(
+        ("peer_id" = Option<String>, Query,
+            description = "Subscribing viewer's peer-id; when present the stream is ACL-filtered to peers this viewer may see, and hole-punch frames are routed by initiator. Omit for an unfiltered admin/debug view."),
+    ),
+    responses(
+        (status = 200, description = "SSE stream of peer events (text/event-stream)",
+            content_type = "text/event-stream",
+            body = PeerEvent),
+    ),
+)]
+pub(crate) async fn stream_handler(
     State(coordinator): State<Coordinator>,
     Query(query): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<SseFrame, Infallible>>> {

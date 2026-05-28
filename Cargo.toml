@@ -65,6 +65,12 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # Encoding
 base64 = "0.22"
 
+# OpenAPI 3 + Swagger UI. Pinned to versions compatible with axum 0.7
+# (utoipa-swagger-ui 9.x requires axum 0.8). `axum_extras` enables
+# IntoResponses for axum, `uuid` adds a schema for `uuid::Uuid`.
+utoipa             = { version = "5", features = ["axum_extras", "uuid"] }
+utoipa-swagger-ui  = { version = "8", features = ["axum"] }
+
 # Error / misc
 anyhow    = "1"
 thiserror = "2"

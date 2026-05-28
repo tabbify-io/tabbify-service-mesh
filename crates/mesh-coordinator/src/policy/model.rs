@@ -32,10 +32,11 @@
 //! module changes.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// A single `accept` rule: every source tag may reach every destination
 /// tag. Tags support trailing-`*` prefix wildcards (and a bare `*`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AclRule {
     /// Always `"accept"` today; kept explicit so a future `"deny"`/`"drop"`
     /// action slots in without a wire-format break. Unknown actions are
@@ -72,7 +73,7 @@ impl AclRule {
 
 /// The full ACL policy: an ordered list of [`AclRule`]s. Default-deny —
 /// an empty policy denies everything.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Policy {
     /// Accept rules, evaluated as a set (order is not significant for
     /// default-deny visibility, but preserved for round-trip fidelity).

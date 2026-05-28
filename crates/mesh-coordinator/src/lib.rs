@@ -14,6 +14,7 @@
 pub mod auth;
 pub mod http;
 pub mod nat;
+pub mod openapi;
 pub mod policy;
 pub mod publisher;
 pub mod roster;

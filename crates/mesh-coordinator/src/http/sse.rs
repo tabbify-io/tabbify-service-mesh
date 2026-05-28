@@ -9,6 +9,7 @@ use crate::http::api::PeerInfo;
 use crate::roster::events::HolePunchInitiate;
 use serde::Serialize;
 use tokio::sync::broadcast;
+use utoipa::ToSchema;
 
 /// Capacity of the broadcast channel — small enough to spot lag in logs,
 /// large enough that a slow subscriber doesn't lose updates from a single
@@ -23,7 +24,7 @@ pub const PEER_BROADCAST_CAPACITY: usize = 256;
 /// work on removals too, [`PeerEvent::Removed`] carries the departed
 /// peer's `tags` — the viewer should only see a remove frame for a peer it
 /// was previously allowed to see.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PeerEvent {
     /// A peer was added to the roster.
