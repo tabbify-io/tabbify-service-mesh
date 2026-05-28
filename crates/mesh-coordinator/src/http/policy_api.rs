@@ -105,6 +105,7 @@ fn check_admin(state: &PolicyApiState, headers: &HeaderMap) -> Option<Response> 
     ),
     security(("bearer" = []))
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_policy_handler(
     State(state): State<PolicyApiState>,
     headers: HeaderMap,
@@ -140,6 +141,7 @@ pub async fn get_policy_handler(
     ),
     security(("bearer" = []))
 )]
+#[tracing::instrument(skip_all)]
 pub async fn put_policy_handler(
     State(state): State<PolicyApiState>,
     headers: HeaderMap,

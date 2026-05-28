@@ -76,6 +76,14 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
     ),
     security(("bearer" = []))
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(
+        display_name = %req.display_name,
+        network = %req.network,
+        kind = %req.kind,
+    ),
+)]
 pub async fn register_handler(
     State(coordinator): State<Coordinator>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
@@ -138,6 +146,10 @@ pub async fn register_handler(
         (status = 404, description = "peer_id not registered", body = ApiError),
     ),
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(peer_id = %req.peer_id),
+)]
 pub async fn heartbeat_handler(
     State(coordinator): State<Coordinator>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
@@ -186,6 +198,10 @@ pub async fn heartbeat_handler(
         (status = 400, description = "Malformed peer_id", body = ApiError),
     ),
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(peer_id = %req.peer_id),
+)]
 pub async fn deregister_handler(
     State(coordinator): State<Coordinator>,
     Json(req): Json<DeregisterRequest>,
@@ -211,6 +227,7 @@ pub async fn deregister_handler(
         (status = 200, description = "Full roster snapshot (admin / debug view)", body = RosterResponse),
     ),
 )]
+#[tracing::instrument(skip_all)]
 pub async fn peers_handler(State(coordinator): State<Coordinator>) -> Response {
     Json(RosterResponse {
         peers: coordinator.snapshot(),

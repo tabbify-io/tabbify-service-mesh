@@ -49,6 +49,10 @@ use uuid::Uuid;
             body = PeerEvent),
     ),
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(peer_id = ?query.peer_id),
+)]
 pub async fn stream_handler(
     State(coordinator): State<Coordinator>,
     Query(query): Query<StreamQuery>,
