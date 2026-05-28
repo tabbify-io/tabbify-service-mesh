@@ -23,7 +23,6 @@ rand_core    = { workspace = true }
 # Async + HTTP
 tokio        = { workspace = true }
 futures      = { workspace = true }
-async-trait  = { workspace = true }
 reqwest      = { workspace = true }
 
 # SSE client used by `peer_sync` to consume the coordinator's
@@ -41,7 +40,6 @@ dashmap     = { workspace = true }
 parking_lot = { workspace = true }
 
 tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 anyhow    = { workspace = true }
 thiserror = { workspace = true }
