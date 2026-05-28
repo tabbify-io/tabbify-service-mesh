@@ -44,11 +44,11 @@ use crate::roster::events::HolePunchInitiate;
                        hole-punch events, and the admin ACL policy API."
     ),
     paths(
-        crate::http::api::register_handler,
-        crate::http::api::heartbeat_handler,
-        crate::http::api::deregister_handler,
-        crate::http::api::peers_handler,
-        crate::http::api::stream_handler,
+        crate::http::api::handlers::register_handler,
+        crate::http::api::handlers::heartbeat_handler,
+        crate::http::api::handlers::deregister_handler,
+        crate::http::api::handlers::peers_handler,
+        crate::http::api::stream::stream_handler,
         crate::http::policy_api::get_policy_handler,
         crate::http::policy_api::put_policy_handler,
     ),
