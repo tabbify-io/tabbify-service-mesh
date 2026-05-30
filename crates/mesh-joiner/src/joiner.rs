@@ -139,8 +139,7 @@ impl Joiner {
         // The advertised string (when present) is metadata for *other*
         // peers — they resolve it in their own environment at dial time
         // (`coordinator::client::remote_to_info`), so we must NOT resolve
-        // it locally.
-        let advertised: Option<String> = config.advertise_endpoint.clone();
+        // it locally. Passed straight into `register` below.
         let client = Arc::new(CoordinatorClient::new(
             config.coordinator_url.clone(),
             config.tls_cert.as_deref(),
@@ -151,7 +150,7 @@ impl Joiner {
         let resp = client
             .register(
                 keypair.public.as_bytes(),
-                advertised,
+                config.advertise_endpoint.clone(),
                 Some(wg_listen_port),
                 &config.display_name,
                 &config.tags,
@@ -160,6 +159,7 @@ impl Joiner {
                 config.kind.clone(),
                 config.parent.clone(),
                 config.app_uuid.clone(),
+                config.software_version.clone(),
             )
             .await?;
         let peer_id = resp.peer_id;
@@ -180,17 +180,16 @@ impl Joiner {
         // already have a loaded identity (sticky_ula was None → fresh join).
         // On a restart with an existing file we would have loaded it above
         // (sticky_ula was Some), so there is nothing new to write.
-        if let Some(id_path) = config.identity_path.as_ref() {
-            if sticky_ula.is_none() {
-                persistent_identity::store(id_path, &keypair, my_ula).map_err(|e| {
-                    anyhow::anyhow!("persist identity {}: {}", id_path.display(), e)
-                })?;
-                tracing::info!(
-                    identity_path = %id_path.display(),
-                    %my_ula,
-                    "joiner: persisted identity (keypair + ULA)"
-                );
-            }
+        if let Some(id_path) = config.identity_path.as_ref()
+            && sticky_ula.is_none()
+        {
+            persistent_identity::store(id_path, &keypair, my_ula)
+                .map_err(|e| anyhow::anyhow!("persist identity {}: {}", id_path.display(), e))?;
+            tracing::info!(
+                identity_path = %id_path.display(),
+                %my_ula,
+                "joiner: persisted identity (keypair + ULA)"
+            );
         }
 
         // 3) Open + configure the TUN device. The fabric crate already
@@ -243,6 +242,7 @@ impl Joiner {
             wg_listen_port,
             heartbeat_interval: config.heartbeat_interval,
             hosted_app_ulas: hosted_app_ulas.clone(),
+            software_version: config.software_version.clone(),
             shutdown_rx,
         });
 
@@ -405,6 +405,9 @@ struct SpawnContext {
     /// (per-app-ULA routing). Shared with [`Joiner`] so `host_app_ula` /
     /// `unhost_app_ula` mutate the set the heartbeat task reads.
     hosted_app_ulas: Arc<dashmap::DashMap<Ipv6Addr, ()>>,
+    /// Software version advertised on register + every heartbeat (spec P0
+    /// OBSERVE). Host-supplied; `None` = unknown, never invented here.
+    software_version: Option<String>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -422,6 +425,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         wg_listen_port,
         heartbeat_interval,
         hosted_app_ulas,
+        software_version,
         shutdown_rx,
     } = ctx;
     let mut tasks: Vec<JoinHandle<()>> = Vec::with_capacity(6);
@@ -500,6 +504,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
             peer_id,
             wg_listen_port,
             hosted_app_ulas,
+            software_version,
             interval: heartbeat_interval,
             shutdown: shutdown_rx,
         })

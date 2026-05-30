@@ -54,6 +54,9 @@ pub struct HeartbeatTask {
     /// App-ULAs this node hosts — advertised on every heartbeat
     /// (per-app-ULA routing). Shared with [`crate::Joiner`].
     pub hosted_app_ulas: Arc<DashMap<Ipv6Addr, ()>>,
+    /// Software version advertised on every heartbeat (spec P0 OBSERVE).
+    /// Host-supplied; `None` = unknown.
+    pub software_version: Option<String>,
     /// Heartbeat interval.
     pub interval: Duration,
     /// Cancellation signal.
@@ -72,6 +75,7 @@ pub async fn run(task: HeartbeatTask) {
         peer_id,
         wg_listen_port,
         hosted_app_ulas,
+        software_version,
         interval,
         mut shutdown,
     } = task;
@@ -101,6 +105,7 @@ pub async fn run(task: HeartbeatTask) {
                     peer_id,
                     wg_listen_port,
                     &hosted_app_ulas,
+                    software_version.clone(),
                 )
                 .await;
             }
@@ -113,6 +118,10 @@ pub async fn run(task: HeartbeatTask) {
 ///
 /// `wg_listen_port` is re-sent so the coordinator can refresh our
 /// reflexive endpoint if our observed public IP changed.
+///
+/// `software_version` is re-sent so the control plane observes the host's
+/// `actual` version (spec P0). `None` = unknown — the coordinator leaves
+/// its stored value untouched.
 pub async fn tick_once(
     client: &CoordinatorClient,
     sessions: &SessionTable,
@@ -120,12 +129,13 @@ pub async fn tick_once(
     peer_id: Uuid,
     wg_listen_port: u16,
     hosted_app_ulas: &DashMap<Ipv6Addr, ()>,
+    software_version: Option<String>,
 ) {
     // Advertise our CURRENT hosted app-ULA set so the coordinator replaces
     // its stored set (per-app-ULA routing — supervisor side).
     let hosted = hosted_app_ula_strings(hosted_app_ulas);
     match client
-        .heartbeat(peer_id, Some(wg_listen_port), &hosted)
+        .heartbeat(peer_id, Some(wg_listen_port), &hosted, software_version)
         .await
     {
         Ok(resp) => reconcile_roster(sessions, our_private, &resp.peers).await,

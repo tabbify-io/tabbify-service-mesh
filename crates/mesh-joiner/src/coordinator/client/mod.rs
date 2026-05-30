@@ -89,6 +89,11 @@ pub struct RegisterRequest {
     /// Omitted from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_uuid: Option<String>,
+    /// Software version of the binary the host is running (e.g. `"v1.4.0"`).
+    /// Host-supplied; omitted from the wire when `None` so older
+    /// coordinators are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_version: Option<String>,
 }
 
 /// Body of `POST /v1/mesh/register`'s response.
@@ -127,6 +132,10 @@ pub struct HeartbeatRequest {
     /// one (per-app-ULA routing). Omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosted_app_ulas: Vec<String>,
+    /// Software version re-sent every heartbeat so the control plane can
+    /// observe `actual` version (spec P0). Omitted from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_version: Option<String>,
 }
 
 /// Body of the heartbeat response. The coordinator returns the current
@@ -264,6 +273,10 @@ impl CoordinatorClient {
     /// (Task 0.2). `None` = coordinator-derived. `kind` / `parent` /
     /// `app_uuid` — runner peer metadata (Task 0.1/0.3). All `None` for
     /// plain peers — omitted from the wire for backward compat.
+    ///
+    /// `software_version` — version of the binary the host is running
+    /// (e.g. `"v1.4.0"`). Host-supplied; `None` for an older host —
+    /// omitted from the wire (spec P0).
     #[allow(clippy::too_many_arguments)]
     pub async fn register(
         &self,
@@ -277,6 +290,7 @@ impl CoordinatorClient {
         kind: Option<String>,
         parent: Option<String>,
         app_uuid: Option<String>,
+        software_version: Option<String>,
     ) -> Result<RegisterResponse> {
         let body = RegisterRequest {
             wg_public_key: B64.encode(wg_public_key),
@@ -293,6 +307,7 @@ impl CoordinatorClient {
             kind,
             parent,
             app_uuid,
+            software_version,
         };
         let url = format!("{}/v1/mesh/register", self.base_url);
         let mut builder = self.http.post(&url).json(&body);
@@ -316,17 +331,24 @@ impl CoordinatorClient {
     /// `wg_listen_port` is our `WireGuard` UDP port, re-sent so the
     /// coordinator can refresh our reflexive endpoint on an observed-IP
     /// change.
+    ///
+    /// `software_version` is the version of the binary the host is running,
+    /// re-sent every heartbeat so the control plane can observe `actual`
+    /// version drift (spec P0). `None` (host-supplied) is omitted from the
+    /// wire and leaves the coordinator's stored value untouched.
     pub async fn heartbeat(
         &self,
         peer_id: Uuid,
         wg_listen_port: Option<u16>,
         hosted_app_ulas: &[String],
+        software_version: Option<String>,
     ) -> Result<HeartbeatResponse> {
         let url = format!("{}/v1/mesh/heartbeat", self.base_url);
         let body = HeartbeatRequest {
             peer_id,
             wg_listen_port,
             hosted_app_ulas: hosted_app_ulas.to_vec(),
+            software_version,
         };
         let resp = self
             .http

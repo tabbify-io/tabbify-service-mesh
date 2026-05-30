@@ -112,6 +112,12 @@ pub struct JoinConfig {
     /// `derive_app_ula`) should leave this `None` and set `requested_ula`
     /// directly instead.
     pub identity_path: Option<PathBuf>,
+    /// Software version of THIS host's binary (e.g. `"v1.4.0"`), supplied by
+    /// the caller (supervisor). Sent on register + every heartbeat as
+    /// `software_version` so the control plane sees `actual` version drift
+    /// toward `desired` (spec P0 OBSERVE). `None` (default) — the joiner
+    /// never invents a value; an omitting host stays back-compatible.
+    pub software_version: Option<String>,
 }
 
 impl Default for JoinConfig {
@@ -139,6 +145,7 @@ impl Default for JoinConfig {
             parent: None,
             app_uuid: None,
             identity_path: None,
+            software_version: None,
         }
     }
 }
@@ -182,6 +189,7 @@ mod tests {
             parent: Some("fd5a:1f00:1::1".into()),
             app_uuid: Some("01910f10-0000-7000-8000-000000000099".into()),
             identity_path: Some(PathBuf::from("/tmp/id.json")),
+            software_version: Some("v1.4.0".into()),
         };
         let cloned = cfg.clone();
         assert_eq!(cloned.coordinator_url, cfg.coordinator_url);
@@ -199,5 +207,21 @@ mod tests {
         assert_eq!(cloned.parent, cfg.parent);
         assert_eq!(cloned.app_uuid, cfg.app_uuid);
         assert_eq!(cloned.identity_path, cfg.identity_path);
+        assert_eq!(cloned.software_version, cfg.software_version);
+    }
+
+    /// SV-2: the host-supplied `software_version` round-trips through clone
+    /// and defaults to `None` (joiner never invents a value).
+    #[test]
+    fn software_version_default_is_none_and_clones() {
+        let cfg = JoinConfig::default();
+        assert_eq!(cfg.software_version, None);
+        let cfg2 = JoinConfig {
+            software_version: Some("v1.4.0".to_owned()),
+            ..JoinConfig::default()
+        };
+        let cloned = cfg2.clone();
+        assert_eq!(cfg2.software_version, Some("v1.4.0".to_owned()));
+        assert_eq!(cloned.software_version, Some("v1.4.0".to_owned()));
     }
 }

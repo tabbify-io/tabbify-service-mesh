@@ -214,6 +214,7 @@ async fn register_round_trip_against_mock_coordinator() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -255,6 +256,7 @@ async fn register_sends_bearer_header_when_join_token_present() {
             "alice",
             &[],
             Some("my-join-jwt"),
+            None,
             None,
             None,
             None,
@@ -309,6 +311,7 @@ async fn register_sends_wg_port_and_omits_listen_endpoint() {
         kind: None,
         parent: None,
         app_uuid: None,
+        software_version: None,
     })
     .unwrap();
     assert!(
@@ -324,6 +327,7 @@ async fn register_sends_wg_port_and_omits_listen_endpoint() {
             Some(51820),
             "alice",
             &[],
+            None,
             None,
             None,
             None,
@@ -369,6 +373,7 @@ async fn register_parses_observed_reflexive_fields() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("register");
@@ -403,6 +408,7 @@ async fn register_tolerates_missing_observed_fields() {
             Some(51820),
             "alice",
             &[],
+            None,
             None,
             None,
             None,
@@ -464,6 +470,7 @@ async fn register_omits_bearer_header_when_no_join_token() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("tokenless register should succeed");
@@ -488,7 +495,7 @@ async fn heartbeat_returns_roster_snapshot() {
         .await;
     let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
     let resp = client
-        .heartbeat(Uuid::nil(), Some(51820), &[])
+        .heartbeat(Uuid::nil(), Some(51820), &[], None)
         .await
         .unwrap();
     assert!(resp.peers.is_empty());
@@ -521,6 +528,7 @@ async fn heartbeat_sends_hosted_app_ulas() {
             Uuid::nil(),
             Some(51820),
             &["fd5a:1f02:dead:beef:cafe:0:0:1".to_owned()],
+            None,
         )
         .await
         .expect("heartbeat with hosted app-ULAs should match the body");
@@ -534,6 +542,7 @@ async fn heartbeat_omits_empty_hosted_app_ulas() {
         peer_id: Uuid::nil(),
         wg_listen_port: Some(51820),
         hosted_app_ulas: vec![],
+        software_version: None,
     })
     .unwrap();
     assert!(
@@ -604,6 +613,7 @@ async fn register_surfaces_json_codec_error_on_garbage_body() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -657,11 +667,51 @@ async fn register_sends_requested_ula_and_peer_metadata() {
             Some("runner".to_owned()),
             Some(sup_ula.to_owned()),
             Some(app_uuid_str.to_owned()),
+            None,
         )
         .await
         .expect("register with requested_ula + metadata should succeed");
     // The coordinator echoed back the requested ULA.
     assert_eq!(resp.ula, runner_ula);
+}
+
+/// SV-2: when the host supplies a `software_version`, the register body
+/// carries it so the coordinator can store it.
+#[tokio::test]
+async fn register_sends_software_version_in_body() {
+    use wiremock::matchers::body_partial_json;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/mesh/register"))
+        .and(body_partial_json(serde_json::json!({
+            "software_version": "v1.4.0"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "peer_id": "01910f10-0000-7000-8000-000000000001",
+            "ula": "fd5a:1f00:1::1",
+            "peers": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+    let pubkey = [0xAAu8; 32];
+    client
+        .register(
+            &pubkey,
+            None,
+            Some(51820),
+            "alice",
+            &["dev-machine".to_owned()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("v1.4.0".to_owned()),
+        )
+        .await
+        .expect("register with software_version should match the body");
 }
 
 /// Backward compat: existing callers that pass `None` for all four new
@@ -681,6 +731,7 @@ fn register_request_omits_optional_runner_fields_when_none() {
         kind: None,
         parent: None,
         app_uuid: None,
+        software_version: None,
     })
     .unwrap();
     assert!(
