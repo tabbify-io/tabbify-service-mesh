@@ -25,6 +25,7 @@
 //! decided — gives downstream code the right import path now without
 //! requiring SSE-extension work today.
 
+use crate::coordinator::heartbeat::SharedPeerId;
 use crate::wg::session::{PeerSession, SessionTable, WgAction, classify_tunn_result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -150,14 +151,28 @@ pub async fn execute_punch(socket: &UdpSocket, plan: &PunchPlan, burst: usize, i
 /// target's reflexive endpoint — opening our NAT mapping so the peer's
 /// simultaneous burst crosses and the `WireGuard` session establishes. The
 /// coordinator emits a swapped pair, so the other side punches back at us.
+///
+/// `my_peer_id` is the LIVE, shared peer id ([`SharedPeerId`]) — the SAME
+/// handle the heartbeat + SSE tasks observe. A coordinator roster loss
+/// (404 on heartbeat) makes the heartbeat task re-register and adopt a NEW
+/// id, after which the coordinator keys hole-punch events to that new id.
+/// We therefore read the current id from the shared handle on EVERY event
+/// rather than capturing it once at spawn, so post-recovery punches keep
+/// firing instead of silently filtering against a dead id. The guard is
+/// read into a local `Uuid` and dropped before any `.await` so it is never
+/// held across the punch I/O.
 pub async fn run(
-    my_peer_id: Uuid,
+    my_peer_id: SharedPeerId,
     socket: Arc<UdpSocket>,
     sessions: SessionTable,
     mut punch_rx: mpsc::UnboundedReceiver<HolePunchInitiate>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    info!(peer_id = %my_peer_id, "holepunch: subscriber started");
+    // Read the id into a local first: holding the lock guard across the
+    // tracing macro's await would make this future non-Send (the guard
+    // isn't Sync) — same constraint the heartbeat task observes.
+    let started_id = *my_peer_id.read().await;
+    info!(peer_id = %started_id, "holepunch: subscriber started");
     loop {
         tokio::select! {
             biased;
@@ -172,7 +187,12 @@ pub async fn run(
                     debug!("holepunch: punch channel closed, exiting");
                     return;
                 };
-                match plan_punch(&sessions, my_peer_id, &event) {
+                // Read the LIVE id per event: a 404 re-register may have
+                // swapped it since spawn. Clone the Uuid out and drop the
+                // guard before any punch I/O (never hold the lock across an
+                // .await).
+                let current_id = *my_peer_id.read().await;
+                match plan_punch(&sessions, current_id, &event) {
                     Some(plan) => {
                         info!(
                             target = %event.target_peer_id,
@@ -198,6 +218,7 @@ pub async fn run(
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::coordinator::heartbeat::SharedPeerId;
     use crate::peer::PeerInfo;
     use crate::wg::session::SessionTable;
     use std::sync::Arc;
@@ -309,12 +330,104 @@ mod tests {
         }
     }
 
+    /// Wrap a fixed id in the shared handle the punch task now reads.
+    fn shared(id: Uuid) -> SharedPeerId {
+        Arc::new(tokio::sync::RwLock::new(id))
+    }
+
+    /// Regression for the 404-re-register hole-punch gap: after the shared
+    /// peer id is swapped (as the heartbeat task does on a 404), the punch
+    /// task must filter initiate events against the LIVE id, not the one it
+    /// saw at spawn.
+    ///
+    /// Two phases, ordered so the swap is observably AFTER the task is
+    /// running (no spawn-time read race):
+    ///
+    /// 1. With the OLD id live, an initiate keyed to OLD punches — proving
+    ///    the task is up and reading the shared handle per event.
+    /// 2. We then swap the shared handle to a NEW id (the 404 recovery) and
+    ///    send an initiate keyed to the NEW id. It MUST punch too. Under the
+    ///    old "capture a plain `Uuid` at spawn" behaviour the task would
+    ///    still compare against OLD, skip (`initiator NEW != OLD`), and no
+    ///    datagram would arrive — so phase 2 is the load-bearing assertion.
+    #[tokio::test]
+    async fn run_filters_on_live_peer_id_after_swap() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
+        let target_addr = receiver.local_addr().expect("recv addr");
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind send"));
+
+        let old_id = Uuid::from_u128(1);
+        let new_id = Uuid::from_u128(99);
+        let target = Uuid::from_u128(2);
+        let sessions = session_table_with(target, "fd5a:1f00:1::2", None);
+        let live_id = shared(old_id);
+        let (punch_tx, punch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let task = {
+            let live_id = live_id.clone();
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                run(live_id, socket, sessions, punch_rx, sd_rx).await;
+            })
+        };
+
+        // Phase 1: OLD id is live; an OLD-keyed initiate punches. Receiving
+        // a datagram proves the task is running and has consumed the first
+        // event, so the swap below is strictly ordered after spawn. A single
+        // punch fires a BURST of `PUNCH_BURST` datagrams; we must DRAIN them
+        // all before phase 2, otherwise phase 2's read could pick up a
+        // leftover phase-1 packet and falsely "pass". The drain loop ends
+        // when the burst is exhausted (a short per-packet timeout elapses).
+        let mut buf = [0u8; 256];
+        punch_tx
+            .send(ev(old_id, target, &target_addr.to_string()))
+            .expect("send initiate (old)");
+        let (n1, _from) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+            .await
+            .expect("phase-1 datagram (old id should punch)")
+            .expect("recv ok");
+        assert!(n1 >= 148, "expected a WG handshake-init, got {n1} bytes");
+        // Drain the rest of the phase-1 burst so none can masquerade as a
+        // phase-2 punch. PUNCH_INTERVAL is 300ms; 1s per packet is ample —
+        // the loop ends when a read times out (burst exhausted).
+        while let Ok(r) =
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buf)).await
+        {
+            r.expect("recv ok");
+        }
+
+        // Phase 2: simulate the 404 re-register adopting a fresh peer id,
+        // then send a NEW-keyed initiate. With the burst fully drained, the
+        // ONLY way a datagram now arrives is the task re-reading the live id
+        // and punching for the NEW-keyed event. A spawn-captured id would
+        // compare NEW against OLD, skip, and this read would time out.
+        *live_id.write().await = new_id;
+        punch_tx
+            .send(ev(new_id, target, &target_addr.to_string()))
+            .expect("send initiate (new)");
+        let (n2, _from) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+            .await
+            .expect("phase-2 datagram (punch must use the live, swapped peer id)")
+            .expect("recv ok");
+        assert!(n2 >= 148, "expected a WG handshake-init, got {n2} bytes");
+        assert_eq!(buf[0], 1, "first byte is the WG handshake-init type");
+
+        // The task is mid-burst on phase 2 (PUNCH_BURST * PUNCH_INTERVAL),
+        // so allow well over the burst duration for it to drain and exit.
+        drop(punch_tx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("task exits when channel closes")
+            .expect("task ran to completion");
+    }
+
     #[tokio::test]
     async fn run_exits_on_shutdown() {
         let (tx, rx) = watch::channel(false);
         let (_punch_tx, punch_rx) = tokio::sync::mpsc::unbounded_channel();
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
-        let me = Uuid::from_u128(7);
+        let me = shared(Uuid::from_u128(7));
         let handle = tokio::spawn(async move {
             run(me, socket, SessionTable::new(), punch_rx, rx).await;
         });
@@ -341,7 +454,7 @@ mod tests {
         let (_sd_tx, sd_rx) = watch::channel(false);
 
         let task = tokio::spawn(async move {
-            run(me, socket, sessions, punch_rx, sd_rx).await;
+            run(shared(me), socket, sessions, punch_rx, sd_rx).await;
         });
 
         punch_tx

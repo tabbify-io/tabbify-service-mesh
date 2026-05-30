@@ -12,20 +12,76 @@
 //!    flaky.
 //! 4. Loops.
 //!
+//! ## Coordinator roster loss (404 recovery)
+//!
+//! If the coordinator forgets our peer record — it restarted with an
+//! empty roster, or timed us out and pruned us while our SSE stream was
+//! wedged — a heartbeat for an unknown `peer_id` comes back `404`. A bare
+//! retry would loop forever against a coordinator that will never know us
+//! again. Instead, on a `404` we perform a FULL re-register (same sticky
+//! identity inputs the initial join used), adopt the freshly-assigned
+//! `peer_id`, reconcile the roster the register response carries, and
+//! resume normal heartbeats. The new `peer_id` is shared (an
+//! `Arc<RwLock<Uuid>>`) with the SSE consumer so it reconnects its stream
+//! filtered to the LIVE id rather than the dead one. Re-register failures
+//! are non-fatal (logged, retried next tick); a one-shot guard makes the
+//! re-register fire once per detected `404` transition, not every tick.
+//!
 //! Cancellation comes through a `tokio_util::sync::CancellationToken`
 //! style channel — we use a plain `tokio::sync::watch` to avoid pulling
 //! `tokio-util` just for one token.
 
 use crate::coordinator::client::{CoordinatorClient, remote_to_info};
+use crate::error::JoinerError;
 use crate::wg::session::SessionTable;
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 use x25519_dalek::StaticSecret;
+
+/// Mutably-shared coordinator-assigned peer id.
+///
+/// Shared between the heartbeat task (which can replace it on a 404
+/// re-register) and the SSE consumer (which must reconnect its stream
+/// filtered to the LIVE id). A `tokio::sync::RwLock` is used over a
+/// `std::sync` one because both holders are async and may be polled across
+/// `.await` points; reads are short and never held across the network I/O
+/// that could deadlock.
+pub type SharedPeerId = Arc<RwLock<Uuid>>;
+
+/// Inputs captured for re-registering after a coordinator roster loss.
+///
+/// The exact arguments [`CoordinatorClient::register`] needs, captured once
+/// at spawn time from the already-resolved keypair +
+/// [`crate::config::JoinConfig`] so a 404-triggered re-register requests the
+/// SAME sticky identity the initial join did — preserving the node's ULA
+/// across the coordinator's amnesia.
+#[derive(Clone)]
+pub struct ReregisterInputs {
+    /// Our X25519 public key — the coordinator keys our record by it.
+    pub our_public: [u8; 32],
+    /// Explicit advertise endpoint override (`None` = reflexive).
+    pub advertise_endpoint: Option<String>,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Role tags (advisory when a join token is present).
+    pub tags: Vec<String>,
+    /// Node-join JWT, re-sent so a validating coordinator re-authorises us.
+    pub join_token: Option<String>,
+    /// Sticky ULA to re-request so the coordinator hands us the same
+    /// overlay address (identity preservation). `None` = coordinator-derived.
+    pub requested_ula: Option<String>,
+    /// Runner role metadata (all `None` for a plain peer).
+    pub kind: Option<String>,
+    /// ULA of the supervisor that owns this runner.
+    pub parent: Option<String>,
+    /// UUID of the app this runner serves.
+    pub app_uuid: Option<String>,
+}
 
 /// Snapshot the locally-hosted app-ULA set into the wire form
 /// (`Vec<String>` of IPv6 literals) the heartbeat advertises. Sorted for
@@ -47,8 +103,11 @@ pub struct HeartbeatTask {
     /// Our X25519 private key — needed to (re)build peer sessions on
     /// reconcile.
     pub our_private: StaticSecret,
-    /// Our coordinator-assigned peer id.
-    pub peer_id: Uuid,
+    /// Our coordinator-assigned peer id, shared with the SSE consumer so a
+    /// 404 re-register that yields a NEW id is observed by both.
+    pub peer_id: SharedPeerId,
+    /// Inputs for a full re-register on a coordinator roster loss (404).
+    pub reregister: ReregisterInputs,
     /// Our `WireGuard` UDP listen port — re-sent for reflexive refresh.
     pub wg_listen_port: u16,
     /// App-ULAs this node hosts — advertised on every heartbeat
@@ -63,6 +122,33 @@ pub struct HeartbeatTask {
     pub shutdown: watch::Receiver<bool>,
 }
 
+/// Per-tick context borrowed from [`HeartbeatTask`]. Keeps [`tick_once`]
+/// under the clippy argument-count cap without an `allow`, and lets the
+/// unit tests drive a single tick without a real ticker.
+pub struct TickCtx<'a> {
+    /// Coordinator HTTP client.
+    pub client: &'a CoordinatorClient,
+    /// Shared session table to reconcile.
+    pub sessions: &'a SessionTable,
+    /// Our X25519 private key for (re)building sessions.
+    pub our_private: &'a StaticSecret,
+    /// Shared, mutable peer id — read for the heartbeat, replaced on a
+    /// 404 re-register.
+    pub peer_id: &'a SharedPeerId,
+    /// Inputs for the re-register fallback.
+    pub reregister: &'a ReregisterInputs,
+    /// Our `WireGuard` UDP listen port.
+    pub wg_listen_port: u16,
+    /// Locally-hosted app-ULA set advertised this tick.
+    pub hosted_app_ulas: &'a DashMap<Ipv6Addr, ()>,
+    /// Software version advertised this tick.
+    pub software_version: Option<String>,
+    /// One-shot guard: set once a 404 has been handled, cleared on the
+    /// next successful heartbeat. Stops a thundering herd of re-registers
+    /// while the coordinator is still bringing its roster back.
+    pub handling_roster_loss: &'a mut bool,
+}
+
 /// Run the heartbeat loop until `shutdown` flips to `true`.
 ///
 /// Designed to be spawned with `tokio::spawn(run(task))` — does not
@@ -73,6 +159,7 @@ pub async fn run(task: HeartbeatTask) {
         sessions,
         our_private,
         peer_id,
+        reregister,
         wg_listen_port,
         hosted_app_ulas,
         software_version,
@@ -85,28 +172,39 @@ pub async fn run(task: HeartbeatTask) {
     // installed from the register response.
     ticker.tick().await;
 
+    // One-shot guard so a re-register fires once per detected 404
+    // transition rather than on every tick while the coordinator is
+    // still re-learning us.
+    let mut handling_roster_loss = false;
+
     loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    // Read the id into a local first: holding the lock guard
+                    // across the tracing macro's await would make this future
+                    // non-Send (the guard isn't Sync).
+                    let current = *peer_id.read().await;
                     tracing::debug!(
-                        peer_id = %peer_id,
+                        peer_id = %current,
                         "heartbeat: shutdown signalled, exiting"
                     );
                     return;
                 }
             }
             _ = ticker.tick() => {
-                tick_once(
-                    &client,
-                    &sessions,
-                    &our_private,
-                    peer_id,
+                tick_once(TickCtx {
+                    client: &client,
+                    sessions: &sessions,
+                    our_private: &our_private,
+                    peer_id: &peer_id,
+                    reregister: &reregister,
                     wg_listen_port,
-                    &hosted_app_ulas,
-                    software_version.clone(),
-                )
+                    hosted_app_ulas: &hosted_app_ulas,
+                    software_version: software_version.clone(),
+                    handling_roster_loss: &mut handling_roster_loss,
+                })
                 .await;
             }
         }
@@ -122,31 +220,136 @@ pub async fn run(task: HeartbeatTask) {
 /// `software_version` is re-sent so the control plane observes the host's
 /// `actual` version (spec P0). `None` = unknown — the coordinator leaves
 /// its stored value untouched.
-pub async fn tick_once(
-    client: &CoordinatorClient,
-    sessions: &SessionTable,
-    our_private: &StaticSecret,
-    peer_id: Uuid,
-    wg_listen_port: u16,
-    hosted_app_ulas: &DashMap<Ipv6Addr, ()>,
-    software_version: Option<String>,
-) {
+///
+/// On a `404` (coordinator forgot us — roster loss) the heartbeat is
+/// converted into a full re-register; see `reregister_after_roster_loss`.
+/// Any other error keeps the existing log-and-retry behaviour.
+pub async fn tick_once(ctx: TickCtx<'_>) {
+    let TickCtx {
+        client,
+        sessions,
+        our_private,
+        peer_id,
+        reregister,
+        wg_listen_port,
+        hosted_app_ulas,
+        software_version,
+        handling_roster_loss,
+    } = ctx;
+
     // Advertise our CURRENT hosted app-ULA set so the coordinator replaces
     // its stored set (per-app-ULA routing — supervisor side).
     let hosted = hosted_app_ula_strings(hosted_app_ulas);
+    let current_id = *peer_id.read().await;
     match client
-        .heartbeat(peer_id, Some(wg_listen_port), &hosted, software_version)
+        .heartbeat(current_id, Some(wg_listen_port), &hosted, software_version)
         .await
     {
-        Ok(resp) => reconcile_roster(sessions, our_private, &resp.peers).await,
+        Ok(resp) => {
+            // A successful heartbeat clears the roster-loss guard so a
+            // FUTURE 404 transition is handled again.
+            *handling_roster_loss = false;
+            reconcile_roster(sessions, our_private, &resp.peers).await;
+        }
+        Err(JoinerError::HttpStatus { status: 404, body }) => {
+            // The coordinator no longer knows this peer_id — its roster
+            // was lost (restart) or it pruned us behind our back. Re-join
+            // with the same sticky identity so we get a fresh peer_id +
+            // the current roster, instead of retrying a dead id forever.
+            if *handling_roster_loss {
+                tracing::debug!(
+                    peer_id = %current_id,
+                    "heartbeat: still recovering from roster loss, skipping duplicate re-register"
+                );
+                return;
+            }
+            *handling_roster_loss = true;
+            tracing::warn!(
+                peer_id = %current_id,
+                body = %body,
+                "heartbeat: coordinator returned 404 (roster loss) — re-registering"
+            );
+            reregister_after_roster_loss(
+                client,
+                sessions,
+                our_private,
+                peer_id,
+                reregister,
+                wg_listen_port,
+            )
+            .await;
+        }
         Err(e) => {
             tracing::warn!(
-                peer_id = %peer_id,
+                peer_id = %current_id,
                 error = %e,
                 "heartbeat failed — will retry on next tick"
             );
         }
     }
+}
+
+/// Perform a full re-register after a coordinator roster loss, then
+/// reconcile the roster the register response carries and adopt the
+/// freshly-assigned `peer_id` (shared with the SSE consumer).
+///
+/// Failure is non-fatal: it is logged and the loop retries on the next
+/// tick (the `handling_roster_loss` guard is left set, so the retry
+/// happens on the regular cadence rather than as a tight loop).
+async fn reregister_after_roster_loss(
+    client: &CoordinatorClient,
+    sessions: &SessionTable,
+    our_private: &StaticSecret,
+    peer_id: &SharedPeerId,
+    inputs: &ReregisterInputs,
+    wg_listen_port: u16,
+) {
+    let resp = match client
+        .register(
+            &inputs.our_public,
+            inputs.advertise_endpoint.clone(),
+            Some(wg_listen_port),
+            &inputs.display_name,
+            &inputs.tags,
+            inputs.join_token.as_deref(),
+            inputs.requested_ula.clone(),
+            inputs.kind.clone(),
+            inputs.parent.clone(),
+            inputs.app_uuid.clone(),
+            // The control plane re-derives `software_version` from heartbeats;
+            // the register only needs identity + roster, so omit it here.
+            None,
+        )
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "heartbeat: re-register after roster loss failed — will retry next tick"
+            );
+            return;
+        }
+    };
+
+    // Adopt the freshly-assigned peer_id so subsequent heartbeats AND the
+    // SSE consumer (on its next reconnect) use the LIVE id, not the dead
+    // one. Write the lock in its own scope so it is never held across the
+    // roster reconcile that follows.
+    {
+        let mut id = peer_id.write().await;
+        *id = resp.peer_id;
+    }
+    tracing::info!(
+        peer_id = %resp.peer_id,
+        ula = %resp.ula,
+        peers = resp.peers.len(),
+        "heartbeat: re-registered after roster loss"
+    );
+
+    // Reinstall the roster the coordinator just handed back, reusing the
+    // same reconcile path a normal heartbeat would.
+    reconcile_roster(sessions, our_private, &resp.peers).await;
 }
 
 /// Compute the (insert, delete) deltas between the local session table
@@ -200,6 +403,8 @@ mod tests {
     use crate::peer::{PeerInfo, RemotePeer};
     use base64::engine::{Engine as _, general_purpose::STANDARD as B64};
     use std::net::Ipv6Addr;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
     use x25519_dalek::PublicKey;
 
     fn pubkey_b64(n: u8) -> String {
@@ -240,6 +445,22 @@ mod tests {
             hosted_app_ulas: vec![],
             software_version: None,
             joined_at_micros: 0,
+        }
+    }
+
+    /// Minimal `ReregisterInputs` for a plain peer — no runner metadata,
+    /// no join token, no sticky ULA.
+    fn reregister_inputs() -> ReregisterInputs {
+        ReregisterInputs {
+            our_public: [0xAB; 32],
+            advertise_endpoint: None,
+            display_name: "test-peer".into(),
+            tags: vec![],
+            join_token: None,
+            requested_ula: None,
+            kind: None,
+            parent: None,
+            app_uuid: None,
         }
     }
 
@@ -303,5 +524,215 @@ mod tests {
                 .is_some()
         );
         assert_eq!(sessions.len(), 1);
+    }
+
+    /// S bug#2: a heartbeat that comes back `404` (the coordinator lost
+    /// our roster entry) must trigger a FULL re-register — not a bare
+    /// retry — and then reinstall the roster the register response
+    /// carries. Proven by:
+    ///
+    /// * the register mock being hit exactly once,
+    /// * the local session table containing the peer from the REGISTER
+    ///   roster (a bare retry would never reach register, so the table
+    ///   would stay empty),
+    /// * the shared `peer_id` being replaced by the coordinator's freshly
+    ///   assigned id (so the SSE consumer reconnects to the live id).
+    #[tokio::test]
+    async fn heartbeat_404_triggers_reregister_and_roster_reinstall() {
+        let server = MockServer::start().await;
+
+        // (a) Every heartbeat returns 404 — the coordinator forgot us.
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/heartbeat"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unknown peer_id"))
+            .mount(&server)
+            .await;
+
+        // (b) Exactly one register, returning a fresh peer_id + a one-peer
+        //     roster.
+        let new_peer_id = "01910f10-0000-7000-8000-0000000000aa";
+        let roster_peer_ula = "fd5a:1f00:9::7";
+        let register_body = serde_json::json!({
+            "peer_id": new_peer_id,
+            "ula": "fd5a:1f00:9::1",
+            "peers": [
+                {
+                    "peer_id": "01910f10-0000-7000-8000-0000000000bb",
+                    "wg_public_key": pubkey_b64(7),
+                    "ula": roster_peer_ula,
+                    "listen_endpoint": "127.0.0.1:51999",
+                    "display_name": "roster-peer",
+                    "tags": [],
+                    "joined_at_micros": 0
+                }
+            ]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(register_body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        let sessions = SessionTable::new();
+        let me = StaticSecret::from([0xAA; 32]);
+        let original_id = Uuid::nil();
+        let peer_id: SharedPeerId = Arc::new(RwLock::new(original_id));
+        let hosted: DashMap<Ipv6Addr, ()> = DashMap::new();
+        let inputs = reregister_inputs();
+        let mut handling_roster_loss = false;
+
+        // Drive a single tick: heartbeat -> 404 -> re-register -> reconcile.
+        tick_once(TickCtx {
+            client: &client,
+            sessions: &sessions,
+            our_private: &me,
+            peer_id: &peer_id,
+            reregister: &inputs,
+            wg_listen_port: 51820,
+            hosted_app_ulas: &hosted,
+            software_version: None,
+            handling_roster_loss: &mut handling_roster_loss,
+        })
+        .await;
+
+        // The peer from the REGISTER roster is now installed — proves the
+        // 404 path re-registered AND reinstalled the roster, not a bare
+        // retry (which would leave the table empty).
+        assert!(
+            sessions
+                .by_ula(roster_peer_ula.parse::<Ipv6Addr>().unwrap())
+                .is_some(),
+            "register-roster peer must be installed after a 404 re-register"
+        );
+        assert_eq!(sessions.len(), 1);
+
+        // The shared peer_id was adopted from the register response, so the
+        // SSE consumer will reconnect filtered to the live id.
+        assert_eq!(
+            *peer_id.read().await,
+            Uuid::parse_str(new_peer_id).unwrap(),
+            "shared peer_id must adopt the coordinator's freshly assigned id"
+        );
+
+        // The guard is set so a duplicate re-register won't fire next tick.
+        assert!(handling_roster_loss, "roster-loss guard must be set");
+
+        // The register `.expect(1)` is verified on server drop — a second
+        // re-register inside this single tick would trip it.
+        drop(server);
+    }
+
+    /// The one-shot guard must stop a thundering herd: while
+    /// `handling_roster_loss` is already set, a second 404 tick must NOT
+    /// re-register again. The register mock is mounted with `.expect(0)`.
+    #[tokio::test]
+    async fn second_404_tick_does_not_reregister_while_guard_set() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/heartbeat"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unknown"))
+            .mount(&server)
+            .await;
+        // If this is ever hit while the guard is set, the test fails.
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "peer_id": "01910f10-0000-7000-8000-0000000000cc",
+                "ula": "fd5a:1f00:9::1",
+                "peers": []
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        let sessions = SessionTable::new();
+        let me = StaticSecret::from([0xAA; 32]);
+        let peer_id: SharedPeerId = Arc::new(RwLock::new(Uuid::nil()));
+        let hosted: DashMap<Ipv6Addr, ()> = DashMap::new();
+        let inputs = reregister_inputs();
+        // Guard already set — simulates a re-register in flight from a
+        // prior tick.
+        let mut handling_roster_loss = true;
+
+        tick_once(TickCtx {
+            client: &client,
+            sessions: &sessions,
+            our_private: &me,
+            peer_id: &peer_id,
+            reregister: &inputs,
+            wg_listen_port: 51820,
+            hosted_app_ulas: &hosted,
+            software_version: None,
+            handling_roster_loss: &mut handling_roster_loss,
+        })
+        .await;
+
+        // Still set — a guarded tick is a no-op for the register endpoint.
+        assert!(handling_roster_loss);
+        drop(server);
+    }
+
+    /// A non-404 error must keep the existing log-and-retry behaviour:
+    /// no re-register, the session table is untouched, and the guard is
+    /// NOT set (so a later genuine 404 still triggers recovery).
+    #[tokio::test]
+    async fn heartbeat_non_404_error_does_not_reregister() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/heartbeat"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "peer_id": "01910f10-0000-7000-8000-0000000000dd",
+                "ula": "fd5a:1f00:9::1",
+                "peers": []
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        let sessions = SessionTable::new();
+        let me = StaticSecret::from([0xAA; 32]);
+        let original_id = Uuid::nil();
+        let peer_id: SharedPeerId = Arc::new(RwLock::new(original_id));
+        let hosted: DashMap<Ipv6Addr, ()> = DashMap::new();
+        let inputs = reregister_inputs();
+        let mut handling_roster_loss = false;
+
+        tick_once(TickCtx {
+            client: &client,
+            sessions: &sessions,
+            our_private: &me,
+            peer_id: &peer_id,
+            reregister: &inputs,
+            wg_listen_port: 51820,
+            hosted_app_ulas: &hosted,
+            software_version: None,
+            handling_roster_loss: &mut handling_roster_loss,
+        })
+        .await;
+
+        assert_eq!(sessions.len(), 0, "non-404 error must not touch sessions");
+        assert_eq!(
+            *peer_id.read().await,
+            original_id,
+            "non-404 error must not change the peer_id"
+        );
+        assert!(
+            !handling_roster_loss,
+            "non-404 error must not set the roster-loss guard"
+        );
+        drop(server);
     }
 }

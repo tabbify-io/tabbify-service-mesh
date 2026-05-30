@@ -13,6 +13,7 @@
 
 use crate::config::JoinConfig;
 use crate::coordinator::client::{CoordinatorClient, remote_to_info};
+use crate::coordinator::heartbeat::{ReregisterInputs, SharedPeerId};
 use crate::coordinator::{heartbeat, peer_sync};
 use crate::error::JoinerError;
 use crate::nat::holepunch;
@@ -46,8 +47,16 @@ pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
 /// sessions vanish); call [`Joiner::leave`] for a graceful
 /// deregistration that also tells the coordinator we're going away.
 pub struct Joiner {
-    /// Coordinator-assigned peer id.
+    /// Coordinator-assigned peer id captured at the INITIAL join. Surfaced
+    /// by the synchronous [`Self::my_peer_id`] accessor. A 404 re-register
+    /// in the heartbeat task can change the LIVE id (see
+    /// [`Self::shared_peer_id`]); this field intentionally holds the
+    /// original so the sync accessor stays infallible and lock-free.
     peer_id: Uuid,
+    /// The LIVE peer id, shared with the heartbeat + SSE tasks. Replaced
+    /// in place when a coordinator roster loss forces a re-register, so
+    /// [`Self::leave`] deregisters the id the coordinator actually knows.
+    shared_peer_id: SharedPeerId,
     /// Our assigned ULA. Stable for the lifetime of this `Joiner`.
     my_ula: Ipv6Addr,
     /// Shared session table — readable for [`Self::peers`].
@@ -155,7 +164,7 @@ impl Joiner {
                 &config.display_name,
                 &config.tags,
                 config.join_token.as_deref(),
-                effective_requested_ula,
+                effective_requested_ula.clone(),
                 config.kind.clone(),
                 config.parent.clone(),
                 config.app_uuid.clone(),
@@ -175,22 +184,7 @@ impl Joiner {
             "joiner: registered (reflexive endpoint from coordinator)"
         );
 
-        // ── Persist identity after a fresh join ───────────────────────────
-        // Only persist when an identity_path was configured AND we didn't
-        // already have a loaded identity (sticky_ula was None → fresh join).
-        // On a restart with an existing file we would have loaded it above
-        // (sticky_ula was Some), so there is nothing new to write.
-        if let Some(id_path) = config.identity_path.as_ref()
-            && sticky_ula.is_none()
-        {
-            persistent_identity::store(id_path, &keypair, my_ula)
-                .map_err(|e| anyhow::anyhow!("persist identity {}: {}", id_path.display(), e))?;
-            tracing::info!(
-                identity_path = %id_path.display(),
-                %my_ula,
-                "joiner: persisted identity (keypair + ULA)"
-            );
-        }
+        persist_identity_if_fresh(&config, &keypair, my_ula, sticky_ula)?;
 
         // 3) Open + configure the TUN device. The fabric crate already
         //    has a polished cross-platform open() that returns
@@ -226,10 +220,15 @@ impl Joiner {
         let peer_info: Arc<dashmap::DashMap<Ipv6Addr, PeerInfo>> = Arc::default();
         seed_initial_roster(&sessions, &peer_info, &keypair.private, &resp.peers).await;
 
-        // 6) Spawn the background tasks. The locally-hosted app-ULA set is
-        //    shared with the heartbeat task so each heartbeat advertises
-        //    the CURRENT set (per-app-ULA routing — supervisor side).
+        // 6) Spawn the background tasks. `hosted_app_ulas` is shared with the
+        //    heartbeat task (advertises the CURRENT set each tick — per-app-ULA
+        //    routing). `shared_peer_id` is shared (mutable) with the heartbeat,
+        //    SSE, AND hole-punch tasks so a coordinator roster loss can swap in
+        //    the re-registered id and all three observe it. `reregister`
+        //    carries the inputs for that 404 recovery — same sticky identity
+        //    the initial join used.
         let hosted_app_ulas: Arc<dashmap::DashMap<Ipv6Addr, ()>> = Arc::default();
+        let shared_peer_id: SharedPeerId = Arc::new(tokio::sync::RwLock::new(peer_id));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let tasks = spawn_background_tasks(SpawnContext {
             socket: socket.clone(),
@@ -237,7 +236,12 @@ impl Joiner {
             tun: tun_arc.clone(),
             client: client.clone(),
             our_private: keypair.private,
-            peer_id,
+            peer_id: shared_peer_id.clone(),
+            reregister: build_reregister_inputs(
+                &config,
+                *keypair.public.as_bytes(),
+                effective_requested_ula.as_ref(),
+            ),
             my_ula,
             wg_listen_port,
             heartbeat_interval: config.heartbeat_interval,
@@ -248,6 +252,7 @@ impl Joiner {
 
         Ok(Self {
             peer_id,
+            shared_peer_id,
             my_ula,
             sessions,
             peer_info,
@@ -350,10 +355,13 @@ impl Joiner {
     /// effort — if the coordinator is unreachable we still tear down
     /// local state.
     pub async fn leave(mut self) -> anyhow::Result<()> {
-        tracing::info!(peer_id = %self.peer_id, "joiner: leaving");
+        // Deregister the LIVE id: a 404 recovery may have replaced the
+        // initial `peer_id`, and the coordinator only knows the current one.
+        let live_id = *self.shared_peer_id.read().await;
+        tracing::info!(peer_id = %live_id, "joiner: leaving");
         // Tell the coordinator first; if this fails we still want to
         // close the local fd / kill tasks.
-        if let Err(e) = self.client.deregister(self.peer_id).await {
+        if let Err(e) = self.client.deregister(live_id).await {
             tracing::warn!(error = %e, "joiner: deregister failed (continuing teardown)");
         }
         // Signal background tasks to exit.
@@ -394,7 +402,16 @@ struct SpawnContext {
     tun: Arc<dyn TunDevice>,
     client: Arc<CoordinatorClient>,
     our_private: x25519_dalek::StaticSecret,
-    peer_id: Uuid,
+    /// Shared, mutable peer id — handed to the heartbeat task (which can
+    /// replace it on a 404 re-register), the SSE consumer (which reads it
+    /// on every reconnect), and the hole-punch task (which reads it per
+    /// initiate event). After a 404 re-register all three observe the new
+    /// id: the punch task therefore filters initiate events against the
+    /// LIVE id, so post-recovery hole-punching keeps firing instead of
+    /// silently matching a dead id.
+    peer_id: SharedPeerId,
+    /// Register inputs for the heartbeat task's 404 recovery path.
+    reregister: ReregisterInputs,
     my_ula: Ipv6Addr,
     /// Our `WireGuard` UDP listen port — re-sent on every heartbeat so the
     /// coordinator can refresh our reflexive endpoint on an observed-IP
@@ -421,6 +438,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         client,
         our_private,
         peer_id,
+        reregister,
         my_ula,
         wg_listen_port,
         heartbeat_interval,
@@ -460,14 +478,17 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
     // to the hole-punch task, which fires the UDP burst (Stage 2).
     let (punch_tx, punch_rx) = mpsc::unbounded_channel::<holepunch::HolePunchInitiate>();
 
-    // SSE consumer. Passes our own `peer_id` so the coordinator returns an
-    // ACL-filtered peer stream (spec §5.3 / 5a decision #3), and the punch
-    // sender so hole-punch frames reach the punch task.
+    // SSE consumer. Passes our own (shared) `peer_id` so the coordinator
+    // returns an ACL-filtered peer stream (spec §5.3 / 5a decision #3),
+    // and the punch sender so hole-punch frames reach the punch task. The
+    // shared id lets the consumer re-subscribe to the LIVE id after a 404
+    // re-register instead of staying filtered to a dead one.
     {
         let sessions = sessions.clone();
         let our_private = our_private.clone();
         let client = client.clone();
         let shutdown_rx = shutdown_rx.clone();
+        let peer_id = peer_id.clone();
         tasks.push(tokio::spawn(async move {
             peer_sync::run(
                 client,
@@ -482,12 +503,16 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
     }
 
     // Stage 2 hole-punch task. Receives forwarded initiate events and fires
-    // handshake-init bursts at the target's reflexive endpoint. `socket` is
-    // moved in here (its last use); `sessions` is cloned because the
-    // heartbeat task below still needs the original.
+    // handshake-init bursts at the target's reflexive endpoint. It shares the
+    // SAME live `peer_id` handle as the heartbeat + SSE tasks: it reads the
+    // current id per initiate event, so a 404 re-register that swaps in a new
+    // id keeps punches firing (the coordinator keys post-recovery events to
+    // the new id). `socket` is moved in here (its last use); `sessions` is
+    // cloned because the heartbeat task below still needs the original.
     {
         let sessions = sessions.clone();
         let shutdown_rx = shutdown_rx.clone();
+        let peer_id = peer_id.clone();
         tasks.push(tokio::spawn(async move {
             holepunch::run(peer_id, socket, sessions, punch_rx, shutdown_rx).await;
         }));
@@ -502,6 +527,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
             sessions,
             our_private,
             peer_id,
+            reregister,
             wg_listen_port,
             hosted_app_ulas,
             software_version,
@@ -605,6 +631,58 @@ fn resolve_identity(
         .or_else(|| config.requested_ula.clone());
 
     Ok((keypair, sticky_ula, effective_requested_ula))
+}
+
+/// Persist the `{keypair, ULA}` identity after a FRESH join.
+///
+/// Only writes when an `identity_path` was configured AND we did not
+/// already load a sticky identity (`sticky_ula` is `None` → fresh join).
+/// On a restart with an existing file we loaded it earlier (`sticky_ula`
+/// is `Some`), so there is nothing new to write.
+///
+/// # Errors
+/// [`anyhow::Error`] when the on-disk write fails.
+fn persist_identity_if_fresh(
+    config: &JoinConfig,
+    keypair: &crate::wg::keypair::WgKeypair,
+    my_ula: Ipv6Addr,
+    sticky_ula: Option<Ipv6Addr>,
+) -> anyhow::Result<()> {
+    if let Some(id_path) = config.identity_path.as_ref()
+        && sticky_ula.is_none()
+    {
+        persistent_identity::store(id_path, keypair, my_ula)
+            .map_err(|e| anyhow::anyhow!("persist identity {}: {}", id_path.display(), e))?;
+        tracing::info!(
+            identity_path = %id_path.display(),
+            %my_ula,
+            "joiner: persisted identity (keypair + ULA)"
+        );
+    }
+    Ok(())
+}
+
+/// Build the [`ReregisterInputs`] handed to the heartbeat task for its
+/// 404-recovery path. Mirrors the arguments the INITIAL register used so a
+/// re-register requests the same sticky identity (preserving the ULA across
+/// a coordinator roster loss). `effective_requested_ula` already folds a
+/// persisted sticky ULA over any explicit `config.requested_ula`.
+fn build_reregister_inputs(
+    config: &JoinConfig,
+    our_public: [u8; 32],
+    effective_requested_ula: Option<&String>,
+) -> ReregisterInputs {
+    ReregisterInputs {
+        our_public,
+        advertise_endpoint: config.advertise_endpoint.clone(),
+        display_name: config.display_name.clone(),
+        tags: config.tags.clone(),
+        join_token: config.join_token.clone(),
+        requested_ula: effective_requested_ula.cloned(),
+        kind: config.kind.clone(),
+        parent: config.parent.clone(),
+        app_uuid: config.app_uuid.clone(),
+    }
 }
 
 /// Default location for the persistent keypair file. Used when the

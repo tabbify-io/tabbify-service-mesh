@@ -16,6 +16,7 @@
 //! reconciliation.
 
 use crate::coordinator::client::{CoordinatorClient, remote_to_info};
+use crate::coordinator::heartbeat::SharedPeerId;
 use crate::nat::holepunch::HolePunchInitiate;
 use crate::peer::{PeerEventKind, PeerRemovedPayload, RemotePeer};
 use crate::wg::session::SessionTable;
@@ -35,13 +36,18 @@ use x25519_dalek::StaticSecret;
 /// / decision #3 of phase 5a). Without it the coordinator would emit the
 /// unfiltered admin view.
 ///
+/// It is a [`SharedPeerId`] rather than a plain `Uuid` because a
+/// coordinator roster loss (404 on heartbeat) makes the heartbeat task
+/// re-register and adopt a NEW id; this consumer reads the shared value
+/// each time it (re)connects so it never stays filtered to a dead id.
+///
 /// Reconnect strategy: 1s → 2s → 5s → 10s, capped at 10s.
 pub async fn run(
     client: Arc<CoordinatorClient>,
     sessions: SessionTable,
     our_private: StaticSecret,
     punch_tx: Option<mpsc::UnboundedSender<HolePunchInitiate>>,
-    peer_id: Uuid,
+    peer_id: SharedPeerId,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let backoff = [1u64, 2, 5, 10];
@@ -56,7 +62,7 @@ pub async fn run(
             &sessions,
             &our_private,
             punch_tx.as_ref(),
-            peer_id,
+            &peer_id,
             &mut shutdown,
         )
         .await;
@@ -114,10 +120,13 @@ async fn consume_once(
     sessions: &SessionTable,
     our_private: &StaticSecret,
     punch_tx: Option<&mpsc::UnboundedSender<HolePunchInitiate>>,
-    peer_id: Uuid,
+    peer_id: &SharedPeerId,
     shutdown: &mut watch::Receiver<bool>,
 ) -> StreamOutcome {
-    let url = stream_url(client.base_url(), peer_id);
+    // Read the LIVE id at connect time: a 404 re-register may have
+    // replaced it since the last reconnect, and re-subscribing with the
+    // dead id would silently drop us into the unfiltered/empty stream.
+    let url = stream_url(client.base_url(), *peer_id.read().await);
     let resp = match client
         .http()
         .get(&url)

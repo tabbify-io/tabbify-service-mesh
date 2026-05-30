@@ -177,6 +177,25 @@ jobs:
           docker push "${IMAGE}:latest"
           docker push "${IMAGE}:${GITHUB_SHA::7}"
 
+      # `:latest`/`:<sha>` are mutable tags and may not be readable immediately
+      # after push (ECR eventual consistency). Resolve the immutable content
+      # digest for the SHA tag — with a retry loop — and GATE the redeploy on
+      # it: if no digest is confirmed this step fails and the SSM redeploy below
+      # never runs (closes bug#3, the redeploy race on a mutable tag).
+      - name: Confirm coordinator image digest
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          REPO_URI="${REGISTRY}/tabbify-coordinator"
+          ENV_FILE="$(mktemp)"
+          bash scripts/confirm-ecr-digest.sh \
+            "${REPO_URI}" "${GITHUB_SHA::7}" "${ENV_FILE}" TABBIFY_COORDINATOR_IMAGE
+          # Surface the confirmed `repo@digest` to later steps so the SSM
+          # redeploy can pin it into /opt/tabbify/.env.
+          grep '^TABBIFY_COORDINATOR_IMAGE=' "${ENV_FILE}" >> "${GITHUB_ENV}"
+
       # A new ECR image is useless until the running container pulls it. Trigger
       # the redeploy on the host via SSM send-command — no SSH, no static keys
       # (the instance role carries SSM managed-node perms; this CI role carries
@@ -186,15 +205,27 @@ jobs:
         env:
           AWS_REGION: ${{ vars.AWS_REGION }}
           REGISTRY: ${{ steps.ecr.outputs.registry }}
+          # Confirmed `repo@digest` from the digest-confirm step above. This
+          # step only runs after that gate passed, so the value is always set.
+          COORDINATOR_IMAGE: ${{ env.TABBIFY_COORDINATOR_IMAGE }}
         run: |
           set -euo pipefail
           # NOTE: SSM AWS-RunShellScript runs this with /bin/sh (dash on
           # Ubuntu), so it must be POSIX — no `pipefail`. `set -e` still aborts
           # on a failed `docker login` (empty creds -> login fails -> exit).
+          # We pin TABBIFY_COORDINATOR_IMAGE to the confirmed immutable digest
+          # in /opt/tabbify/.env; compose references ${TABBIFY_COORDINATOR_IMAGE:-<default>}
+          # (fallback added by the infra lane), so the host pulls the exact
+          # digest CI confirmed rather than the mutable :latest tag.
           DEPLOY_SCRIPT=$(cat <<EOF
           set -eu
           aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REGISTRY}
-          cd /opt/tabbify && docker compose pull && docker compose up -d
+          cd /opt/tabbify
+          touch .env
+          grep -v '^TABBIFY_COORDINATOR_IMAGE=' .env > .env.next || true
+          printf 'TABBIFY_COORDINATOR_IMAGE=%s\n' "${COORDINATOR_IMAGE}" >> .env.next
+          mv .env.next .env
+          docker compose pull && docker compose up -d
           EOF
           )
           CMD_ID=$(aws ssm send-command \
