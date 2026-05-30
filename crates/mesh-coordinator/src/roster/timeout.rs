@@ -86,6 +86,7 @@ mod tests {
                 parent: None,
                 app_uuid: None,
                 requested_ula: None,
+                software_version: None,
             })
             .await
             .expect("ok");
@@ -102,6 +103,7 @@ mod tests {
                 parent: None,
                 app_uuid: None,
                 requested_ula: None,
+                software_version: None,
             })
             .await
             .expect("ok");
@@ -110,7 +112,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         // Refresh `b`'s heartbeat so it survives the sweep.
         coord
-            .heartbeat(b.peer_id, String::new(), None, vec![])
+            .heartbeat(b.peer_id, String::new(), None, vec![], None)
             .await
             .expect("heartbeat");
 

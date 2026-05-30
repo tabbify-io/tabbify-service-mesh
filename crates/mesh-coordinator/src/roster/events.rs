@@ -61,6 +61,10 @@ pub struct PeerJoined {
     /// `#[serde(default)]` keeps older events back-compatible.
     #[serde(default)]
     pub app_uuid: Option<String>,
+    /// Software version the registrant reported (e.g. `"v1.4.0"`).
+    /// `#[serde(default)]` keeps replay / older events back-compatible.
+    #[serde(default)]
+    pub software_version: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -89,6 +93,11 @@ pub struct PeerHeartbeat {
     /// replay / older heartbeats back-compatible.
     #[serde(default)]
     pub hosted_app_ulas: Vec<String>,
+    /// Software version reported on this heartbeat. `None` (older / omitting
+    /// peer) means "no change" — the apply layer leaves the stored value
+    /// untouched. `#[serde(default)]` keeps replay back-compatible.
+    #[serde(default)]
+    pub software_version: Option<String>,
     /// Heartbeat wall-clock micros.
     pub at_micros: i64,
 }

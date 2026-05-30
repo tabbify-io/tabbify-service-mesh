@@ -88,6 +88,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             requested_ula: None,
+            software_version: None,
         }
     }
 

@@ -46,6 +46,7 @@ impl Coordinator {
         observed_external: String,
         wg_listen_port: Option<u16>,
         hosted_app_ulas: Vec<String>,
+        software_version: Option<String>,
     ) -> Result<PeerEntry, CoordinatorError> {
         // Pre-check membership so we can surface UnknownPeer without
         // emitting a heartbeat event for a peer that doesn't exist. Capture
@@ -67,6 +68,10 @@ impl Coordinator {
             // so the apply layer (and any future durable replay) replaces
             // the stored set from one source of truth.
             hosted_app_ulas,
+            // Carry the reported version through the event so the apply
+            // layer updates the stored value (when present); `None` leaves
+            // it untouched (spec P0: never a downgrade).
+            software_version,
             at_micros: now_unix_micros(),
         };
         publish_event(self.inner.publisher.as_ref(), PEER_SEGMENT, &event).await;

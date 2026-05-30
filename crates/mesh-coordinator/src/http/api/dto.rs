@@ -49,6 +49,14 @@ pub struct PeerInfo {
     /// UUID of the app this runner serves. `None` for a plain peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_uuid: Option<String>,
+    /// Reported software version of the binary this peer is running
+    /// (e.g. `"v1.4.0"`). `None` = unknown — set by the host (supervisor)
+    /// once it learns its own version; a coordinator/joiner that omits it
+    /// (older build) deserializes to `None`. `None` is NEVER a downgrade
+    /// trigger (self-update health gate, spec P0). `#[serde(default)]`
+    /// keeps the wire format back-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_version: Option<String>,
 }
 
 pub(super) fn default_kind() -> String {
@@ -113,6 +121,10 @@ pub struct RegisterRequest {
     /// `#[serde(default)]` keeps older joiners (which omit this field) working.
     #[serde(default)]
     pub requested_ula: Option<String>,
+    /// Software version the registrant is running (e.g. `"v1.4.0"`).
+    /// Host-supplied; `#[serde(default)]` → `None` for older joiners.
+    #[serde(default)]
+    pub software_version: Option<String>,
 }
 
 /// Body of `POST /v1/mesh/register` response.
@@ -160,6 +172,12 @@ pub struct HeartbeatRequest {
     /// apps.
     #[serde(default)]
     pub hosted_app_ulas: Vec<String>,
+    /// Software version the peer is currently running. Re-sent every
+    /// heartbeat so the control plane sees `actual` version drift toward
+    /// `desired` (spec P0 OBSERVE). `#[serde(default)]` → `None` for older
+    /// joiners; `None` leaves the stored value untouched.
+    #[serde(default)]
+    pub software_version: Option<String>,
 }
 
 /// Body of `POST /v1/mesh/heartbeat` response.

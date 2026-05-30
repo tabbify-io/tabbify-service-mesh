@@ -38,6 +38,7 @@ fn req_with(seed: u8, network: &str, tags: &[&str]) -> RegisterRequest {
         parent: None,
         app_uuid: None,
         requested_ula: None,
+        software_version: None,
     }
 }
 

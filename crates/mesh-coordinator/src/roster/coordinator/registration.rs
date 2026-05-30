@@ -152,6 +152,7 @@ impl Coordinator {
             kind: req.kind.clone(),
             parent: req.parent.clone(),
             app_uuid: req.app_uuid.clone(),
+            software_version: req.software_version.clone(),
         };
         // Publish first so the sink sees the event before in-memory state
         // changes; then apply the event to in-memory state from the same
@@ -265,6 +266,11 @@ impl Coordinator {
             e.kind.clone_from(&req.kind);
             e.parent.clone_from(&req.parent);
             e.app_uuid.clone_from(&req.app_uuid);
+            // A re-register refreshes the reported version when present;
+            // an omitting re-register leaves the stored value untouched.
+            if req.software_version.is_some() {
+                e.software_version.clone_from(&req.software_version);
+            }
             e.last_heartbeat = Instant::now();
             if let Some(obs) = observed {
                 e.observed_external = obs.to_string();

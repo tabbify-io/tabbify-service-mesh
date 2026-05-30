@@ -66,6 +66,7 @@ impl Coordinator {
             kind: event.kind.clone(),
             parent: event.parent.clone(),
             app_uuid: event.app_uuid.clone(),
+            software_version: event.software_version.clone(),
         };
         self.inner.roster.insert(peer_id, entry.clone());
         self.inner
@@ -100,6 +101,12 @@ impl Coordinator {
             // lives in [`Coordinator::heartbeat`], which compares before
             // and after this apply.
             entry.hosted_app_ulas.clone_from(&event.hosted_app_ulas);
+            // A heartbeat that omits the version (`None`) must NOT clobber
+            // the stored value — only a present value updates it (spec P0:
+            // `None` is unknown, never a downgrade).
+            if event.software_version.is_some() {
+                entry.software_version.clone_from(&event.software_version);
+            }
         }
     }
 
@@ -143,6 +150,7 @@ mod tests {
             kind: "peer".into(),
             parent: None,
             app_uuid: None,
+            software_version: None,
         };
         let entry = coord.apply_peer_joined(&joined).expect("apply joined");
         assert_eq!(entry.peer_index, 5);
@@ -153,6 +161,7 @@ mod tests {
             peer_id: peer_id.to_string(),
             observed_external: "203.0.113.1:51820".into(),
             hosted_app_ulas: vec![],
+            software_version: None,
             at_micros: 2,
         };
         coord.apply_peer_heartbeat(&hb);
@@ -161,6 +170,7 @@ mod tests {
             peer_id: uuid::Uuid::now_v7().to_string(),
             observed_external: String::new(),
             hosted_app_ulas: vec![],
+            software_version: None,
             at_micros: 3,
         };
         coord.apply_peer_heartbeat(&unknown_hb);
@@ -199,6 +209,7 @@ mod tests {
             kind: "peer".into(),
             parent: None,
             app_uuid: None,
+            software_version: None,
         };
         coord.apply_peer_joined(&joined).expect("apply");
         // Next live register in net7 should land on index 8.
@@ -217,6 +228,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             requested_ula: None,
+            software_version: None,
         };
         let (entry, _) = coord.register(req).await.expect("register");
         assert_eq!(entry.peer_index, 8);
@@ -238,6 +250,7 @@ mod tests {
             kind: "peer".into(),
             parent: None,
             app_uuid: None,
+            software_version: None,
         };
         let err = coord.apply_peer_joined(&bad).expect_err("bad uuid");
         assert!(matches!(

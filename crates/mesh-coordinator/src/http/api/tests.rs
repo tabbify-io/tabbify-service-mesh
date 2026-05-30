@@ -86,3 +86,35 @@ fn requests_carry_hosted_app_ulas_when_present() {
     .expect("register body parses");
     assert_eq!(reg.hosted_app_ulas, vec!["fd5a:1f02:dead:beef:cafe:0:0:1"]);
 }
+
+/// Back-compat (SV-1): an older joiner that omits `software_version`
+/// must still deserialize — the field defaults to `None`, never an
+/// error. `None` = unknown, never a downgrade trigger.
+#[test]
+fn register_request_omitting_software_version_defaults_to_none() {
+    let body = serde_json::json!({
+        "wg_public_key": "AAAA",
+        "display_name": "old-joiner",
+        "tags": []
+    });
+    let req: super::dto::RegisterRequest =
+        serde_json::from_value(body).expect("old register body must still parse");
+    assert_eq!(req.software_version, None);
+}
+
+/// A `PeerInfo` roster entry emitted by an older coordinator omits the
+/// field; the joiner / any consumer must read it back as `None`.
+#[test]
+fn peer_info_omitting_software_version_defaults_to_none() {
+    let body = serde_json::json!({
+        "peer_id": "01910f10-0000-7000-8000-000000000001",
+        "wg_public_key": "AAAA",
+        "ula": "fd5a:1f00:1::1",
+        "display_name": "p",
+        "tags": [],
+        "joined_at_micros": 0
+    });
+    let info: super::dto::PeerInfo =
+        serde_json::from_value(body).expect("old roster entry must still parse");
+    assert_eq!(info.software_version, None);
+}

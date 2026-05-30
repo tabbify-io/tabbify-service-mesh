@@ -36,6 +36,7 @@ fn req(seed: u8, name: &str) -> RegisterRequest {
         parent: None,
         app_uuid: None,
         requested_ula: None,
+        software_version: None,
     }
 }
 
@@ -82,6 +83,7 @@ async fn heartbeat_updates_only_known_peers() {
             "203.0.113.1:51820".into(),
             Some(51820),
             vec![],
+            None,
         )
         .await
         .expect("heartbeat");
@@ -89,7 +91,7 @@ async fn heartbeat_updates_only_known_peers() {
 
     let bogus = Uuid::now_v7();
     let err = c
-        .heartbeat(bogus, "ignored".into(), None, vec![])
+        .heartbeat(bogus, "ignored".into(), None, vec![], None)
         .await
         .expect_err("unknown peer");
     assert!(matches!(err, CoordinatorError::UnknownPeer(_)));
@@ -140,6 +142,7 @@ async fn invalid_pubkey_length_is_rejected() {
             parent: None,
             app_uuid: None,
             requested_ula: None,
+            software_version: None,
         })
         .await
         .expect_err("invalid pubkey");
@@ -241,6 +244,7 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
         "203.0.113.10:11111".into(),
         Some(51820),
         vec![],
+        None,
     )
     .await
     .expect("a hb1");
@@ -256,6 +260,7 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
         "198.51.100.20:22222".into(),
         Some(51820),
         vec![],
+        None,
     )
     .await
     .expect("b hb1");
@@ -298,6 +303,7 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
         "203.0.113.10:11111".into(),
         Some(51820),
         vec![],
+        None,
     )
     .await
     .expect("a hb2");
@@ -326,6 +332,7 @@ async fn heartbeat_broadcasts_holepunch_pair_to_sse_subscribers() {
         "203.0.113.70:11111".into(),
         Some(51820),
         vec![],
+        None,
     )
     .await
     .expect("a hb");
@@ -334,6 +341,7 @@ async fn heartbeat_broadcasts_holepunch_pair_to_sse_subscribers() {
         "198.51.100.71:22222".into(),
         Some(51820),
         vec![],
+        None,
     )
     .await
     .expect("b hb");
@@ -373,7 +381,7 @@ async fn heartbeat_does_not_emit_when_one_peer_lacks_external() {
 
     // Alice heartbeats with a known external — bob never heartbeats,
     // so its observed_external stays empty.
-    c.heartbeat(alice.peer_id, "203.0.113.30:33333".into(), None, vec![])
+    c.heartbeat(alice.peer_id, "203.0.113.30:33333".into(), None, vec![], None)
         .await
         .expect("a hb");
 
@@ -393,14 +401,14 @@ async fn heartbeat_with_empty_external_skips_emit() {
     let (bob, _) = c.register(req(61, "bob")).await.expect("b");
 
     // Alice gets an external on heartbeat 1.
-    c.heartbeat(alice.peer_id, "203.0.113.50:44444".into(), None, vec![])
+    c.heartbeat(alice.peer_id, "203.0.113.50:44444".into(), None, vec![], None)
         .await
         .expect("a hb");
 
     // Bob heartbeats but ConnectInfo wasn't captured — empty string.
     // This mirrors the test-router path that drives via Router::call
     // without the make_service wrapper.
-    c.heartbeat(bob.peer_id, String::new(), None, vec![])
+    c.heartbeat(bob.peer_id, String::new(), None, vec![], None)
         .await
         .expect("b hb empty external");
 
@@ -465,6 +473,7 @@ async fn register_preserves_public_self_report_over_reflexive() {
         parent: None,
         app_uuid: None,
         requested_ula: None,
+        software_version: None,
     };
     let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
     let (entry, _) = c
@@ -512,6 +521,7 @@ async fn heartbeat_rolls_reflexive_endpoint_over_on_ip_change() {
             "198.51.100.99:60000".into(),
             Some(51820),
             vec![],
+            None,
         )
         .await
         .expect("heartbeat");
@@ -540,6 +550,7 @@ async fn heartbeat_preserves_public_advertised_endpoint() {
         parent: None,
         app_uuid: None,
         requested_ula: None,
+        software_version: None,
     };
     let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
     let (entry, _) = c
@@ -553,6 +564,7 @@ async fn heartbeat_preserves_public_advertised_endpoint() {
             "203.0.113.7:34900".into(),
             Some(51820),
             vec![],
+            None,
         )
         .await
         .expect("heartbeat");
@@ -583,6 +595,7 @@ async fn heartbeat_promotes_loopback_fallback_to_reflexive() {
             "203.0.113.7:34812".into(),
             Some(51820),
             vec![],
+            None,
         )
         .await
         .expect("heartbeat");
@@ -677,6 +690,7 @@ async fn heartbeat_replaces_hosted_app_ula_set() {
             "203.0.113.1:51820".into(),
             Some(51820),
             vec![app_b.to_owned()],
+            None,
         )
         .await
         .expect("heartbeat");
@@ -693,6 +707,7 @@ async fn heartbeat_replaces_hosted_app_ula_set() {
             "203.0.113.1:51820".into(),
             Some(51820),
             vec![],
+            None,
         )
         .await
         .expect("heartbeat clear");
@@ -715,6 +730,7 @@ async fn heartbeat_broadcasts_updated_with_new_hosted_set() {
         "203.0.113.1:51820".into(),
         Some(51820),
         vec![app_a.to_owned()],
+        None,
     )
     .await
     .expect("heartbeat");
@@ -927,4 +943,61 @@ async fn register_fallback_to_idx_when_no_requested_ula() {
     assert_ne!(p1.ula, p2.ula);
     assert_eq!(p1.peer_index, 1);
     assert_eq!(p2.peer_index, 2);
+}
+
+/// SV-1: a register carrying `software_version` stores it on the entry,
+/// surfaces it in the snapshot, and broadcasts it on `peer_added`.
+/// A subsequent heartbeat with a new value updates the stored version
+/// and re-broadcasts it on `peer_updated`. `None` on heartbeat leaves
+/// the stored value untouched (never a downgrade).
+#[tokio::test]
+async fn software_version_is_stored_and_broadcast() {
+    let c = coordinator();
+    let mut rx = c.broadcaster().subscribe();
+
+    let mut r = req(200, "versioned");
+    r.software_version = Some("v1.4.0".to_owned());
+    let (entry, _) = c.register(r).await.expect("register");
+    assert_eq!(entry.software_version.as_deref(), Some("v1.4.0"));
+    assert_eq!(
+        c.snapshot()[0].software_version.as_deref(),
+        Some("v1.4.0"),
+        "snapshot must carry the version"
+    );
+    match rx.try_recv().expect("peer_added broadcast") {
+        PeerEvent::Added(info) => {
+            assert_eq!(info.software_version.as_deref(), Some("v1.4.0"));
+        }
+        other => panic!("expected Added, got {other:?}"),
+    }
+
+    // Heartbeat reports a newer version → stored value updates + rebroadcast.
+    let after = c
+        .heartbeat(
+            entry.peer_id,
+            String::new(),
+            Some(51820),
+            vec![],
+            Some("v1.5.0".to_owned()),
+        )
+        .await
+        .expect("heartbeat");
+    assert_eq!(after.software_version.as_deref(), Some("v1.5.0"));
+    match rx.try_recv().expect("peer_updated broadcast") {
+        PeerEvent::Updated(info) => {
+            assert_eq!(info.software_version.as_deref(), Some("v1.5.0"));
+        }
+        other => panic!("expected Updated, got {other:?}"),
+    }
+
+    // A heartbeat that omits the version (None) must NOT wipe it.
+    let kept = c
+        .heartbeat(entry.peer_id, String::new(), Some(51820), vec![], None)
+        .await
+        .expect("heartbeat none");
+    assert_eq!(
+        kept.software_version.as_deref(),
+        Some("v1.5.0"),
+        "None on heartbeat must not clear the stored version"
+    );
 }

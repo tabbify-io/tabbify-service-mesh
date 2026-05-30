@@ -166,7 +166,13 @@ pub async fn heartbeat_handler(
     let observed_addr = connect_info.as_ref().map(|c| c.0);
     let observed = observed_addr.map(|a| a.to_string()).unwrap_or_default();
     match coordinator
-        .heartbeat(peer_id, observed, req.wg_listen_port, req.hosted_app_ulas)
+        .heartbeat(
+            peer_id,
+            observed,
+            req.wg_listen_port,
+            req.hosted_app_ulas,
+            req.software_version,
+        )
         .await
     {
         Ok(entry) => {

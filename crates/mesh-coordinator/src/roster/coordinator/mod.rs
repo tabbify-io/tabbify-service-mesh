@@ -101,6 +101,11 @@ pub struct PeerEntry {
     pub parent: Option<String>,
     /// UUID of the app this runner serves. `None` for plain peers.
     pub app_uuid: Option<String>,
+    /// Software version this peer reports running (e.g. `"v1.4.0"`).
+    /// `None` = unknown. Set on register, refreshed on re-register and on
+    /// every heartbeat that carries a value; a heartbeat with `None` leaves
+    /// it untouched (never a downgrade trigger — spec P0).
+    pub software_version: Option<String>,
 }
 
 impl PeerEntry {
@@ -125,6 +130,7 @@ impl PeerEntry {
             kind: self.kind.clone(),
             parent: self.parent.clone(),
             app_uuid: self.app_uuid.clone(),
+            software_version: self.software_version.clone(),
         }
     }
 }
