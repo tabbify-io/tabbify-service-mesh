@@ -457,6 +457,7 @@ mod tests {
             display_name: "peer".into(),
             tags: vec![],
             hosted_app_ulas: vec![],
+            software_version: None,
             joined_at_micros: 0,
         };
         let t = SessionTable::new();
@@ -555,6 +556,7 @@ mod tests {
             display_name: "host".into(),
             tags: vec![],
             hosted_app_ulas: vec![app],
+            software_version: None,
             joined_at_micros: 0,
         };
         let t = SessionTable::new();
@@ -584,6 +586,7 @@ mod tests {
             display_name: "host".into(),
             tags: vec![],
             hosted_app_ulas: vec![],
+            software_version: None,
             joined_at_micros: 0,
         };
         let t = SessionTable::new();

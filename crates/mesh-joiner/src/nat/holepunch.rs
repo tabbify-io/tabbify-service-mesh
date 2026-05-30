@@ -218,6 +218,7 @@ mod tests {
             display_name: "target".into(),
             tags: vec![],
             hosted_app_ulas: vec![],
+            software_version: None,
             joined_at_micros: 0,
         };
         t.upsert(&me, &info);

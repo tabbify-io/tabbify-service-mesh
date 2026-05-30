@@ -39,6 +39,10 @@ pub struct PeerInfo {
     /// Empty for a peer that hosts no apps (the common case).
     #[serde(default)]
     pub hosted_app_ulas: Vec<Ipv6Addr>,
+    /// Software version this peer reports running (e.g. `"v1.4.0"`),
+    /// parsed straight through from the coordinator roster. `None` =
+    /// unknown (older coordinator omitting the field).
+    pub software_version: Option<String>,
     /// Coordinator-stamped microseconds-since-epoch.
     pub joined_at_micros: i64,
 }
@@ -67,6 +71,11 @@ pub struct RemotePeer {
     /// working — the peer is then treated as hosting no apps.
     #[serde(default)]
     pub hosted_app_ulas: Vec<String>,
+    /// Software version the coordinator advertises for this peer. `None`
+    /// from an older coordinator that omits it. `#[serde(default)]` keeps
+    /// the wire format back-compatible.
+    #[serde(default)]
+    pub software_version: Option<String>,
     /// Microseconds-since-epoch as stamped by the coordinator.
     pub joined_at_micros: i64,
 }
@@ -147,5 +156,23 @@ mod tests {
             PeerEventKind::from_event_name("holepunch_initiate"),
             Some(PeerEventKind::HolePunch)
         );
+    }
+
+    /// Back-compat (SV-1): a roster entry from an older coordinator omits
+    /// `software_version`; `RemotePeer` must deserialize it as `None`,
+    /// never error. `None` = unknown.
+    #[test]
+    fn remote_peer_omitting_software_version_defaults_to_none() {
+        let body = serde_json::json!({
+            "peer_id": "01910f10-0000-7000-8000-000000000001",
+            "wg_public_key": "AAAA",
+            "ula": "fd5a:1f00:1::1",
+            "display_name": "p",
+            "tags": [],
+            "joined_at_micros": 0
+        });
+        let r: RemotePeer =
+            serde_json::from_value(body).expect("old roster entry must still parse");
+        assert_eq!(r.software_version, None);
     }
 }

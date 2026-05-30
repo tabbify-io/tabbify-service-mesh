@@ -287,6 +287,7 @@ mod tests {
             display_name: format!("peer-{n}"),
             tags: vec![],
             hosted_app_ulas: vec![],
+            software_version: None,
             joined_at_micros: 0,
         })
         .unwrap()
@@ -488,6 +489,7 @@ mod tests {
             display_name: format!("peer-{n}"),
             tags: vec![],
             hosted_app_ulas: hosted.iter().map(|s| (*s).to_owned()).collect(),
+            software_version: None,
             joined_at_micros: 0,
         })
         .unwrap()

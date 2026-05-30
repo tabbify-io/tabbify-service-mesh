@@ -50,6 +50,7 @@ async fn remote_to_info_parses_full_record() {
         display_name: "alice".into(),
         tags: vec!["dev".into()],
         hosted_app_ulas: vec![],
+        software_version: None,
         joined_at_micros: 1_700_000_000_000_000,
     };
     let info = remote_to_info(&remote).await.unwrap();
@@ -78,6 +79,7 @@ async fn remote_to_info_parses_hosted_app_ulas() {
             "fd5a:1f02:dead:beef:cafe:0:0:1".into(),
             "fd5a:1f02:dead:beef:cafe:0:0:2".into(),
         ],
+        software_version: None,
         joined_at_micros: 0,
     };
     let info = remote_to_info(&remote).await.unwrap();
@@ -111,6 +113,7 @@ async fn remote_to_info_skips_malformed_hosted_app_ula() {
             "not-an-ipv6".into(),
             "fd5a:1f02:dead:beef:cafe:0:0:9".into(),
         ],
+        software_version: None,
         joined_at_micros: 0,
     };
     let info = remote_to_info(&remote).await.unwrap();
@@ -139,6 +142,7 @@ async fn remote_to_info_treats_empty_endpoint_as_none() {
         display_name: "bob".into(),
         tags: vec![],
         hosted_app_ulas: vec![],
+        software_version: None,
         joined_at_micros: 0,
     };
     let info = remote_to_info(&remote).await.unwrap();
@@ -156,6 +160,7 @@ async fn remote_to_info_rejects_bad_ula() {
         display_name: "x".into(),
         tags: vec![],
         hosted_app_ulas: vec![],
+        software_version: None,
         joined_at_micros: 0,
     };
     let err = remote_to_info(&remote).await.unwrap_err();

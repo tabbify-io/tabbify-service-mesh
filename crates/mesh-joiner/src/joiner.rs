@@ -653,6 +653,7 @@ fn synth_info(s: &PeerSession) -> PeerInfo {
         // from a `PeerSession` alone, so report none. The next roster
         // upsert re-applies the real set.
         hosted_app_ulas: Vec::new(),
+        software_version: None,
         joined_at_micros: 0,
     }
 }
@@ -675,6 +676,7 @@ mod tests {
             display_name: "irrelevant".into(),
             tags: vec![],
             hosted_app_ulas: vec![],
+            software_version: None,
             joined_at_micros: 0,
         };
         let table = SessionTable::new();
