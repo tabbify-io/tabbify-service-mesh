@@ -109,20 +109,58 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Upload binaries and bootstrap.sh to S3
-        # Each artifact lands under the mesh/ prefix so bootstrap.sh can
-        # fetch them from a single, predictable base URL.
+        # Legacy overwrite-latest keys (compat aliases) + versioned layout
+        # (<family>/v<SEMVER>/<arch>/<binaries> + sibling `latest` manifest)
+        # when building a v* tag. Old hosts keep reading mesh/<bin>; the
+        # self-updater reads mesh/v<SEMVER>/... + mesh/latest (spec P0).
+        env:
+          BUCKET: ${{ vars.RELEASE_S3_BUCKET }}
         run: |
           set -euo pipefail
           BIN_DIR="target/${TARGET}/release"
-          DEST="s3://${{ vars.RELEASE_S3_BUCKET }}/mesh"
+          DEST="s3://${BUCKET}/mesh"
+          ARCH="${TARGET%%-*}"   # x86_64-unknown-linux-musl -> x86_64
 
+          # 1) LEGACY overwrite-latest keys (compatibility aliases).
           for bin in tabbify-mesh-coordinator tabbify-mesh tabbify-mesh-ca; do
-            echo "Uploading ${bin}..."
+            echo "Uploading legacy alias ${bin}..."
             aws s3 cp "${BIN_DIR}/${bin}" "${DEST}/${bin}"
           done
-
           echo "Uploading bootstrap.sh..."
           aws s3 cp bootstrap.sh "${DEST}/bootstrap.sh"
+
+          # 2) VERSIONED layout — only on a v* tag (SEMVER source = git tag).
+          REF="${GITHUB_REF#refs/tags/}"
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              SEMVER="${REF}"   # e.g. v1.4.0
+              VDEST="${DEST}/${SEMVER}/${ARCH}"
+              echo "Uploading versioned binaries to ${VDEST}..."
+              SHA_MESH=$(sha256sum "${BIN_DIR}/tabbify-mesh"    | cut -d' ' -f1)
+              SHA_CA=$(  sha256sum "${BIN_DIR}/tabbify-mesh-ca" | cut -d' ' -f1)
+              aws s3 cp "${BIN_DIR}/tabbify-mesh"    "${VDEST}/tabbify-mesh"
+              aws s3 cp "${BIN_DIR}/tabbify-mesh-ca" "${VDEST}/tabbify-mesh-ca"
+
+              # TODO(P3+): `versions` currently lists only the current tag.
+              # Full history aggregation (merge with the previous `latest`
+              # manifest) is a separate task; for P0 a single-element list
+              # is sufficient.
+              TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              MANIFEST=$(jq -n \
+                --arg latest "${SEMVER}" \
+                --arg sha_mesh "${SHA_MESH}" \
+                --arg sha_ca   "${SHA_CA}" \
+                --arg ts "${TS}" \
+                '{latest:$latest, versions:[$latest],
+                  sha256:{"tabbify-mesh":$sha_mesh,"tabbify-mesh-ca":$sha_ca},
+                  ts:$ts}')
+              echo "${MANIFEST}" | aws s3 cp - "${DEST}/latest" --content-type application/json
+              echo "Wrote ${DEST}/latest:"; echo "${MANIFEST}"
+              ;;
+            *)
+              echo "Not a v* tag (${GITHUB_REF}) — skipping versioned upload."
+              ;;
+          esac
 
       # The coordinator (pure HTTP, no TUN) also ships as a container image for
       # the service host. joiner/CA stay as S3 binaries above (host TUN). The
