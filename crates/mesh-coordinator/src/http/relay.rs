@@ -1,7 +1,7 @@
 //! `GET /v1/mesh/relay` — DERP-style WebSocket relay endpoint.
 //!
 //! Each joiner keeps one persistent `WebSocket` to this endpoint keyed by its
-//! `WireGuard` public key (`?pubkey=<base64-STANDARD>`). It forwards opaque,
+//! `WireGuard` public key (`?pubkey=<base64url (URL-safe, no padding)>`). It forwards opaque,
 //! already-`WireGuard`-encrypted frames by destination pubkey: an uplink frame
 //! `{dst_pubkey, payload}` from connection `S` is rewritten to `{src=S, payload}`
 //! and delivered to `dst`'s connection, so the receiver demuxes by source. The
@@ -18,7 +18,12 @@
 //! claimed pubkey must still resolve to a registered peer.
 
 use crate::relay::{decode_relay_frame, encode_relay_frame};
-use crate::roster::coordinator::{Coordinator, decode_pubkey};
+use crate::roster::coordinator::Coordinator;
+use base64::Engine as _;
+// base64url (no padding): the pubkey rides in the URL query, where standard
+// base64's `+`/`/` are unsafe (`+` decodes to a space). The joiner encodes the
+// `?pubkey=` value with the SAME alphabet — keep these two in lockstep.
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
@@ -34,7 +39,7 @@ const RELAY_PING_INTERVAL: Duration = Duration::from_secs(15);
 /// Query string for the relay upgrade: the connecting peer's WG public key.
 #[derive(serde::Deserialize)]
 pub struct RelayQuery {
-    /// base64-STANDARD of the connecting peer's 32-byte WG public key.
+    /// base64url (URL-safe, no padding) of the connecting peer's 32-byte WG public key.
     pubkey: String,
 }
 
@@ -69,7 +74,7 @@ pub fn route_uplink(coordinator: &Coordinator, my_pubkey: &[u8; 32], buf: &[u8])
     tag = "mesh",
     params(
         ("pubkey" = String, Query,
-            description = "base64-STANDARD of the connecting peer's 32-byte WireGuard public key. This is a WebSocket upgrade endpoint (documented as GET; OpenAPI cannot model the WS protocol). The connection relays opaque, already-encrypted WireGuard frames by destination pubkey; every forward is ACL-gated by the same policy as direct sessions."),
+            description = "base64url (URL-safe, no padding) of the connecting peer's 32-byte WireGuard public key. This is a WebSocket upgrade endpoint (documented as GET; OpenAPI cannot model the WS protocol). The connection relays opaque, already-encrypted WireGuard frames by destination pubkey; every forward is ACL-gated by the same policy as direct sessions."),
     ),
     responses(
         (status = 101, description = "Switching Protocols — WebSocket relay established."),
@@ -82,7 +87,7 @@ pub async fn relay_ws_handler(
     Query(q): Query<RelayQuery>,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
-    let Ok(pubkey_bytes) = decode_pubkey(&q.pubkey) else {
+    let Ok(pubkey_bytes) = B64URL.decode(&q.pubkey) else {
         return (axum::http::StatusCode::BAD_REQUEST, "bad pubkey").into_response();
     };
     let Ok(my_pubkey): Result<[u8; 32], _> = pubkey_bytes.try_into() else {
@@ -149,7 +154,6 @@ mod tests {
     use crate::http::api::RegisterRequest;
     use crate::policy::{AclRule, Policy, PolicyStore};
     use crate::publisher::NoopPublisher;
-    use base64::Engine as _;
     use std::sync::Arc;
     use std::time::Duration;
 

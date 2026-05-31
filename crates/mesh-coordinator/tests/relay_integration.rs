@@ -41,8 +41,18 @@ const fn raw_pubkey(seed: u8) -> [u8; 32] {
     [seed; 32]
 }
 
+/// Standard base64 — what the JSON `register` body carries (matches the
+/// coordinator's register decode).
 fn pubkey_b64(seed: u8) -> String {
     base64::engine::general_purpose::STANDARD.encode(raw_pubkey(seed))
+}
+
+/// base64url, no padding — what the relay WS `?pubkey=` query carries (the
+/// URL-safe alphabet the joiner uses; standard base64's `+`/`/` would be
+/// mangled in a URL query). Seed `0xFB` exercises this: its STANDARD base64
+/// starts `+/v7...`, so a relay URL built with the wrong alphabet would 400.
+fn pubkey_b64url(seed: u8) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw_pubkey(seed))
 }
 
 /// Policy mirroring `policy_acl.rs`: A (`tag:user-a`) and B (`tag:svc`) are
@@ -110,7 +120,7 @@ async fn open_relay(
 > {
     let url = format!(
         "ws://{addr}/v1/mesh/relay?pubkey={}",
-        pubkey_b64(seed)
+        pubkey_b64url(seed)
     );
     let (ws, _resp) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(url))
         .await
@@ -186,6 +196,30 @@ async fn relay_denies_isolated_peer() {
         result.is_err(),
         "ACL-denied frame must not be delivered; A unexpectedly received: {result:?}"
     );
+}
+
+/// A pubkey whose STANDARD base64 contains `+` and `/` (seed `0xFB` → `+/v7…`)
+/// must still connect over the relay. The `?pubkey=` query uses base64url, so
+/// no URL-unsafe character reaches the wire. Regression guard for the bug where
+/// the joiner put standard base64 in the URL and the coordinator's `Query`
+/// extractor decoded `+` as a space → base64 decode failed → 400.
+#[tokio::test]
+async fn relay_ws_accepts_url_unsafe_pubkey() {
+    // Sanity: this seed's STANDARD base64 really does exercise + and /.
+    let std_b64 = base64::engine::general_purpose::STANDARD.encode(raw_pubkey(0xFB));
+    assert!(
+        std_b64.contains('+') && std_b64.contains('/'),
+        "test seed must exercise + and / (got {std_b64})"
+    );
+
+    let (addr, _s) = spawn().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let _ = register(&client, &base, 0xFB, "k", "a", &["tag:user-a"]).await;
+
+    // Connects with the base64url ?pubkey=; must upgrade (no 400). If the URL
+    // alphabet were wrong, `open_relay`'s `connect_async` would error and panic.
+    let _ws = open_relay(addr, 0xFB).await;
 }
 
 /// Read the next BINARY frame from a relay WS, skipping protocol pings/pongs

@@ -8,7 +8,11 @@ use crate::relay::frame::{decode_relay_frame, encode_relay_frame};
 use crate::wg::loops::process_inbound_datagram;
 use crate::wg::session::SessionTable;
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
+// base64url (no padding) for the `?pubkey=` query: standard base64's `+` and
+// `/` are unsafe in a URL — `+` decodes to a space in a query string — so the
+// coordinator's `Query` extractor would receive a mangled key and reject it.
+// base64url uses only `-_` plus alphanumerics, safe to drop straight into a URL.
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,7 +126,7 @@ pub async fn run(mut task: RelayTask) {
     }
 
     let base = derive_relay_url(&task.coordinator_url, task.relay_url.as_deref());
-    let pubkey_q = B64.encode(task.my_pubkey);
+    let pubkey_q = B64URL.encode(task.my_pubkey);
     let url = format!("{base}?pubkey={pubkey_q}");
 
     let backoff = [1u64, 2, 5, 10];
