@@ -236,9 +236,12 @@ async fn handle_inbound(task: &RelayTask, buf: &[u8]) {
         tracing::trace!("relay: inbound frame for unknown source pubkey, dropping");
         return;
     };
+    // `via_direct = false`: a relayed packet must NEVER confirm or refresh
+    // a DIRECT path — only true UDP RX can prove the direct route works.
     process_inbound_datagram(
         &task.socket,
         task.sessions.relay(),
+        false,
         &task.tun,
         &session,
         payload,

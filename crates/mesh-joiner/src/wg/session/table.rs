@@ -22,6 +22,7 @@ use rand_core::{OsRng, RngCore};
 use std::collections::HashSet;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -355,6 +356,12 @@ impl SessionTable {
             peer_pubkey: info.wg_public_key,
             allowed_ips: parking_lot::RwLock::new(allowed_ips_for(info)),
             endpoint: parking_lot::RwLock::new(info.listen_endpoint),
+            // A fresh session always starts UNCONFIRMED — even a re-upsert
+            // (endpoint roam / re-handshake) must re-prove the direct path
+            // before TX leaves the relay floor. The advertised endpoint is
+            // only a candidate until a decrypted data packet confirms it.
+            direct_confirmed: AtomicBool::new(false),
+            last_direct_rx_micros: AtomicI64::new(0),
             tunn: Mutex::new(tunn),
         });
         // Re-apply any app-ULAs this peer already hosts onto the FRESH

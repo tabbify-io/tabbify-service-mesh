@@ -9,7 +9,19 @@ use crate::peer::PeerInfo;
 use boringtun::noise::Tunn;
 use std::collections::HashSet;
 use std::net::{Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::Mutex;
+
+/// How long a confirmed-direct path may go without a VALID inbound UDP
+/// datagram before we downgrade it back to the relay floor.
+///
+/// 35 s is deliberately comfortably above `WireGuard`'s 25 s persistent
+/// keepalive (`WG_PERSISTENT_KEEPALIVE_SECS`): a live-but-idle direct path
+/// keeps refreshing `last_direct_rx_micros` via those keepalives, so it
+/// never false-downgrades. Once the path actually dies (NAT rebind / SG
+/// change) no keepalives arrive, the timestamp ages past this TTL, and the
+/// next `downgrade_direct_if_stale` falls the session back to the relay.
+pub const DIRECT_PATH_TTL_MICROS: i64 = 35_000_000;
 
 /// One peer's encryption state + routing metadata.
 pub struct PeerSession {
@@ -43,6 +55,21 @@ pub struct PeerSession {
     /// a packet from a new source address (`WireGuard`'s roaming
     /// behaviour — peer's NAT mapping changes, we follow).
     pub endpoint: parking_lot::RwLock<Option<SocketAddr>>,
+    /// `true` once a CONFIRMED-working direct path to this peer exists —
+    /// i.e. a decrypted DATA packet (`boringtun`'s `DeliverToTun`) has
+    /// arrived over UDP, proving the direct path works BIDIRECTIONALLY (the
+    /// sender only emits data after ITS handshake completed, which required
+    /// our response to reach it). Until then `endpoint` is only a
+    /// CANDIDATE and the TX path uses the relay floor. A lone handshake
+    /// init/response must NEVER set this — it can arrive directly even when
+    /// the return path is blocked, which would falsely upgrade.
+    pub direct_confirmed: AtomicBool,
+    /// Unix-micros of the last VALID inbound UDP datagram from this peer
+    /// (any valid `WireGuard` packet, incl. keepalives). Drives the
+    /// staleness downgrade: a confirmed path that stops receiving for
+    /// longer than `DIRECT_PATH_TTL_MICROS` is downgraded back to the
+    /// relay. `0` means "never seen a valid direct datagram".
+    pub last_direct_rx_micros: AtomicI64,
     /// Boringtun session state. Wrapped in a tokio Mutex so async
     /// send + receive halves can serialise access without holding a
     /// guard across socket I/O.
@@ -54,6 +81,44 @@ impl PeerSession {
     /// guard which is contention-free against other readers.
     pub fn endpoint(&self) -> Option<SocketAddr> {
         *self.endpoint.read()
+    }
+
+    /// `true` iff a confirmed-working direct path exists. The TX hot path
+    /// reads this on every send to decide direct-vs-relay; a relaxed load
+    /// is fine because the worst case of a stale read is one extra packet
+    /// over the wrong path.
+    pub fn direct_confirmed(&self) -> bool {
+        self.direct_confirmed.load(Ordering::Relaxed)
+    }
+
+    /// Refresh the last-valid-RX timestamp. Called on ANY valid inbound UDP
+    /// datagram (incl. `WireGuard` keepalives), so a confirmed-but-idle
+    /// direct path keeps its staleness clock fresh and never
+    /// false-downgrades. Does NOT confirm the path — only
+    /// `confirm_direct` does.
+    pub fn note_direct_rx(&self, now_micros: i64) {
+        self.last_direct_rx_micros.store(now_micros, Ordering::Relaxed);
+    }
+
+    /// THE upgrade signal: a decrypted DATA packet arrived over UDP,
+    /// proving the direct path works bidirectionally. Mark the path
+    /// confirmed AND refresh the staleness clock. Called ONLY from the
+    /// `DeliverToTun` path on a direct (non-relayed) datagram.
+    pub fn confirm_direct(&self, now_micros: i64) {
+        self.direct_confirmed.store(true, Ordering::Relaxed);
+        self.last_direct_rx_micros.store(now_micros, Ordering::Relaxed);
+    }
+
+    /// Downgrade a confirmed path back to the relay floor if it has gone
+    /// silent for longer than `ttl_micros` (NAT rebind / path death). A
+    /// no-op when the path is already unconfirmed or still fresh. Called
+    /// from the timer loop on every tick.
+    pub fn downgrade_direct_if_stale(&self, now_micros: i64, ttl_micros: i64) {
+        if self.direct_confirmed.load(Ordering::Relaxed)
+            && now_micros - self.last_direct_rx_micros.load(Ordering::Relaxed) > ttl_micros
+        {
+            self.direct_confirmed.store(false, Ordering::Relaxed);
+        }
     }
 
     /// `true` iff `source` is one of the `/128`s this peer is allowed to
@@ -106,7 +171,98 @@ impl std::fmt::Debug for PeerSession {
             .field("peer_pubkey", &"<pubkey>")
             .field("allowed_ips", &self.allowed_ips.read())
             .field("endpoint", &self.endpoint())
+            .field("direct_confirmed", &self.direct_confirmed())
+            .field(
+                "last_direct_rx_micros",
+                &self.last_direct_rx_micros.load(Ordering::Relaxed),
+            )
             .field("tunn", &"<Tunn>")
             .finish()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use boringtun::noise::Tunn;
+    use std::sync::atomic::{AtomicBool, AtomicI64};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    /// Build a bare `PeerSession` (no endpoint, empty allowed-set) for
+    /// exercising the direct-path confirmation state machine in isolation.
+    fn bare_session() -> PeerSession {
+        PeerSession {
+            peer_id: uuid::Uuid::nil(),
+            ula: "fd5a:1f00:1::1".parse().unwrap(),
+            peer_pubkey: [0u8; 32],
+            allowed_ips: parking_lot::RwLock::new(HashSet::new()),
+            endpoint: parking_lot::RwLock::new(None),
+            direct_confirmed: AtomicBool::new(false),
+            last_direct_rx_micros: AtomicI64::new(0),
+            tunn: Mutex::new(Tunn::new(
+                StaticSecret::from([1u8; 32]),
+                PublicKey::from(&StaticSecret::from([2u8; 32])),
+                None,
+                None,
+                7,
+                None,
+            )),
+        }
+    }
+
+    /// A fresh session starts UNCONFIRMED — the relay is the floor until a
+    /// direct data packet proves the path works both ways.
+    #[test]
+    fn direct_confirmed_defaults_false() {
+        let s = bare_session();
+        assert!(!s.direct_confirmed());
+    }
+
+    /// `confirm_direct` is the upgrade signal: it flips the bool true.
+    #[test]
+    fn confirm_direct_sets_confirmed() {
+        let s = bare_session();
+        s.confirm_direct(1_000);
+        assert!(s.direct_confirmed());
+    }
+
+    /// `note_direct_rx` alone (a keepalive / handshake over UDP) refreshes
+    /// staleness but must NOT confirm — only real data confirms.
+    #[test]
+    fn note_direct_rx_does_not_confirm() {
+        let s = bare_session();
+        s.note_direct_rx(1_000);
+        assert!(!s.direct_confirmed());
+    }
+
+    /// `downgrade_direct_if_stale` resets a confirmed path AFTER the TTL
+    /// elapses (NAT rebind / path death), but NOT before — a live path
+    /// whose RX timestamp is fresh stays confirmed.
+    #[test]
+    fn downgrade_only_after_ttl() {
+        let s = bare_session();
+        s.confirm_direct(1_000); // last_direct_rx = 1_000
+        // Not stale yet: within the TTL window.
+        s.downgrade_direct_if_stale(1_000 + DIRECT_PATH_TTL_MICROS, DIRECT_PATH_TTL_MICROS);
+        assert!(s.direct_confirmed(), "must stay confirmed within the TTL");
+        // Stale: past the TTL window → fall back to relay.
+        s.downgrade_direct_if_stale(1_000 + DIRECT_PATH_TTL_MICROS + 1, DIRECT_PATH_TTL_MICROS);
+        assert!(!s.direct_confirmed(), "must downgrade once the TTL is exceeded");
+    }
+
+    /// A keepalive refresh (`note_direct_rx`) keeps a confirmed-but-idle
+    /// path alive: with periodic refreshes inside the TTL it never
+    /// false-downgrades.
+    #[test]
+    fn keepalive_refresh_prevents_false_downgrade() {
+        let s = bare_session();
+        s.confirm_direct(0);
+        // A WG keepalive lands well within the TTL, refreshing the clock.
+        s.note_direct_rx(DIRECT_PATH_TTL_MICROS - 1);
+        // "Now" is past the original confirm + TTL, but the refresh moved
+        // the window forward, so the path is still live.
+        s.downgrade_direct_if_stale(DIRECT_PATH_TTL_MICROS + 10, DIRECT_PATH_TTL_MICROS);
+        assert!(s.direct_confirmed(), "keepalive refresh prevents a false downgrade");
     }
 }

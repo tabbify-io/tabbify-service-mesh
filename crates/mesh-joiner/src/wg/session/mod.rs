@@ -33,7 +33,7 @@
 //! existing `wireguard_udp.rs` suite, which exercises the same
 //! boringtun calls we make here.
 
-mod peer_session;
+pub mod peer_session;
 mod route_sink;
 mod table;
 

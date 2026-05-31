@@ -44,6 +44,55 @@ pub(crate) const MAX_UDP_FRAME: usize = 9_001;
 /// the receive buffer.
 pub(crate) const MAX_TUN_FRAME: usize = 9_001;
 
+/// Current time as unix-micros. Used to stamp direct-path RX timestamps
+/// and to drive the staleness downgrade. Saturates to `0` on the
+/// impossible pre-epoch clock and to `i64::MAX` on the (year-294247)
+/// overflow — both are inert for the staleness arithmetic.
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+}
+
+/// Send already-encapsulated `WireGuard` bytes to `session` over the best
+/// path: a CONFIRMED-direct UDP endpoint, else the relay (the connectivity
+/// floor), else — when no relay is configured — a best-effort send to the
+/// unconfirmed candidate endpoint (pre-relay behaviour), else drop.
+///
+/// This is the single TX chokepoint every WG send site routes through, so
+/// the direct-vs-relay decision lives in exactly one place. A `Some`
+/// endpoint on an UNCONFIRMED session is only a CANDIDATE: until a
+/// decrypted data packet proves the direct path bidirectionally
+/// (`PeerSession::confirm_direct`), traffic rides the relay so a
+/// firewalled/NAT'd peer whose reflexive endpoint the coordinator
+/// advertised is reachable rather than black-holed.
+async fn send_wire(
+    socket: &UdpSocket,
+    relay: Option<&RelayHandle>,
+    session: &Arc<PeerSession>,
+    bytes: Vec<u8>,
+) {
+    if session.direct_confirmed() {
+        if let Some(endpoint) = session.endpoint() {
+            if let Err(e) = socket.send_to(&bytes, endpoint).await {
+                tracing::debug!(error = %e, %endpoint, "udp send failed");
+            }
+            return;
+        }
+    }
+    if let Some(relay) = relay {
+        relay.try_relay(session.peer_pubkey, bytes);
+        return;
+    }
+    if let Some(endpoint) = session.endpoint() {
+        if let Err(e) = socket.send_to(&bytes, endpoint).await {
+            tracing::debug!(error = %e, %endpoint, "udp send failed");
+        }
+    } else {
+        tracing::trace!(peer = %session.peer_id, "no direct path, no relay — dropping");
+    }
+}
+
 /// Drain UDP → boringtun → TUN.
 pub(crate) async fn udp_recv_loop(
     socket: Arc<UdpSocket>,
@@ -66,8 +115,10 @@ pub(crate) async fn udp_recv_loop(
                         let datagram = &buf[..n];
                         let relay = sessions.relay();
                         // Fast path: known endpoint → known session.
+                        // `via_direct = true`: this arrived over the UDP
+                        // socket, the only path that can prove a direct route.
                         if let Some(session) = sessions.by_endpoint(peer_addr) {
-                            process_inbound_datagram(&socket, relay, &tun, &session, datagram).await;
+                            process_inbound_datagram(&socket, relay, true, &tun, &session, datagram).await;
                             continue;
                         }
                         // Slow path: unknown source addr. WireGuard
@@ -106,7 +157,13 @@ pub(crate) async fn udp_recv_loop(
                                 "udp_recv: learned endpoint from successful decapsulate"
                             );
                             sessions.learn_endpoint(&session, peer_addr);
-                            apply_wg_action(&socket, relay, &tun, &session, attempt).await;
+                            // A valid datagram just decapsulated over UDP →
+                            // refresh the staleness clock (mirrors the
+                            // fast-path `note_direct_rx`). This alone does
+                            // NOT confirm; a direct DeliverToTun does.
+                            session.note_direct_rx(now_micros());
+                            // `via_direct = true`: slow path is still UDP.
+                            apply_wg_action(&socket, relay, true, &tun, &session, attempt).await;
                             // Drain any queued frames (mirrors process_inbound_datagram).
                             loop {
                                 let next = {
@@ -118,7 +175,7 @@ pub(crate) async fn udp_recv_loop(
                                 if matches!(next, WgAction::Nothing) {
                                     break;
                                 }
-                                apply_wg_action(&socket, relay, &tun, &session, next).await;
+                                apply_wg_action(&socket, relay, true, &tun, &session, next).await;
                             }
                             accepted = true;
                             break;
@@ -140,9 +197,15 @@ pub(crate) async fn udp_recv_loop(
 /// Feed one inbound UDP datagram into `session`'s tunnel, dispatching
 /// any emitted plaintext frames to the TUN device and any
 /// boringtun-emitted handshake responses back to the wire.
+///
+/// `via_direct` is `true` when this datagram arrived over the UDP socket
+/// (the only path that can prove a direct route) and `false` when it was
+/// injected by the relay client — a relayed packet must NEVER confirm or
+/// refresh a DIRECT path.
 pub(crate) async fn process_inbound_datagram(
     socket: &UdpSocket,
     relay: Option<&RelayHandle>,
+    via_direct: bool,
     tun: &Arc<dyn TunDevice>,
     session: &Arc<PeerSession>,
     datagram: &[u8],
@@ -154,7 +217,14 @@ pub(crate) async fn process_inbound_datagram(
         let res = tunn.decapsulate(None, datagram, &mut scratch);
         classify_tunn_result(res)
     };
-    apply_wg_action(socket, relay, tun, session, first).await;
+    // A valid WG packet (anything that isn't an error — handshake or data,
+    // incl. keepalives) arrived over UDP: refresh the staleness clock so a
+    // confirmed-but-idle path doesn't age out. This does NOT confirm; only
+    // a direct DeliverToTun (real data) does that, below in apply_wg_action.
+    if via_direct && !matches!(first, WgAction::Error(_)) {
+        session.note_direct_rx(now_micros());
+    }
+    apply_wg_action(socket, relay, via_direct, tun, session, first).await;
 
     // boringtun documents that after `WriteToNetwork`, the caller
     // should keep calling `decapsulate` with an empty datagram until
@@ -170,13 +240,14 @@ pub(crate) async fn process_inbound_datagram(
         if matches!(next, WgAction::Nothing) {
             break;
         }
-        apply_wg_action(socket, relay, tun, session, next).await;
+        apply_wg_action(socket, relay, via_direct, tun, session, next).await;
     }
 }
 
 async fn apply_wg_action(
     socket: &UdpSocket,
     relay: Option<&RelayHandle>,
+    via_direct: bool,
     tun: &Arc<dyn TunDevice>,
     session: &Arc<PeerSession>,
     action: WgAction,
@@ -187,24 +258,12 @@ async fn apply_wg_action(
             tracing::debug!(error = %e, peer = %session.peer_id, "boringtun action error");
         }
         WgAction::SendToPeer(bytes) => {
-            let Some(endpoint) = session.endpoint() else {
-                // No direct path for this peer (e.g. a relay-only peer we
-                // are responding to). Carry the handshake RESPONSE back
-                // over the relay when a handle exists; else keep the
-                // pre-relay no-op.
-                if let Some(relay) = relay {
-                    relay.try_relay(session.peer_pubkey, bytes);
-                } else {
-                    tracing::trace!(
-                        peer = %session.peer_id,
-                        "no direct path, no relay — dropping outbound response"
-                    );
-                }
-                return;
-            };
-            if let Err(e) = socket.send_to(&bytes, endpoint).await {
-                tracing::debug!(error = %e, %endpoint, "udp send failed");
-            }
+            // A handshake init/response — route it through the single TX
+            // chokepoint. It must NEVER confirm a direct path: a lone
+            // handshake can cross directly even when the return path is
+            // blocked, so it stays on the relay floor until DATA proves
+            // both directions.
+            send_wire(socket, relay, session, bytes).await;
         }
         WgAction::DeliverToTun(bytes) => {
             // spec §5.5 RX enforcement: boringtun decapsulated this
@@ -215,6 +274,14 @@ async fn apply_wg_action(
             // its source is outside the peer's allowed-set.
             if !inner_source_allowed(session, &bytes) {
                 return;
+            }
+            // THE upgrade signal: a real DATA packet was delivered over a
+            // DIRECT (non-relayed) UDP path. The sender only emits data
+            // after ITS handshake completed — which required our response
+            // to reach it — so a direct data packet proves the path works
+            // BIDIRECTIONALLY. Confirm so future TX leaves the relay floor.
+            if via_direct {
+                session.confirm_direct(now_micros());
             }
             if let Err(e) = tun.write_packet(&bytes).await {
                 tracing::debug!(error = %e, "tun write failed");
@@ -327,23 +394,10 @@ async fn encapsulate_and_send(
     };
     match action {
         WgAction::SendToPeer(bytes) => {
-            let Some(endpoint) = session.endpoint() else {
-                // No direct path. Relay the (already-encrypted) datagram
-                // through the coordinator when a relay handle exists; else
-                // keep the pre-relay silent drop.
-                if let Some(relay) = relay {
-                    relay.try_relay(session.peer_pubkey, bytes);
-                } else {
-                    tracing::trace!(
-                        peer = %session.peer_id,
-                        "no direct path, no relay — dropping outbound until they initiate"
-                    );
-                }
-                return;
-            };
-            if let Err(e) = socket.send_to(&bytes, endpoint).await {
-                tracing::debug!(error = %e, %endpoint, "tun_read: udp send failed");
-            }
+            // Route through the single TX chokepoint: confirmed-direct →
+            // UDP, else relay floor, else (no relay) best-effort candidate
+            // endpoint, else drop.
+            send_wire(socket, relay, session, bytes).await;
         }
         WgAction::Nothing => {
             // boringtun queued the packet behind a handshake — it'll
@@ -400,7 +454,16 @@ pub(crate) async fn timer_loop(
                 }
             }
             _ = interval.tick() => {
+                let now = now_micros();
                 for session in sessions.snapshot() {
+                    // Downgrade a confirmed-direct path that has gone silent
+                    // past the TTL (NAT rebind / path death) back to the
+                    // relay floor — independent of whether the timer emits
+                    // anything to send this tick.
+                    session.downgrade_direct_if_stale(
+                        now,
+                        crate::wg::session::peer_session::DIRECT_PATH_TTL_MICROS,
+                    );
                     let outbound: Option<Vec<u8>> = {
                         let mut scratch = vec![0u8; 256];
                         let mut tunn = session.tunn.lock().await;
@@ -412,18 +475,10 @@ pub(crate) async fn timer_loop(
                         }
                     };
                     if let Some(bytes) = outbound {
-                        let Some(endpoint) = session.endpoint() else {
-                            // No direct path — carry the timer-driven WG
-                            // output (rekey / keepalive) over the relay so a
-                            // relay-only session stays alive; else drop.
-                            if let Some(relay) = sessions.relay() {
-                                relay.try_relay(session.peer_pubkey, bytes);
-                            }
-                            continue;
-                        };
-                        if let Err(e) = socket.send_to(&bytes, endpoint).await {
-                            tracing::trace!(error = %e, %endpoint, "timer: udp send failed");
-                        }
+                        // Timer-driven WG output (rekey / keepalive) rides
+                        // the same chokepoint: confirmed-direct → UDP, else
+                        // relay floor, else best-effort candidate, else drop.
+                        send_wire(&socket, sessions.relay(), &session, bytes).await;
                     }
                 }
             }
@@ -562,6 +617,8 @@ mod tests {
             peer_pubkey: [0u8; 32],
             allowed_ips: parking_lot::RwLock::new(HashSet::from([a, b])),
             endpoint: parking_lot::RwLock::new(None),
+            direct_confirmed: std::sync::atomic::AtomicBool::new(false),
+            last_direct_rx_micros: std::sync::atomic::AtomicI64::new(0),
             tunn: tokio::sync::Mutex::new(boringtun::noise::Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
@@ -632,17 +689,60 @@ mod tests {
         assert!(!out.payload.is_empty(), "relayed payload is the WG handshake-init");
     }
 
-    /// With a direct endpoint bound, `encapsulate_and_send` sends over UDP
-    /// and does NOT relay — the relay is a fallback, never the primary
-    /// path when a direct endpoint exists.
+    /// REGRESSION (this fix): a `Some` endpoint is only a CANDIDATE, not a
+    /// confirmed direct path. With a relay handle present and the session
+    /// NOT yet `direct_confirmed`, TX must go over the RELAY — the
+    /// connectivity floor — NOT to the unconfirmed candidate endpoint. The
+    /// old code sent straight to the candidate endpoint (a black hole for a
+    /// firewalled/NAT'd peer whose reflexive endpoint the coordinator
+    /// advertised) and never relayed. This test FAILS on the old code.
     #[tokio::test]
-    async fn encapsulate_uses_udp_not_relay_when_endpoint_known() {
+    async fn tx_relays_when_endpoint_known_but_unconfirmed() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new();
+        // Bind a receiver socket so a (wrongly) direct send WOULD land here —
+        // letting the test distinguish "relayed" from "sent direct".
+        let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst = receiver.local_addr().unwrap();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        // Endpoint KNOWN (a candidate) but the direct path is unconfirmed.
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
+        assert!(!session.direct_confirmed(), "a fresh session starts unconfirmed");
+        let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
+
+        encapsulate_and_send(&sender, table.relay(), &session, &packet).await;
+
+        // The frame went over the RELAY, not the candidate UDP endpoint.
+        // Bounded so the OLD (buggy) behaviour — which sends direct and
+        // never relays — fails as a clean assertion instead of hanging on
+        // an unbounded `recv`.
+        let out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("frame must be relayed (not sent direct) while direct is unconfirmed")
+            .expect("relay channel delivered the frame");
+        assert_eq!(out.dst_pubkey, session.peer_pubkey, "relay targets the peer pubkey");
+        assert!(!out.payload.is_empty(), "relayed payload is the WG handshake-init");
+        let mut buf = vec![0u8; MAX_UDP_FRAME];
+        let recv =
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf)).await;
+        assert!(recv.is_err(), "nothing sent to the unconfirmed candidate endpoint");
+    }
+
+    /// Once the direct path is CONFIRMED (a decrypted data packet arrived
+    /// over UDP → `confirm_direct`), TX goes over UDP to the endpoint and
+    /// does NOT relay. This is the upgrade the Tailscale model performs
+    /// after bidirectional direct connectivity is proven.
+    #[tokio::test]
+    async fn tx_direct_when_confirmed() {
         let (relay, mut rx) = crate::relay::RelayHandle::new();
         // Bind a receiver socket so the UDP send has a live destination.
         let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let dst = receiver.local_addr().unwrap();
         let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
         let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
+        // Prove the direct path (the only signal that flips the floor off).
+        session.confirm_direct(now_micros());
+        assert!(session.direct_confirmed());
         let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
 
@@ -651,8 +751,89 @@ mod tests {
         // The datagram went to UDP, not the relay.
         let mut buf = vec![0u8; MAX_UDP_FRAME];
         let recv = tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf)).await;
-        assert!(recv.is_ok(), "handshake-init delivered over UDP to the direct endpoint");
-        assert!(rx.try_recv().is_err(), "nothing relayed when a direct endpoint exists");
+        assert!(recv.is_ok(), "handshake-init delivered over UDP to the confirmed endpoint");
+        assert!(rx.try_recv().is_err(), "nothing relayed once the direct path is confirmed");
+    }
+
+    /// A TUN device that swallows every write — lets the `DeliverToTun` path
+    /// run end-to-end without a real interface.
+    struct NoopTun;
+    #[async_trait::async_trait]
+    impl tabbify_mesh_fabric::tun::TunDevice for NoopTun {
+        fn name(&self) -> &'static str {
+            "noop-tun"
+        }
+        async fn read_packet(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            std::future::pending().await
+        }
+        async fn write_packet(&self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    /// Confirmation gate: a `DeliverToTun` of REAL data over a DIRECT path
+    /// (`via_direct = true`) confirms the direct route (bidirectional proof
+    /// — the sender only emits data after its handshake, which needed our
+    /// response). The SAME delivery over the RELAY (`via_direct = false`)
+    /// must NOT confirm — a relayed packet proves nothing about the direct
+    /// path. A `SendToPeer` (handshake) must never confirm either.
+    #[tokio::test]
+    async fn deliver_to_tun_confirms_only_when_direct() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tun: Arc<dyn TunDevice> = Arc::new(NoopTun);
+        let table = SessionTable::new();
+        // Allowed-source set is exactly the peer's own ULA, so an inner
+        // packet sourced from it passes the §5.5 gate and reaches the
+        // confirm branch.
+        let ula = "fd5a:1f00:1::1";
+        let session = upsert_peer(&table, ula, Some("127.0.0.1:51820"));
+        let inner = ipv6_packet_from(ula.parse().unwrap());
+
+        // Relayed data (via_direct = false): delivered to TUN but NOT
+        // confirmed — the relay proves nothing about the direct path.
+        apply_wg_action(
+            &socket,
+            None,
+            false,
+            &tun,
+            &session,
+            WgAction::DeliverToTun(inner.clone()),
+        )
+        .await;
+        assert!(
+            !session.direct_confirmed(),
+            "a relayed data delivery must NOT confirm a direct path"
+        );
+
+        // A handshake (SendToPeer) over the direct flag must NOT confirm.
+        apply_wg_action(
+            &socket,
+            None,
+            true,
+            &tun,
+            &session,
+            WgAction::SendToPeer(vec![1, 2, 3]),
+        )
+        .await;
+        assert!(
+            !session.direct_confirmed(),
+            "a handshake (SendToPeer) must NEVER confirm a direct path"
+        );
+
+        // Direct data (via_direct = true): THE upgrade signal.
+        apply_wg_action(
+            &socket,
+            None,
+            true,
+            &tun,
+            &session,
+            WgAction::DeliverToTun(inner),
+        )
+        .await;
+        assert!(
+            session.direct_confirmed(),
+            "a direct data delivery confirms the direct path"
+        );
     }
 
     /// With NO relay handle, a no-endpoint session keeps the pre-relay
