@@ -74,6 +74,7 @@ async fn send_wire(
 ) {
     if session.direct_confirmed() {
         if let Some(endpoint) = session.endpoint() {
+            tracing::debug!(peer = %session.peer_id, %endpoint, len = bytes.len(), "send_wire: direct (confirmed)");
             if let Err(e) = socket.send_to(&bytes, endpoint).await {
                 tracing::debug!(error = %e, %endpoint, "udp send failed");
             }
@@ -81,15 +82,17 @@ async fn send_wire(
         }
     }
     if let Some(relay) = relay {
+        tracing::debug!(peer = %session.peer_id, len = bytes.len(), "send_wire: relay");
         relay.try_relay(session.peer_pubkey, bytes);
         return;
     }
     if let Some(endpoint) = session.endpoint() {
+        tracing::debug!(peer = %session.peer_id, %endpoint, "send_wire: direct (no relay configured)");
         if let Err(e) = socket.send_to(&bytes, endpoint).await {
             tracing::debug!(error = %e, %endpoint, "udp send failed");
         }
     } else {
-        tracing::trace!(peer = %session.peer_id, "no direct path, no relay — dropping");
+        tracing::debug!(peer = %session.peer_id, "send_wire: drop (no direct path, no relay)");
     }
 }
 

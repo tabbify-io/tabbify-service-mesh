@@ -54,13 +54,29 @@ pub struct RelayQuery {
 pub fn route_uplink(coordinator: &Coordinator, my_pubkey: &[u8; 32], buf: &[u8]) -> Option<Vec<u8>> {
     let (dst, payload) = decode_relay_frame(buf)?;
     if !coordinator.can_relay(my_pubkey, &dst) {
+        tracing::warn!(
+            src = %B64URL.encode(my_pubkey),
+            dst = %B64URL.encode(dst),
+            "relay: ACL denied — frame dropped"
+        );
         return None;
     }
     let downlink = encode_relay_frame(my_pubkey, payload);
     if coordinator.relay().forward(&dst, downlink.clone()) {
+        tracing::debug!(
+            src = %B64URL.encode(my_pubkey),
+            dst = %B64URL.encode(dst),
+            len = downlink.len(),
+            "relay: forwarded"
+        );
         Some(downlink)
     } else {
-        // Destination offline — nothing forwarded (same outcome as a drop).
+        // Destination has no live relay connection — nothing forwarded.
+        tracing::warn!(
+            src = %B64URL.encode(my_pubkey),
+            dst = %B64URL.encode(dst),
+            "relay: destination has no live connection — frame dropped"
+        );
         None
     }
 }
@@ -105,6 +121,7 @@ pub async fn relay_ws_handler(
 async fn relay_conn(coordinator: Coordinator, my_pubkey: [u8; 32], socket: WebSocket) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let id = coordinator.relay().register(my_pubkey.to_vec(), tx);
+    tracing::info!(pubkey = %B64URL.encode(my_pubkey), conn_id = id, "relay: peer connected");
     let (mut sink, mut stream) = socket.split();
 
     // Send task: forward downlink frames + heartbeat pings to the peer.
@@ -144,6 +161,7 @@ async fn relay_conn(coordinator: Coordinator, my_pubkey: [u8; 32], socket: WebSo
     // Tear down: drop our registry entry (only if still ours) + stop the
     // send task so its sink half is released.
     coordinator.relay().unregister(&my_pubkey, id);
+    tracing::info!(pubkey = %B64URL.encode(my_pubkey), conn_id = id, "relay: peer disconnected");
     send_task.abort();
 }
 

@@ -234,12 +234,14 @@ async fn connect_once(url: &str, task: &mut RelayTask) -> ConnOutcome {
 /// peer also go back over the relay.
 async fn handle_inbound(task: &RelayTask, buf: &[u8]) {
     let Some((src, payload)) = decode_relay_frame(buf) else {
+        tracing::debug!(len = buf.len(), "relay inbound: malformed frame, ignoring");
         return; // too short — ignore
     };
     let Some(session) = task.sessions.by_pubkey(src) else {
-        tracing::trace!("relay: inbound frame for unknown source pubkey, dropping");
+        tracing::debug!(src = %B64URL.encode(src), "relay inbound: no session for source pubkey, dropping");
         return;
     };
+    tracing::debug!(peer = %session.peer_id, len = payload.len(), "relay inbound: injecting into tunnel");
     // `via_direct = false`: a relayed packet must NEVER confirm or refresh
     // a DIRECT path — only true UDP RX can prove the direct route works.
     process_inbound_datagram(
