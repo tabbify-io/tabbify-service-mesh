@@ -56,6 +56,9 @@
 //! * [`platform`] — per-OS shell-outs to wire the TUN device into the
 //!   kernel routing table.
 //! * [`nat`] — Stage 2 hole-punch subscriber stub.
+//! * [`relay`] — Stage 3 DERP-style relay client: forwards
+//!   already-encrypted WG datagrams through the coordinator when no
+//!   direct path is known.
 
 // Crate-root modules: caller-facing config / error / public types and the
 // orchestrator that ties the domains together.
@@ -65,6 +68,7 @@ pub mod error;
 pub mod joiner;
 pub mod nat;
 pub mod peer;
+pub mod relay;
 pub mod platform;
 pub mod wg;
 
