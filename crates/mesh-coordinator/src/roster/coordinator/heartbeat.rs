@@ -247,6 +247,9 @@ impl Coordinator {
             peer_id: peer_id.to_string(),
             tags,
         });
+        // Membership changed — refresh the durable roster snapshot so the
+        // departed peer is not resurrected on the next coordinator restart.
+        self.persist_roster().await;
         true
     }
 }

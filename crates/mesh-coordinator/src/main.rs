@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tabbify_mesh_coordinator::{
-    AuthValidator, Coordinator, NoopPublisher, PolicyStore, build_router_with_admin,
-    build_server_config, timeout,
+    AuthValidator, Coordinator, FileRosterStore, NoopPublisher, NoopRosterStore, PolicyStore,
+    SharedRosterStore, build_router_with_admin, build_server_config, timeout,
 };
 use tracing::{info, warn};
 
@@ -71,6 +71,16 @@ struct Args {
     #[arg(long, env = "MESH_ADMIN_TOKEN")]
     admin_token: Option<String>,
 
+    /// Directory for the durable roster snapshot (`<dir>/roster.json`). When
+    /// set, the coordinator restores its peer roster on startup and persists
+    /// it on every membership change, so a restart keeps each peer's
+    /// `peer_id ↔ ULA ↔ wg_public_key` mapping instead of reshuffling ULAs /
+    /// 409-crashing sticky peers. Back it with a docker volume so the snapshot
+    /// survives container redeploys. When UNSET, the roster is in-memory only
+    /// (joiners re-register on heartbeat-timeout — the dev / self-healing path).
+    #[arg(long, env = "TABBIFY_MESH_STATE_DIR")]
+    state_dir: Option<PathBuf>,
+
     /// Base URL of the auth service used to validate node-join tokens
     /// (spec §8), e.g. `http://127.0.0.1:8080`. The coordinator calls
     /// `POST <AUTH_URL>/v1/validate` over plain HTTP (NOT over the mesh)
@@ -121,14 +131,23 @@ async fn main() -> Result<()> {
     // misconfiguration).
     let validator = build_validator(args.auth_url.as_deref())?;
 
-    // In-memory roster sink. Joiners re-register on heartbeat-timeout, so
-    // a restart self-heals within one heartbeat interval.
-    let coordinator = Coordinator::with_policy_and_validator(
+    // Durable roster store: a file-backed snapshot when --state-dir is set
+    // (survives coordinator restarts — no ULA reshuffle / sticky-ULA 409),
+    // else the no-op store (in-memory, self-heals via re-register).
+    let roster_store = build_roster_store(args.state_dir.as_ref());
+
+    let coordinator = Coordinator::with_policy_validator_store(
         Arc::new(NoopPublisher),
         Duration::from_secs(args.heartbeat_timeout_secs),
         policy_store,
         validator,
+        roster_store,
     );
+
+    // Restore any persisted roster BEFORE serving + before the sweeper runs,
+    // so the first re-register hits the idempotent by_pubkey path (same ULA)
+    // and restored peers get a full heartbeat-timeout grace.
+    coordinator.restore().await;
 
     let _sweeper = timeout::spawn(coordinator.clone());
 
@@ -184,6 +203,26 @@ async fn main() -> Result<()> {
             .context("axum-server::serve")?;
     }
     Ok(())
+}
+
+/// Build the durable roster store from an optional `--state-dir`.
+///
+/// `Some(dir)` → a file-backed snapshot at `<dir>/roster.json` so the roster
+/// survives a coordinator restart (no ULA reshuffle / sticky-ULA 409).
+/// `None` → the no-op store: the roster is in-memory and self-heals as
+/// joiners re-register. Logged either way so the durability posture is never
+/// a silent surprise. (`let ... else` lets each `Arc::new` coerce to the
+/// trait-object return type — no explicit cast, no Option-combinator lint.)
+fn build_roster_store(state_dir: Option<&PathBuf>) -> SharedRosterStore {
+    let Some(dir) = state_dir else {
+        warn!(
+            "TABBIFY_MESH_STATE_DIR unset: roster is IN-MEMORY only. A coordinator \
+             restart drops the roster — joiners re-register on heartbeat-timeout."
+        );
+        return Arc::new(NoopRosterStore);
+    };
+    info!(state_dir = %dir.display(), "durable roster ENABLED (restore + persist)");
+    Arc::new(FileRosterStore::new(dir.clone()))
 }
 
 /// Build the join-token validator from an optional `AUTH_URL`.

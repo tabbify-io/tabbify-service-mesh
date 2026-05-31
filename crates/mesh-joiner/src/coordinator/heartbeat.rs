@@ -31,7 +31,7 @@
 //! style channel — we use a plain `tokio::sync::watch` to avoid pulling
 //! `tokio-util` just for one token.
 
-use crate::coordinator::client::{CoordinatorClient, remote_to_info};
+use crate::coordinator::client::{CoordinatorClient, RegisterResponse, remote_to_info};
 use crate::error::JoinerError;
 use crate::wg::session::SessionTable;
 use dashmap::DashMap;
@@ -289,6 +289,36 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
     }
 }
 
+/// Issue a single `register` to the coordinator with an explicit
+/// `requested_ula` override (the rest of the identity comes from `inputs`).
+///
+/// Factored out so the roster-loss path can retry with a FREE allocation
+/// (`None`) after a sticky-ULA `409` without duplicating the long argument
+/// list. The control plane re-derives `software_version` from heartbeats, so
+/// the register only carries identity + roster — `software_version` is `None`.
+async fn register_once(
+    client: &CoordinatorClient,
+    inputs: &ReregisterInputs,
+    wg_listen_port: u16,
+    requested_ula: Option<String>,
+) -> crate::error::Result<RegisterResponse> {
+    client
+        .register(
+            &inputs.our_public,
+            inputs.advertise_endpoint.clone(),
+            Some(wg_listen_port),
+            &inputs.display_name,
+            &inputs.tags,
+            inputs.join_token.as_deref(),
+            requested_ula,
+            inputs.kind.clone(),
+            inputs.parent.clone(),
+            inputs.app_uuid.clone(),
+            None,
+        )
+        .await
+}
+
 /// Perform a full re-register after a coordinator roster loss, then
 /// reconcile the roster the register response carries and adopt the
 /// freshly-assigned `peer_id` (shared with the SSE consumer).
@@ -304,25 +334,34 @@ async fn reregister_after_roster_loss(
     inputs: &ReregisterInputs,
     wg_listen_port: u16,
 ) {
-    let resp = match client
-        .register(
-            &inputs.our_public,
-            inputs.advertise_endpoint.clone(),
-            Some(wg_listen_port),
-            &inputs.display_name,
-            &inputs.tags,
-            inputs.join_token.as_deref(),
-            inputs.requested_ula.clone(),
-            inputs.kind.clone(),
-            inputs.parent.clone(),
-            inputs.app_uuid.clone(),
-            // The control plane re-derives `software_version` from heartbeats;
-            // the register only needs identity + roster, so omit it here.
-            None,
-        )
-        .await
+    // Try with the sticky `requested_ula` first. A 409 means a DIFFERENT peer
+    // holds that ULA — e.g. the coordinator's durable roster was lost on a
+    // box-replace and the slot was reallocated before we re-registered. Rather
+    // than crash-loop on the same conflict every tick, fall back to a FREE
+    // allocation (no `requested_ula`) so we rejoin at a fresh coordinator-
+    // assigned address. (With the coordinator's durable roster this 409 is
+    // rare; this fallback keeps the joiner self-healing in the residual case.)
+    let resp = match register_once(client, inputs, wg_listen_port, inputs.requested_ula.clone()).await
     {
         Ok(resp) => resp,
+        Err(JoinerError::HttpStatus { status: 409, body }) => {
+            tracing::warn!(
+                requested_ula = ?inputs.requested_ula,
+                body = %body,
+                "heartbeat: re-register hit 409 (sticky ULA already claimed) — \
+                 retrying with a coordinator-allocated address"
+            );
+            match register_once(client, inputs, wg_listen_port, None).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "heartbeat: re-register fallback (free ULA) failed — will retry next tick"
+                    );
+                    return;
+                }
+            }
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -759,6 +798,86 @@ mod tests {
             !handling_roster_loss,
             "non-404 error must not set the roster-loss guard"
         );
+        drop(server);
+    }
+
+    /// A sticky-ULA `409` on re-register must NOT crash-loop: the joiner falls
+    /// back to a coordinator-allocated address (no `requested_ula`) and adopts
+    /// the freshly-assigned `peer_id`. Defensive for the residual case where the
+    /// coordinator's durable roster was lost and the sticky slot was reused.
+    #[tokio::test]
+    async fn sticky_ula_409_falls_back_to_free_allocation() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        // Heartbeat 404 → triggers the re-register path.
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/heartbeat"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unknown peer"))
+            .mount(&server)
+            .await;
+        // Sticky register (carries `requested_ula`) → 409 Conflict. Mounted
+        // FIRST + matched by the `requested_ula` in the body. wiremock matches
+        // mounts in order (first-mounted wins ties), so this specific mock
+        // catches the sticky attempt; the fallback (no `requested_ula`) falls
+        // through to the catch-all below.
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .and(body_partial_json(serde_json::json!({
+                "requested_ula": "fd5a:1f00:0:5::1"
+            })))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_string("requested ULA already claimed"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Free-allocation register (no `requested_ula`) → 200 with a roster.
+        let new_peer_id = "01910f10-0000-7000-8000-00000000beef";
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "peer_id": new_peer_id,
+                "ula": "fd5a:1f00:0:42::1",
+                "peers": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        let sessions = SessionTable::new();
+        let me = StaticSecret::from([0xAA; 32]);
+        let peer_id: SharedPeerId = Arc::new(RwLock::new(Uuid::nil()));
+        let hosted: DashMap<Ipv6Addr, ()> = DashMap::new();
+        let inputs = ReregisterInputs {
+            requested_ula: Some("fd5a:1f00:0:5::1".into()),
+            ..reregister_inputs()
+        };
+        let mut handling_roster_loss = false;
+
+        tick_once(TickCtx {
+            client: &client,
+            sessions: &sessions,
+            our_private: &me,
+            peer_id: &peer_id,
+            reregister: &inputs,
+            wg_listen_port: 51820,
+            hosted_app_ulas: &hosted,
+            software_version: None,
+            handling_roster_loss: &mut handling_roster_loss,
+        })
+        .await;
+
+        // The fallback (free-allocation) register succeeded → its peer_id was
+        // adopted, proving the 409 did NOT dead-end the re-register.
+        assert_eq!(
+            *peer_id.read().await,
+            Uuid::parse_str(new_peer_id).unwrap(),
+            "after a sticky 409, the joiner must adopt the free-allocation peer_id"
+        );
+        assert!(handling_roster_loss, "roster-loss guard set after recovery");
+        // Both register `.expect(1)` are verified on drop: exactly one sticky
+        // attempt (409) + one free-allocation fallback (200).
         drop(server);
     }
 }

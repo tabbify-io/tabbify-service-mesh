@@ -181,6 +181,10 @@ impl Coordinator {
         self.inner
             .broadcaster
             .broadcast(PeerEvent::Added(entry.to_info()));
+        // Membership changed — persist the durable roster snapshot so a
+        // coordinator restart restores this peer at the same ULA (no reshuffle,
+        // no sticky-ULA 409). Best-effort; the store logs any failure.
+        self.persist_roster().await;
         Ok((entry, RegisterOutcome::Created))
     }
 

@@ -29,6 +29,8 @@ use crate::nat::holepunch::PunchTracker;
 use crate::policy::PolicyStore;
 use crate::publisher::SharedPublisher;
 use crate::roster::allocator::UlaAllocator;
+use crate::roster::events::PeerJoined;
+use crate::roster::store::{NoopRosterStore, SharedRosterStore};
 use dashmap::DashMap;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
@@ -133,6 +135,35 @@ impl PeerEntry {
             software_version: self.software_version.clone(),
         }
     }
+
+    /// Project this entry back into a [`PeerJoined`] event for the durable
+    /// roster snapshot. The inverse of [`Coordinator::apply_peer_joined`]:
+    /// replaying the result through that seam reconstructs an equivalent
+    /// entry (ULA, network slot, allocator index, pubkey index all recovered
+    /// from the `ula` field). `observed_external` + `endpoint_is_reflexive`
+    /// are intentionally NOT carried — they are refreshed by the next live
+    /// heartbeat / register, and `apply_peer_joined` treats a reloaded
+    /// endpoint as sticky (the safe default).
+    ///
+    /// [`Coordinator::apply_peer_joined`]: crate::roster::coordinator::Coordinator::apply_peer_joined
+    #[must_use]
+    pub fn to_joined_event(&self) -> crate::roster::events::PeerJoined {
+        crate::roster::events::PeerJoined {
+            peer_id: self.peer_id.to_string(),
+            wg_public_key: self.wg_public_key.clone(),
+            ula: self.ula.to_string(),
+            listen_endpoint: self.listen_endpoint.clone().unwrap_or_default(),
+            display_name: self.display_name.clone(),
+            network: self.network.clone(),
+            tags: self.tags.clone(),
+            hosted_app_ulas: self.hosted_app_ulas.clone(),
+            joined_at_micros: self.joined_at_micros,
+            kind: self.kind.clone(),
+            parent: self.parent.clone(),
+            app_uuid: self.app_uuid.clone(),
+            software_version: self.software_version.clone(),
+        }
+    }
 }
 
 /// Errors a coordinator method can surface to its HTTP handler.
@@ -210,6 +241,12 @@ pub(crate) struct Inner {
     pub(crate) punch_tracker: PunchTracker,
     /// Ephemeral pubkey → live relay WS connection (Stage-3 relay floor).
     pub(crate) relay: crate::relay::RelayRegistry,
+    /// Durable roster snapshot sink. Persisted on every membership change
+    /// (register / deregister) and replayed at startup via [`Self::restore`]
+    /// so a coordinator restart restores the exact `peer_id` ↔ ULA ↔ pubkey
+    /// mapping instead of reshuffling ULAs / 409-crashing sticky peers.
+    /// Defaults to [`NoopRosterStore`] (in-memory dev / tests).
+    pub(crate) roster_store: SharedRosterStore,
 }
 
 impl Coordinator {
@@ -252,6 +289,33 @@ impl Coordinator {
         policy: PolicyStore,
         validator: Option<AuthValidator>,
     ) -> Self {
+        Self::with_policy_validator_store(
+            publisher,
+            heartbeat_timeout,
+            policy,
+            validator,
+            Arc::new(NoopRosterStore),
+        )
+    }
+
+    /// Build a coordinator with an explicit ACL [`PolicyStore`], an optional
+    /// join-token [`AuthValidator`], AND a durable [`RosterStore`].
+    ///
+    /// This is the full base constructor — every other `new` / `with_*`
+    /// convenience delegates here. Pass a
+    /// [`crate::roster::store::FileRosterStore`] to make the roster survive a
+    /// coordinator restart (call [`Self::restore`] once at startup), or
+    /// [`NoopRosterStore`] for the in-memory dev / test configuration.
+    ///
+    /// [`RosterStore`]: crate::roster::store::RosterStore
+    #[must_use]
+    pub fn with_policy_validator_store(
+        publisher: SharedPublisher,
+        heartbeat_timeout: Duration,
+        policy: PolicyStore,
+        validator: Option<AuthValidator>,
+        roster_store: SharedRosterStore,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 roster: DashMap::new(),
@@ -264,8 +328,55 @@ impl Coordinator {
                 heartbeat_timeout,
                 punch_tracker: PunchTracker::new(),
                 relay: crate::relay::RelayRegistry::new(),
+                roster_store,
             }),
         }
+    }
+
+    /// Restore the roster from the durable [`RosterStore`]. Call ONCE at
+    /// startup, before serving and before the sweeper runs, so re-registering
+    /// peers hit the idempotent `by_pubkey` path (same `peer_id` + ULA) instead
+    /// of being re-allocated — eliminating the post-restart ULA reshuffle and
+    /// the sticky-ULA `409` crash-loop.
+    ///
+    /// Replays each persisted [`PeerJoined`] through [`Self::apply_peer_joined`]
+    /// (the same pure apply seam a live register uses), which repopulates the
+    /// roster + `by_pubkey` index, bumps the allocator past every restored
+    /// index, and stamps a fresh `last_heartbeat` (so restored peers get a full
+    /// heartbeat-timeout grace before the sweeper could evict them).
+    ///
+    /// [`RosterStore`]: crate::roster::store::RosterStore
+    pub async fn restore(&self) {
+        let peers = self.inner.roster_store.load().await;
+        let mut restored = 0_usize;
+        for event in &peers {
+            match self.apply_peer_joined(event) {
+                Ok(_) => restored += 1,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    peer_id = %event.peer_id,
+                    "skipped malformed peer while restoring roster snapshot",
+                ),
+            }
+        }
+        if restored > 0 {
+            tracing::info!(restored, "restored peers from durable roster snapshot");
+        }
+    }
+
+    /// Persist the current peer set to the durable [`RosterStore`]. Best-effort
+    /// (the store logs failures). Called after a membership change (a first-time
+    /// register or a deregister) so the snapshot tracks the live roster.
+    ///
+    /// [`RosterStore`]: crate::roster::store::RosterStore
+    pub async fn persist_roster(&self) {
+        let peers: Vec<PeerJoined> = self
+            .inner
+            .roster
+            .iter()
+            .map(|kv| kv.value().to_joined_event())
+            .collect();
+        self.inner.roster_store.save(&peers).await;
     }
 
     /// Borrow the live policy store — the policy HTTP handlers read/replace

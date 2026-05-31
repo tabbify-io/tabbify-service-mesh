@@ -1001,3 +1001,146 @@ async fn software_version_is_stored_and_broadcast() {
         "None on heartbeat must not clear the stored version"
     );
 }
+
+// ── Durable roster (coordinator-restart resilience) ─────────────────────────
+// A coordinator backed by a FileRosterStore must, after a "restart" (a fresh
+// Coordinator over the SAME store dir + `restore()`), bring every peer back at
+// the SAME ULA, repopulate `by_pubkey` so a sticky re-register is idempotent
+// (no 409), and resume the allocator past the restored indices (no reshuffle).
+
+use crate::roster::store::FileRosterStore;
+
+fn coordinator_with_store(dir: &std::path::Path) -> Coordinator {
+    Coordinator::with_policy_validator_store(
+        Arc::new(NoopPublisher),
+        Duration::from_secs(60),
+        PolicyStore::empty(),
+        None,
+        Arc::new(FileRosterStore::new(dir)),
+    )
+}
+
+#[tokio::test]
+async fn restore_brings_peers_back_at_the_same_ula() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // First coordinator lifetime: register two peers, persist on each.
+    let (alice_id, alice_ula, bob_ula);
+    {
+        let c1 = coordinator_with_store(dir.path());
+        let (a, _) = c1.register(req(1, "alice")).await.expect("reg alice");
+        let (b, _) = c1.register(req(2, "bob")).await.expect("reg bob");
+        alice_id = a.peer_id;
+        alice_ula = a.ula;
+        bob_ula = b.ula;
+    }
+    // "Restart": fresh coordinator over the same store dir.
+    let c2 = coordinator_with_store(dir.path());
+    c2.restore().await;
+    let snap = c2.snapshot();
+    assert_eq!(snap.len(), 2, "both peers restored");
+    // Same peer_id + ULA survive the restart (no reshuffle).
+    let alice = snap
+        .iter()
+        .find(|p| p.peer_id == alice_id.to_string())
+        .expect("alice restored");
+    assert_eq!(alice.ula, alice_ula.to_string());
+    assert!(snap.iter().any(|p| p.ula == bob_ula.to_string()));
+}
+
+#[tokio::test]
+async fn sticky_reregister_after_restore_is_idempotent_no_409() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (orig_id, orig_ula);
+    {
+        let c1 = coordinator_with_store(dir.path());
+        let (p, _) = c1.register(req(7, "registry")).await.expect("reg");
+        orig_id = p.peer_id;
+        orig_ula = p.ula;
+    }
+    let c2 = coordinator_with_store(dir.path());
+    c2.restore().await;
+    // Same pubkey re-registers → idempotent: same peer_id + ULA, NO UlaConflict.
+    let (again, outcome) = c2
+        .register(req(7, "registry"))
+        .await
+        .expect("sticky re-register must NOT 409 after restore");
+    assert_eq!(outcome, RegisterOutcome::Existed);
+    assert_eq!(again.peer_id, orig_id, "same peer_id after restart");
+    assert_eq!(again.ula, orig_ula, "same ULA after restart");
+}
+
+#[tokio::test]
+async fn different_peer_claiming_a_restored_ula_gets_409() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let claimed_ula;
+    {
+        let c1 = coordinator_with_store(dir.path());
+        let (p, _) = c1.register(req(1, "holder")).await.expect("reg");
+        claimed_ula = p.ula.to_string();
+    }
+    let c2 = coordinator_with_store(dir.path());
+    c2.restore().await;
+    // A DIFFERENT peer (seed 2) requesting the restored peer's ULA must be
+    // rejected — proving restore put the holder back into the conflict scan.
+    let mut intruder = req(2, "intruder");
+    intruder.requested_ula = Some(claimed_ula.clone());
+    let err = c2
+        .register(intruder)
+        .await
+        .expect_err("claiming a restored ULA must conflict");
+    assert!(
+        matches!(err, CoordinatorError::UlaConflict(u) if u == claimed_ula),
+        "expected UlaConflict for the restored ULA",
+    );
+}
+
+#[tokio::test]
+async fn allocator_resumes_past_restored_indices() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let c1 = coordinator_with_store(dir.path());
+        // Two peers in the default network → indices 1 and 2.
+        c1.register(req(1, "a")).await.expect("a");
+        c1.register(req(2, "b")).await.expect("b");
+    }
+    let c2 = coordinator_with_store(dir.path());
+    c2.restore().await;
+    // A brand-new peer must get index 3, not collide at 1 (allocator resumed).
+    let (fresh, outcome) = c2.register(req(9, "fresh")).await.expect("fresh");
+    assert_eq!(outcome, RegisterOutcome::Created);
+    assert_eq!(fresh.peer_index, 3, "allocator continued past restored 1,2");
+}
+
+#[tokio::test]
+async fn deregister_persists_so_peer_is_not_resurrected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gone_id;
+    {
+        let c1 = coordinator_with_store(dir.path());
+        let (p, _) = c1.register(req(1, "ephemeral")).await.expect("reg");
+        gone_id = p.peer_id;
+        assert!(c1.deregister(gone_id, "client_deregister").await);
+    }
+    let c2 = coordinator_with_store(dir.path());
+    c2.restore().await;
+    assert!(
+        c2.snapshot().is_empty(),
+        "a deregistered peer must not be resurrected on restart",
+    );
+}
+
+#[tokio::test]
+async fn restored_peer_is_not_immediately_stale() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let c1 = coordinator_with_store(dir.path());
+        c1.register(req(1, "p")).await.expect("reg");
+    }
+    let c2 = coordinator_with_store(dir.path());
+    c2.restore().await;
+    // restore() stamps a fresh last_heartbeat → no peer is stale right now.
+    assert!(
+        c2.stale_peers(std::time::Instant::now()).is_empty(),
+        "restored peers get a full heartbeat-timeout grace, not instant eviction",
+    );
+}
