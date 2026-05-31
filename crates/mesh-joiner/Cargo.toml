@@ -65,6 +65,9 @@ tabbify-mesh-fabric = { path = "../mesh-fabric", features = ["wireguard"] }
 tokio-test = { workspace = true }
 tempfile   = { workspace = true }
 wiremock   = { workspace = true }
+# Implement a recording `TunDevice` (an `#[async_trait]` trait) in the
+# relay client task's unit tests.
+async-trait = { workspace = true }
 # Generate throwaway self-signed certs in mTLS unit tests so we don't
 # need to ship PEM fixtures with the crate.
 rcgen      = "0.13"

@@ -186,20 +186,10 @@ impl Joiner {
 
         persist_identity_if_fresh(&config, &keypair, my_ula, sticky_ula)?;
 
-        // 3) Open + configure the TUN device. The fabric crate already
-        //    has a polished cross-platform open() that returns
-        //    Box<dyn TunDevice>; we just need to feed it a TunOptions.
-        let tun_name = config.tun_name.clone().unwrap_or_default();
-        let tun_dev = fabric_tun::open(TunOptions {
-            name: tun_name,
-            ula: my_ula,
-            mtu: 1_420,
-        })
-        .await
-        .map_err(|e| JoinerError::TunSetup(format!("open: {e}")))?;
-        let iface_name = tun_dev.name().to_owned();
-        let tun_arc: Arc<dyn TunDevice> = Arc::from(tun_dev);
-        tracing::info!(iface = %iface_name, "joiner: tun device opened");
+        // 3) Open + configure the TUN device (cross-platform open() in
+        //    the fabric crate). Extracted into a helper to keep this
+        //    constructor under the clippy line cap.
+        let (tun_arc, iface_name) = open_tun_device(config.tun_name.clone(), my_ula).await?;
 
         // 4) Tell the kernel about our ULA. We DO NOT add a blanket
         //    `/48` overlay route any more (spec §5.5): per-peer `/128`
@@ -215,8 +205,16 @@ impl Joiner {
         //    wired to a `TunRouteSink` so every upsert installs the peer's
         //    `/128` host route (TX scoping) and every advertised app-ULA
         //    its app-route (per-app-ULA routing). See `seed_initial_roster`.
+        // Relay (Stage-3 connectivity floor): when enabled, create the
+        // handle the WG TX seams use to relay packets to peers with no
+        // direct path, plus the receiver the relay client task drains. The
+        // handle is wired into the SessionTable so the loops can reach it;
+        // the receiver is handed to the relay task in `spawn_background_tasks`.
+        let (relay_handle, relay_outbound_rx) =
+            build_relay_channel(config.relay_enabled, config.insecure_no_mtls);
+
         let route_sink = Arc::new(platform::TunRouteSink::new(iface_name.clone()));
-        let sessions = SessionTable::with_route_sink(route_sink);
+        let sessions = SessionTable::with_route_sink_and_relay(route_sink, relay_handle);
         let peer_info: Arc<dashmap::DashMap<Ipv6Addr, PeerInfo>> = Arc::default();
         seed_initial_roster(&sessions, &peer_info, &keypair.private, &resp.peers).await;
 
@@ -247,6 +245,11 @@ impl Joiner {
             heartbeat_interval: config.heartbeat_interval,
             hosted_app_ulas: hosted_app_ulas.clone(),
             software_version: config.software_version.clone(),
+            relay_outbound_rx,
+            relay_url: config.relay_url.clone(),
+            coordinator_url: config.coordinator_url.clone(),
+            my_pubkey: *keypair.public.as_bytes(),
+            insecure_no_mtls: config.insecure_no_mtls,
             shutdown_rx,
         });
 
@@ -425,6 +428,21 @@ struct SpawnContext {
     /// Software version advertised on register + every heartbeat (spec P0
     /// OBSERVE). Host-supplied; `None` = unknown, never invented here.
     software_version: Option<String>,
+    /// Receiver the relay client task drains for outbound relayed
+    /// datagrams. `Some` only when relay is enabled; `None` (`--no-relay`)
+    /// skips spawning the relay task entirely.
+    relay_outbound_rx: Option<mpsc::UnboundedReceiver<crate::relay::client::RelayOutbound>>,
+    /// Explicit relay endpoint URL override; `None` derives it from
+    /// `coordinator_url`.
+    relay_url: Option<String>,
+    /// Coordinator base URL — the relay URL is derived from it when
+    /// `relay_url` is `None`.
+    coordinator_url: String,
+    /// Our raw WG public key — sent as the relay `?pubkey=` query param.
+    my_pubkey: [u8; 32],
+    /// `true` for a plaintext (`--insecure-no-mtls`) coordinator. The relay
+    /// task only connects under insecure mode (wss/mTLS not yet built).
+    insecure_no_mtls: bool,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -444,9 +462,14 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         heartbeat_interval,
         hosted_app_ulas,
         software_version,
+        relay_outbound_rx,
+        relay_url,
+        coordinator_url,
+        my_pubkey,
+        insecure_no_mtls,
         shutdown_rx,
     } = ctx;
-    let mut tasks: Vec<JoinHandle<()>> = Vec::with_capacity(6);
+    let mut tasks: Vec<JoinHandle<()>> = Vec::with_capacity(7);
 
     // UDP receive loop — drains ciphertext, decapsulates, writes
     // plaintext IPv6 packets to the TUN device.
@@ -458,11 +481,12 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
     )));
 
     // TUN read loop — drains plaintext from the kernel, encapsulates,
-    // and sends ciphertext to the right peer.
+    // and sends ciphertext to the right peer. `tun.clone()` so the relay
+    // task below can still hand relayed RX to the SAME device.
     tasks.push(tokio::spawn(tun_read_loop(
         socket.clone(),
         sessions.clone(),
-        tun,
+        tun.clone(),
         my_ula,
         shutdown_rx.clone(),
     )));
@@ -473,6 +497,28 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         sessions.clone(),
         shutdown_rx.clone(),
     )));
+
+    // Relay client task (Stage-3 connectivity floor). Spawned only when
+    // relay is enabled. It keeps a persistent WS to the coordinator,
+    // drains the outbound queue, and injects inbound relayed datagrams into
+    // the SAME session table + TUN the UDP loops use. Spawned BEFORE the
+    // hole-punch block because that block MOVES `socket`; the relay clones
+    // what it needs here.
+    if let Some(relay_outbound_rx) = relay_outbound_rx {
+        tasks.push(tokio::spawn(crate::relay::client::run(
+            crate::relay::client::RelayTask {
+                coordinator_url,
+                relay_url,
+                my_pubkey,
+                insecure_no_mtls,
+                sessions: sessions.clone(),
+                socket: socket.clone(),
+                tun: tun.clone(),
+                outbound_rx: relay_outbound_rx,
+                shutdown: shutdown_rx.clone(),
+            },
+        )));
+    }
 
     // Punch channel: the SSE consumer forwards `HolePunchInitiate` frames
     // to the hole-punch task, which fires the UDP burst (Stage 2).
@@ -695,6 +741,64 @@ fn default_keypair_path() -> std::path::PathBuf {
     std::path::PathBuf::from(home)
         .join(".tabbify-mesh")
         .join("keypair")
+}
+
+/// Open + configure the overlay TUN device, returning the shared device
+/// handle and the kernel-assigned interface name. Pulled out of
+/// [`Joiner::join`] to keep that constructor under the clippy line cap.
+///
+/// # Errors
+/// [`JoinerError::TunSetup`] if the device cannot be opened.
+async fn open_tun_device(
+    tun_name: Option<String>,
+    my_ula: Ipv6Addr,
+) -> anyhow::Result<(Arc<dyn TunDevice>, String)> {
+    let tun_dev = fabric_tun::open(TunOptions {
+        name: tun_name.unwrap_or_default(),
+        ula: my_ula,
+        mtu: 1_420,
+    })
+    .await
+    .map_err(|e| JoinerError::TunSetup(format!("open: {e}")))?;
+    let iface_name = tun_dev.name().to_owned();
+    let tun_arc: Arc<dyn TunDevice> = Arc::from(tun_dev);
+    tracing::info!(iface = %iface_name, "joiner: tun device opened");
+    Ok((tun_arc, iface_name))
+}
+
+/// Build the relay handle + outbound receiver when relay is active.
+///
+/// Returns `(Some(handle), Some(rx))` only when relay is enabled AND we
+/// are in insecure (`--insecure-no-mtls`) mode — the only mode the relay
+/// client supports today (wss/mTLS is not yet implemented). In that case
+/// the [`SessionTable`] carries the handle and the relay task drains the
+/// receiver. Otherwise `(None, None)`: the WG TX seams keep the pre-relay
+/// silent-drop behaviour and no relay task is spawned. Gating on
+/// `insecure_no_mtls` here is what stops a secure-mode joiner from queuing
+/// outbound datagrams into a channel that the (early-returning) secure
+/// relay task would never drain.
+fn build_relay_channel(
+    relay_enabled: bool,
+    insecure_no_mtls: bool,
+) -> (
+    Option<crate::relay::RelayHandle>,
+    Option<mpsc::UnboundedReceiver<crate::relay::client::RelayOutbound>>,
+) {
+    if relay_enabled && insecure_no_mtls {
+        let (h, rx) = crate::relay::RelayHandle::new();
+        (Some(h), Some(rx))
+    } else if relay_enabled {
+        // Enabled but secure: the relay client can't connect yet (wss/mTLS
+        // unimplemented), so install no handle — otherwise the TX seams
+        // would queue into a channel nothing drains.
+        tracing::warn!(
+            "relay enabled but coordinator is secure (mTLS); relay disabled \
+             (wss/mTLS not implemented) — direct + hole-punch still active"
+        );
+        (None, None)
+    } else {
+        (None, None)
+    }
 }
 
 /// Seed the session table + metadata map from the initial register
