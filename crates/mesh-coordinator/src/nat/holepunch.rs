@@ -12,18 +12,25 @@
 //! real NAT topology**. This module only pins the protocol shape so
 //! joiner subscribers don't churn when the real implementation lands.
 //!
-//! Gating logic: the coordinator tracks an in-memory `DashSet<(Uuid,
-//! Uuid)>` of already-punched ordered pairs so a single pair is only
-//! emitted once per coordinator lifetime. Pairs are keyed in canonical
-//! (smaller, larger) form so heartbeats from either side hit the same
-//! key. The set is reset on coordinator restart, which is fine — punch
-//! events never need re-emitting after a restart (the joiners re-register
-//! and re-pair).
+//! Gating logic: the coordinator tracks an in-memory `DashMap<(Uuid,
+//! Uuid), last_emit_micros>` of punched ordered pairs and RE-EMITS a pair
+//! once its last emit is older than [`PUNCH_REEMIT_COOLDOWN_MICROS`].
+//! Pairs are keyed in canonical (smaller, larger) form so heartbeats from
+//! either side hit the same key.
 //!
-//! Spam mitigation: this is a skeleton, not a production policy. When
-//! the real impl lands, gating should probably also age out entries so
-//! a peer that became reachable directly can later fall back to hole
-//! punching without a coordinator restart.
+//! Why re-emit (not emit-once): a UDP hole punch is not guaranteed to
+//! succeed on the first simultaneous attempt — NAT mappings expire, the
+//! two sides' bursts must overlap, and a peer whose SSE stream was briefly
+//! disconnected at emit time would otherwise miss its punch directive
+//! FOREVER (the joiner fires a short handshake burst, not a sustained
+//! retry). Emitting once per coordinator lifetime therefore orphans any
+//! NAT'd peer whose first punch window misses — observed live when a peer
+//! re-registered with a fresh identity after a coordinator/host replace:
+//! the surviving peer kept the stale pairing and never re-punched. Re-
+//! emitting on a cooldown drives repeated bidirectional bursts until the
+//! NATs align and the `WireGuard` session establishes. The cooldown bounds
+//! the SSE traffic; the joiner no-ops a punch directive for a peer it is
+//! already sessioned with, so re-emits to an established pair are cheap.
 //!
 //! Called from `coordinator.rs::heartbeat`: after stamping `peer A`'s
 //! heartbeat with its newly observed external endpoint, iterate over
@@ -34,10 +41,19 @@ use crate::http::sse::{PeerBroadcaster, PeerEvent};
 use crate::publisher::{EventPublisher, publish_event};
 use crate::roster::coordinator::PEER_SEGMENT;
 use crate::roster::events::HolePunchInitiate;
-use dashmap::DashSet;
+use dashmap::DashMap;
 use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
+
+/// Re-emit cooldown for a hole-punch pair.
+///
+/// Once a pair's last emit is older than this, the next heartbeat re-emits the
+/// bidirectional punch — repeated simultaneous bursts until the NATs align (see
+/// module docs). Set a touch below the joiner heartbeat interval so a stuck
+/// pair gets a fresh attempt roughly every heartbeat, while an established pair
+/// costs at most one (no-op'd) directive per window.
+pub const PUNCH_REEMIT_COOLDOWN_MICROS: i64 = 15_000_000; // 15s
 
 /// Pair tracking key. Stored in canonical (smaller, larger) form so
 /// heartbeats from either side hit the same entry. Single source of
@@ -63,12 +79,14 @@ pub struct PunchPeer {
     pub dial_endpoint: String,
 }
 
-/// Tracks which `(peer_id, peer_id)` ordered pairs have already had
-/// a `HolePunchInitiate` event emitted. Cheap to clone — wraps an `Arc`
-/// internally via `DashSet`.
+/// Last `HolePunchInitiate` emit time (unix micros) per canonical pair.
+///
+/// Tracks last-emit (not just presence) so a stuck pair is re-punched on a
+/// cooldown rather than emitted once-and-forgotten. Cheap to clone — wraps an
+/// `Arc` internally via `DashMap`.
 #[derive(Default, Clone)]
 pub struct PunchTracker {
-    punched: Arc<DashSet<PunchPair>>,
+    last_emit: Arc<DashMap<PunchPair, i64>>,
 }
 
 impl PunchTracker {
@@ -76,37 +94,56 @@ impl PunchTracker {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            punched: Arc::new(DashSet::new()),
+            last_emit: Arc::new(DashMap::new()),
         }
     }
 
-    /// Has this canonical pair already been emitted?
+    /// Claim the right to emit a punch for this canonical pair at `now_micros`.
+    ///
+    /// Returns `true` (and records `now_micros` as the new last-emit) when the
+    /// pair has never been emitted OR its last emit is at least
+    /// [`PUNCH_REEMIT_COOLDOWN_MICROS`] ago — i.e. it's time to (re-)punch.
+    /// Returns `false` within the cooldown window (deduped), so repeated
+    /// heartbeats don't spam a freshly-emitted pair.
+    pub fn claim(&self, pair: PunchPair, now_micros: i64) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.last_emit.entry(pair) {
+            Entry::Occupied(mut e) => {
+                if now_micros - *e.get() >= PUNCH_REEMIT_COOLDOWN_MICROS {
+                    *e.get_mut() = now_micros;
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(now_micros);
+                true
+            }
+        }
+    }
+
+    /// Has this canonical pair ever been emitted?
     #[must_use]
     pub fn contains(&self, pair: PunchPair) -> bool {
-        self.punched.contains(&pair)
+        self.last_emit.contains_key(&pair)
     }
 
-    /// Mark this canonical pair as emitted. Returns `true` if the pair
-    /// was newly inserted (caller wins the race), `false` otherwise.
-    pub fn mark(&self, pair: PunchPair) -> bool {
-        self.punched.insert(pair)
-    }
-
-    /// Forget the pair — used in tests / by future ageing-out logic.
+    /// Forget the pair — used in tests / by future eviction logic.
     pub fn clear(&self, pair: PunchPair) -> bool {
-        self.punched.remove(&pair).is_some()
+        self.last_emit.remove(&pair).is_some()
     }
 
-    /// Number of pairs already punched.
+    /// Number of pairs tracked.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.punched.len()
+        self.last_emit.len()
     }
 
     /// Convenience predicate.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.punched.is_empty()
+        self.last_emit.is_empty()
     }
 }
 
@@ -131,7 +168,10 @@ pub async fn try_emit_pair(
         return false;
     }
     let pair = canonical_pair(a.peer_id, b.peer_id);
-    if !tracker.mark(pair) {
+    // (Re-)emit only when the pair is new or its last punch is older than the
+    // cooldown — drives sustained bidirectional bursts until the session lands,
+    // without spamming a freshly-punched pair on every heartbeat.
+    if !tracker.claim(pair, now_micros) {
         return false;
     }
     debug!(
@@ -291,6 +331,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_emit_pair_reemits_after_cooldown() {
+        let pub_ = CapturingPublisher::new();
+        let tracker = PunchTracker::new();
+        let a = peer(1, "203.0.113.1:34567");
+        let b = peer(2, "198.51.100.42:51820");
+        // First punch at t=0.
+        assert!(try_emit_pair(&pub_, &PeerBroadcaster::new(), &tracker, &a, &b, 0).await);
+        // Still within the cooldown -> deduped (no re-punch yet).
+        assert!(
+            !try_emit_pair(
+                &pub_,
+                &PeerBroadcaster::new(),
+                &tracker,
+                &a,
+                &b,
+                PUNCH_REEMIT_COOLDOWN_MICROS - 1,
+            )
+            .await
+        );
+        // At the cooldown boundary -> re-emits the pair so a stuck punch retries.
+        assert!(
+            try_emit_pair(
+                &pub_,
+                &PeerBroadcaster::new(),
+                &tracker,
+                &a,
+                &b,
+                PUNCH_REEMIT_COOLDOWN_MICROS,
+            )
+            .await
+        );
+        // Two emits => four HolePunchInitiate events; still one tracked pair.
+        assert_eq!(pub_.events().len(), 4);
+        assert_eq!(tracker.len(), 1);
+    }
+
+    #[tokio::test]
     async fn try_emit_pair_skips_self_pair() {
         let pub_ = CapturingPublisher::new();
         let tracker = PunchTracker::new();
@@ -304,9 +381,25 @@ mod tests {
     fn tracker_clear_removes_known_pair() {
         let tracker = PunchTracker::new();
         let pair = (Uuid::from_u128(1), Uuid::from_u128(2));
-        assert!(tracker.mark(pair));
+        assert!(tracker.claim(pair, 0));
         assert!(tracker.contains(pair));
         assert!(tracker.clear(pair));
         assert!(!tracker.contains(pair));
+    }
+
+    #[test]
+    fn claim_dedupes_within_cooldown_then_allows_after() {
+        let tracker = PunchTracker::new();
+        let pair = (Uuid::from_u128(1), Uuid::from_u128(2));
+        assert!(tracker.claim(pair, 1_000), "first claim wins");
+        assert!(!tracker.claim(pair, 1_000), "same instant -> deduped");
+        assert!(
+            !tracker.claim(pair, 1_000 + PUNCH_REEMIT_COOLDOWN_MICROS - 1),
+            "just under cooldown -> deduped"
+        );
+        assert!(
+            tracker.claim(pair, 1_000 + PUNCH_REEMIT_COOLDOWN_MICROS),
+            "cooldown elapsed -> re-claim"
+        );
     }
 }
