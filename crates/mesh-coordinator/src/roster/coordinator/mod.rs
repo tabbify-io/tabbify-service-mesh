@@ -208,6 +208,8 @@ pub(crate) struct Inner {
     /// pairs have already had their `HolePunchInitiate` events emitted
     /// so a noisy heartbeat stream doesn't re-publish each tick.
     pub(crate) punch_tracker: PunchTracker,
+    /// Ephemeral pubkey → live relay WS connection (Stage-3 relay floor).
+    pub(crate) relay: crate::relay::RelayRegistry,
 }
 
 impl Coordinator {
@@ -261,6 +263,7 @@ impl Coordinator {
                 validator,
                 heartbeat_timeout,
                 punch_tracker: PunchTracker::new(),
+                relay: crate::relay::RelayRegistry::new(),
             }),
         }
     }
@@ -290,6 +293,19 @@ impl Coordinator {
     #[must_use]
     pub fn punch_tracker(&self) -> &PunchTracker {
         &self.inner.punch_tracker
+    }
+
+    /// Borrow the relay registry — the WS handler registers/forwards through it.
+    #[must_use]
+    pub fn relay(&self) -> &crate::relay::RelayRegistry {
+        &self.inner.relay
+    }
+
+    /// Whether `pk` (raw 32-byte X25519 key) belongs to a registered peer.
+    /// The relay WS handler rejects an upgrade from an unknown pubkey.
+    #[must_use]
+    pub fn is_registered_pubkey(&self, pk: &[u8]) -> bool {
+        self.inner.by_pubkey.contains_key(pk)
     }
 
     /// Snapshot the entire roster, ordered by `peer_index` for stable output.
@@ -324,7 +340,7 @@ impl Coordinator {
     }
 }
 
-pub(super) fn decode_pubkey(s: &str) -> Result<Vec<u8>, CoordinatorError> {
+pub(crate) fn decode_pubkey(s: &str) -> Result<Vec<u8>, CoordinatorError> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD
         .decode(s)

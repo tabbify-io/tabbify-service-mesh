@@ -53,6 +53,26 @@ impl Coordinator {
         self.inner.policy.current().can_see(viewer_tags, peer_tags)
     }
 
+    /// May `src_pubkey` reach `dst_pubkey` over the relay? Resolves both raw
+    /// pubkeys to peer-ids via `by_pubkey`, pulls their tags, and applies the
+    /// SAME ACL as direct sessions ([`Self::viewer_can_see`]). `false` when
+    /// either pubkey is unknown or the policy denies the pair — the relay must
+    /// never be an ACL bypass.
+    #[must_use]
+    pub fn can_relay(&self, src_pubkey: &[u8], dst_pubkey: &[u8]) -> bool {
+        let Some(src_id) = self.inner.by_pubkey.get(src_pubkey).map(|e| *e) else {
+            return false;
+        };
+        let Some(dst_id) = self.inner.by_pubkey.get(dst_pubkey).map(|e| *e) else {
+            return false;
+        };
+        let (Some(src_tags), Some(dst_tags)) = (self.peer_tags(src_id), self.peer_tags(dst_id))
+        else {
+            return false;
+        };
+        self.viewer_can_see(&src_tags, &dst_tags)
+    }
+
     /// The roster as seen by a viewer carrying `viewer_tags`, filtered by
     /// policy and excluding the viewer itself (matched by `viewer_id`).
     ///
@@ -261,5 +281,37 @@ mod tests {
         let c = coordinator_with(shared_service_policy());
         assert!(c.viewer_can_see(&["tag:user-a".to_owned()], &["tag:svc".to_owned()]));
         assert!(!c.viewer_can_see(&["tag:user-a".to_owned()], &["tag:user-b".to_owned()]));
+    }
+
+    /// `can_relay` applies the SAME ACL as direct sessions: a relay forward is
+    /// allowed only for a policy-visible pair, denied for an isolated pair, and
+    /// denied when either pubkey is unknown — the relay is never an ACL bypass.
+    #[tokio::test]
+    async fn can_relay_honours_policy_and_unknown_pubkeys() {
+        let c = coordinator_with(shared_service_policy());
+        // a1 + svc are visible to each other (user-*→svc edge); a1 + b1 are not.
+        let _ = c.register(req(1, "a1", "a", &["tag:user-a"])).await.expect("a1");
+        let _ = c.register(req(2, "svc1", "svc", &["tag:svc"])).await.expect("svc");
+        let _ = c.register(req(3, "b1", "b", &["tag:user-b"])).await.expect("b1");
+        let a_pubkey = [1u8; 32];
+        let svc_pubkey = [2u8; 32];
+        let b_pubkey = [3u8; 32];
+        let unknown = [0u8; 32];
+        assert!(
+            c.can_relay(&a_pubkey, &svc_pubkey),
+            "user-a may relay to svc (policy-visible)"
+        );
+        assert!(
+            !c.can_relay(&a_pubkey, &b_pubkey),
+            "user-a must NOT relay to user-b (isolated)"
+        );
+        assert!(
+            !c.can_relay(&a_pubkey, &unknown),
+            "unknown destination pubkey denies relay"
+        );
+        assert!(
+            !c.can_relay(&unknown, &svc_pubkey),
+            "unknown source pubkey denies relay"
+        );
     }
 }
