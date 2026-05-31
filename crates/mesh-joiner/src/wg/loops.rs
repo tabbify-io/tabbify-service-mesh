@@ -529,6 +529,7 @@ mod tests {
         let session = Arc::new(PeerSession {
             peer_id: uuid::Uuid::nil(),
             ula: a,
+            peer_pubkey: [0u8; 32],
             allowed_ips: parking_lot::RwLock::new(HashSet::from([a, b])),
             endpoint: parking_lot::RwLock::new(None),
             tunn: tokio::sync::Mutex::new(boringtun::noise::Tunn::new(
