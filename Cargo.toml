@@ -4,6 +4,7 @@ members  = [
     "crates/mesh-fabric",
     "crates/mesh-coordinator",
     "crates/mesh-joiner",
+    "crates/mesh-log",
     "tools/tabbify-mesh",
     "tools/tabbify-mesh-ca",
 ]

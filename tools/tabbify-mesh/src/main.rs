@@ -2,18 +2,17 @@
 
 use anyhow::Result;
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
 use tabbify_mesh::cli::{Cli, Cmd};
 use tabbify_mesh::commands;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
-        .init();
+    // Single fleet-wide logging init: JSON + `info` default + a flat
+    // `service` field. This replaces the old inline `warn`-default,
+    // non-JSON subscriber so this CLI's logs match the coordinator's and
+    // the host apps' shape in Loki. Re-exported from `tabbify-mesh-joiner`.
+    tabbify_mesh_joiner::init_logging("tabbify-mesh");
 
     let cli = Cli::parse();
     match cli.cmd {

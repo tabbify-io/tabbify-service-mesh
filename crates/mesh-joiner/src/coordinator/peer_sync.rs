@@ -198,10 +198,22 @@ pub async fn apply_event(
                     return;
                 }
             };
+            // Re-peer observability (Loki): one structured line per roster
+            // mutation, keyed by the consistent (peer_id, ula, endpoint)
+            // fields + an `event` discriminator so a single peer's
+            // add/update/remove can be traced. `peer_added` covers both the
+            // first add and a re-add after an endpoint change (a NAT'd peer
+            // re-peering shows up here).
+            let event = if matches!(kind, PeerEventKind::Updated) {
+                "peer_updated"
+            } else {
+                "peer_added"
+            };
             tracing::info!(
                 peer_id = %info.peer_id,
                 ula = %info.ula,
-                ?kind,
+                endpoint = ?info.listen_endpoint,
+                event,
                 hosted_app_ulas = ?info.hosted_app_ulas,
                 "peer-stream: applying upsert"
             );
@@ -230,7 +242,13 @@ pub async fn apply_event(
                 .filter(|s| s.peer_id == payload.peer_id)
                 .collect();
             for s in candidates {
-                tracing::info!(peer_id = %s.peer_id, ula = %s.ula, "peer-stream: removing peer");
+                tracing::info!(
+                    peer_id = %s.peer_id,
+                    ula = %s.ula,
+                    endpoint = ?s.endpoint(),
+                    event = "peer_removed",
+                    "peer-stream: removing peer"
+                );
                 sessions.remove(s.ula);
             }
         }
@@ -241,10 +259,18 @@ pub async fn apply_event(
             };
             match serde_json::from_str::<HolePunchInitiate>(data) {
                 Ok(ev) => {
+                    // Re-peer observability: a NAT'd peer's hole-punch path
+                    // starts here when the coordinator pushes a punch
+                    // directive over the SSE stream. `peer_id` is the target
+                    // we are being told to dial, `endpoint` its external
+                    // reflexive addr — the same field names the roster +
+                    // handshake events use, so one Loki query follows the
+                    // whole sequence (directive -> handshake_init -> ...).
                     tracing::info!(
+                        peer_id = %ev.target_peer_id,
+                        endpoint = %ev.target_external_endpoint,
+                        event = "holepunch_directive",
                         initiator = %ev.initiator_peer_id,
-                        target = %ev.target_peer_id,
-                        target_endpoint = %ev.target_external_endpoint,
                         "peer-stream: forwarding hole-punch to punch task"
                     );
                     // Best-effort: if the punch task has gone away, drop it.

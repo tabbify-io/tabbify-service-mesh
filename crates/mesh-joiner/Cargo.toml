@@ -40,6 +40,10 @@ dashmap     = { workspace = true }
 parking_lot = { workspace = true }
 
 tracing            = { workspace = true }
+# Unified logging-init, re-exported from this crate's root so host apps
+# that embed the joiner (supervisor / node) call the SAME `init_logging`
+# the coordinator and the CLI use — one JSON shape across the fleet.
+tabbify-mesh-log   = { path = "../mesh-log" }
 
 anyhow    = { workspace = true }
 thiserror = { workspace = true }

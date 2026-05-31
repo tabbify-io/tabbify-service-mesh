@@ -2201,7 +2201,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2234,13 +2233,13 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "tabbify-mesh-log",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-test",
  "tracing",
- "tracing-subscriber",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
@@ -2281,6 +2280,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tabbify-mesh-fabric",
+ "tabbify-mesh-log",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2289,6 +2289,14 @@ dependencies = [
  "uuid",
  "wiremock",
  "x25519-dalek",
+]
+
+[[package]]
+name = "tabbify-mesh-log"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

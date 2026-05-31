@@ -368,6 +368,21 @@ async fn reconcile_roster(
         match remote_to_info(r).await {
             Ok(info) => {
                 remote_ulas.insert(info.ula);
+                // Re-peer observability: only log a `reconcile_add` for a
+                // peer the heartbeat backfill is learning for the FIRST time
+                // (i.e. the SSE stream missed it). A steady-state upsert
+                // re-handshakes every tick, so logging those would be pure
+                // noise — gate on "no prior session for this ULA" to keep
+                // the line low-cardinality and meaningful.
+                if sessions.by_ula(info.ula).is_none() {
+                    tracing::info!(
+                        peer_id = %info.peer_id,
+                        ula = %info.ula,
+                        endpoint = ?info.listen_endpoint,
+                        event = "reconcile_add",
+                        "heartbeat: backfilling peer the SSE stream missed"
+                    );
+                }
                 // upsert is a no-op for unchanged endpoints (well — it
                 // re-handshakes; we accept that cost for simplicity in
                 // MVP). Future work: skip when (peer_id, endpoint,
@@ -390,7 +405,18 @@ async fn reconcile_roster(
     // roster has been timed out or deregistered behind our back.
     for ula in sessions.ulas() {
         if !remote_ulas.contains(&ula) {
-            tracing::debug!(%ula, "heartbeat: pruning timed-out peer");
+            // Re-peer observability: the coordinator no longer lists this
+            // ULA, so the SSE `peer_removed` was missed or the peer was
+            // timed out behind our back. Capture the peer_id (best-effort
+            // from the live session) so the prune correlates with its
+            // earlier add by peer_id, not just ULA.
+            let peer_id = sessions.by_ula(ula).map(|s| s.peer_id);
+            tracing::info!(
+                peer_id = ?peer_id,
+                %ula,
+                event = "reconcile_prune",
+                "heartbeat: pruning timed-out peer the SSE stream missed"
+            );
             sessions.remove(ula);
         }
     }

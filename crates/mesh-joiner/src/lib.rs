@@ -77,3 +77,14 @@ pub use config::JoinConfig;
 pub use error::{JoinerError, Result as JoinerResult};
 pub use joiner::Joiner;
 pub use peer::PeerInfo;
+
+/// Re-export of the unified logging initialiser so a host application that
+/// embeds the joiner (the supervisor / node) calls the SAME
+/// `init_logging` the coordinator binary and the `tabbify-mesh` CLI use —
+/// one JSON shape, one `RUST_LOG` default (`info`), one flat `service`
+/// field across the whole fleet. See [`tabbify_mesh_log::init_logging`].
+///
+/// ```ignore
+/// tabbify_mesh_joiner::init_logging("tabbify-supervisor");
+/// ```
+pub use tabbify_mesh_log::init_logging;

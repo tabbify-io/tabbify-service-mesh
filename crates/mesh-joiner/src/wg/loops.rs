@@ -87,9 +87,20 @@ pub(crate) async fn udp_recv_loop(
                             if matches!(attempt, WgAction::Error(_) | WgAction::Nothing) {
                                 continue;
                             }
-                            tracing::debug!(
-                                peer = %session.peer_id,
-                                %peer_addr,
+                            // Re-peer observability: a datagram from a NOT-yet-known
+                            // source addr just decapsulated cleanly under this
+                            // session's Tunn — i.e. the peer authenticated from a
+                            // new endpoint (NAT roam / re-peer / hole-punch crossing).
+                            // This is the live data-plane moment a re-peering NAT'd
+                            // peer (the ThinkPad) becomes reachable, so emit a
+                            // structured `session_established` with the consistent
+                            // (peer_id, ula, endpoint) fields the roster + handshake
+                            // events use.
+                            tracing::info!(
+                                peer_id = %session.peer_id,
+                                ula = %session.ula,
+                                endpoint = %peer_addr,
+                                event = "session_established",
                                 "udp_recv: learned endpoint from successful decapsulate"
                             );
                             sessions.learn_endpoint(&session, peer_addr);

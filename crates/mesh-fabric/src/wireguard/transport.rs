@@ -80,12 +80,40 @@ impl WireGuardFabric {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if let Some(peer) = self.inner.peers.get(node_id) {
-                let tunn = peer.tunn.lock().await;
-                if tunn.time_since_last_handshake().is_some() {
+                let established = {
+                    let tunn = peer.tunn.lock().await;
+                    tunn.time_since_last_handshake().is_some()
+                };
+                if established {
+                    // Re-peer observability: the first authenticated packet
+                    // has crossed — the session is live. Same (node_id,
+                    // endpoint) fields as `handshake_init` so a Loki query
+                    // can confirm the re-peer actually completed.
+                    tracing::info!(
+                        node_id = %node_id,
+                        endpoint = %peer.endpoint,
+                        event = "session_established",
+                        "wireguard: handshake completed — session established"
+                    );
                     return Ok(());
                 }
             }
             if tokio::time::Instant::now() >= deadline {
+                // Re-peer observability: the handshake never completed in
+                // time. This is the line that pinpoints a stuck re-peer (the
+                // ThinkPad sent inits but no authenticated packet came back).
+                let endpoint = self
+                    .inner
+                    .peers
+                    .get(node_id)
+                    .map(|p| p.endpoint.to_string());
+                tracing::warn!(
+                    node_id = %node_id,
+                    endpoint = ?endpoint,
+                    event = "handshake_timeout",
+                    timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    "wireguard: handshake did not complete within timeout"
+                );
                 return Err(FabricError::Transport(format!(
                     "handshake to {node_id} did not complete within {timeout:?}"
                 )));
@@ -126,6 +154,18 @@ impl WireGuardFabric {
             }
         };
         if let Some(bytes) = outbound {
+            // Re-peer observability: a fresh WireGuard handshake-init is
+            // going out to this peer's endpoint. `event="handshake_init"`
+            // with the (node_id, endpoint) pair lets a Loki query see the
+            // moment a re-peer attempt leaves the wire — paired with the
+            // `session_established` / `handshake_timeout` events below it
+            // tells you whether the handshake ever completed.
+            tracing::info!(
+                node_id = %node_id,
+                endpoint = %peer.endpoint,
+                event = "handshake_init",
+                "wireguard: sending handshake-init to peer"
+            );
             self.inner
                 .socket
                 .send_to(&bytes, peer.endpoint)

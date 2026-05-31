@@ -20,7 +20,6 @@ use tabbify_mesh_coordinator::{
     build_server_config, timeout,
 };
 use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "tabbify-mesh-coordinator", version)]
@@ -91,12 +90,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .json()
-        .init();
+    tabbify_mesh_log::init_logging("mesh-coordinator");
 
     let args = Args::parse();
     // Don't log the full args struct — it carries the admin token. Log the

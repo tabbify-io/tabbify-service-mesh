@@ -24,7 +24,9 @@ tabbify-mesh-joiner = { path = "../../crates/mesh-joiner" }
 clap     = { workspace = true }
 tokio    = { workspace = true }
 tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
+# Logging init comes from the unified `tabbify-mesh-log` crate, re-exported
+# through `tabbify-mesh-joiner` (this tool already depends on it), so this
+# CLI no longer needs a direct `tracing-subscriber` dependency.
 anyhow   = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }

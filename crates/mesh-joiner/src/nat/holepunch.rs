@@ -129,9 +129,17 @@ pub async fn execute_punch(socket: &UdpSocket, plan: &PunchPlan, burst: usize, i
             if let Err(e) = socket.send_to(&bytes, plan.endpoint).await {
                 tracing::warn!(error = %e, endpoint = %plan.endpoint, "holepunch: send failed");
             } else {
-                tracing::debug!(
+                // Re-peer observability: a WireGuard handshake-init just left
+                // the wire toward the target's reflexive endpoint as part of
+                // the NAT hole-punch burst. Same (peer_id, ula, endpoint,
+                // event) shape as the roster + completion events so the punch
+                // burst is traceable in Loki between the `holepunch_directive`
+                // and a later `session_established`.
+                tracing::info!(
+                    peer_id = %plan.session.peer_id,
+                    ula = %plan.session.ula,
                     endpoint = %plan.endpoint,
-                    peer = %plan.session.peer_id,
+                    event = "handshake_init",
                     "holepunch: fired handshake-init"
                 );
             }

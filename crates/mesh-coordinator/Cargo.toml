@@ -39,7 +39,10 @@ dashmap      = { workspace = true }
 parking_lot  = { workspace = true }
 
 tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
+# Unified logging-init: single JSON subscriber with a flat `service`
+# field, shared by every mesh entry point. Replaces the inline
+# `tracing_subscriber::fmt().json().init()` this binary used to call.
+tabbify-mesh-log   = { path = "../mesh-log" }
 
 clap     = { workspace = true }
 anyhow   = { workspace = true }
