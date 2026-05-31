@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Join(args) => commands::join::run(args).await,
+        Cmd::Join(args) => commands::join::run(*args).await,
         Cmd::Status => commands::status::run().await,
         Cmd::Peers(args) => commands::peers::run(args).await,
         Cmd::Leave(args) => commands::leave::run(args).await,

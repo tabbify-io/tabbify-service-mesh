@@ -118,6 +118,17 @@ pub struct JoinConfig {
     /// toward `desired` (spec P0 OBSERVE). `None` (default) — the joiner
     /// never invents a value; an omitting host stays back-compatible.
     pub software_version: Option<String>,
+    /// Whether to open the Stage-3 DERP-style relay client (the
+    /// connectivity floor). `true` (default) — the joiner keeps a
+    /// persistent WebSocket to the coordinator's `/v1/mesh/relay` endpoint
+    /// and relays WG packets to peers it has no direct path to. Set `false`
+    /// (`--no-relay`) to opt out and rely solely on direct + hole-punch.
+    pub relay_enabled: bool,
+    /// Explicit relay endpoint URL, OVERRIDING the default derivation from
+    /// `coordinator_url`. `None` (default) — derive
+    /// `ws(s)://{host}/v1/mesh/relay` from [`Self::coordinator_url`]. Set
+    /// only when the relay lives at a non-default location.
+    pub relay_url: Option<String>,
 }
 
 impl Default for JoinConfig {
@@ -146,6 +157,11 @@ impl Default for JoinConfig {
             app_uuid: None,
             identity_path: None,
             software_version: None,
+            // Relay (Stage-3 connectivity floor) is ON by default: the
+            // joiner should always have a path to every peer it can see,
+            // even behind a hard NAT. Opt out via `--no-relay`.
+            relay_enabled: true,
+            relay_url: None,
         }
     }
 }
@@ -166,6 +182,10 @@ mod tests {
         assert!(cfg.tags.is_empty());
         assert!(cfg.listen_port.is_none());
         assert!(cfg.tun_name.is_none());
+        // Relay is the connectivity floor — it must default ON so every
+        // peer is reachable even when direct + hole-punch fail.
+        assert!(cfg.relay_enabled, "relay must default on");
+        assert!(cfg.relay_url.is_none());
     }
 
     #[test]
@@ -190,6 +210,8 @@ mod tests {
             app_uuid: Some("01910f10-0000-7000-8000-000000000099".into()),
             identity_path: Some(PathBuf::from("/tmp/id.json")),
             software_version: Some("v1.4.0".into()),
+            relay_enabled: false,
+            relay_url: Some("ws://10.0.0.1:9000/v1/mesh/relay".into()),
         };
         let cloned = cfg.clone();
         assert_eq!(cloned.coordinator_url, cfg.coordinator_url);
@@ -208,6 +230,8 @@ mod tests {
         assert_eq!(cloned.app_uuid, cfg.app_uuid);
         assert_eq!(cloned.identity_path, cfg.identity_path);
         assert_eq!(cloned.software_version, cfg.software_version);
+        assert_eq!(cloned.relay_enabled, cfg.relay_enabled);
+        assert_eq!(cloned.relay_url, cfg.relay_url);
     }
 
     /// SV-2: the host-supplied `software_version` round-trips through clone

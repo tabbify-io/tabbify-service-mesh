@@ -2268,11 +2268,13 @@ name = "tabbify-mesh-joiner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "boringtun",
  "dashmap",
  "eventsource-stream",
  "futures",
+ "futures-util",
  "parking_lot",
  "rand_core 0.6.4",
  "rcgen",
@@ -2285,6 +2287,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
  "wiremock",

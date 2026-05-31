@@ -15,6 +15,7 @@ use super::WG_PERSISTENT_KEEPALIVE_SECS;
 use super::peer_session::{PeerSession, allowed_ips_for};
 use super::route_sink::RouteSink;
 use crate::peer::PeerInfo;
+use crate::relay::RelayHandle;
 use boringtun::noise::Tunn;
 use dashmap::DashMap;
 use rand_core::{OsRng, RngCore};
@@ -33,6 +34,11 @@ pub struct SessionTable {
     /// Lookup by source UDP endpoint — used by the UDP-recv path to
     /// route an inbound ciphertext datagram to the right `Tunn`.
     by_endpoint: Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
+    /// Lookup by the peer's raw WG public key — used by the relay RX path
+    /// to demux an inbound relay frame (keyed by source pubkey) to the
+    /// right session. Populated on every [`Self::upsert`] and dropped on
+    /// [`Self::remove`] / [`Self::clear`].
+    by_pubkey: Arc<DashMap<[u8; 32], Arc<PeerSession>>>,
     /// Secondary index for per-app-ULA routing: `app_ula → hosting peer's
     /// ULA`. Consulted by [`Self::by_ula`] as a FALLBACK after the
     /// peer-ULA fast path misses, so a packet bound for an app-ULA
@@ -44,6 +50,12 @@ pub struct SessionTable {
     /// route management entirely — used by unit tests and by callers
     /// that manage routes out of band.
     route_sink: Option<Arc<dyn RouteSink>>,
+    /// Optional relay handle (Stage-3 connectivity floor). When `Some`,
+    /// the WG TX seams forward a packet through the relay instead of
+    /// silently dropping it when no direct endpoint is known. `None` (the
+    /// default) preserves the pre-relay drop behaviour — used by tests and
+    /// by a joiner started with `--no-relay`.
+    relay: Option<RelayHandle>,
 }
 
 impl std::fmt::Debug for SessionTable {
@@ -51,11 +63,13 @@ impl std::fmt::Debug for SessionTable {
         f.debug_struct("SessionTable")
             .field("by_ula", &self.by_ula)
             .field("by_endpoint", &self.by_endpoint)
+            .field("by_pubkey", &self.by_pubkey.len())
             .field("app_routes", &self.app_routes)
             .field(
                 "route_sink",
                 &self.route_sink.as_ref().map(|_| "<RouteSink>"),
             )
+            .field("relay", &self.relay.as_ref().map(|_| "<RelayHandle>"))
             .finish()
     }
 }
@@ -79,6 +93,32 @@ impl SessionTable {
             route_sink: Some(route_sink),
             ..Self::default()
         }
+    }
+
+    /// Construct an empty table wired to `route_sink` AND an optional
+    /// relay handle (Stage-3 connectivity floor). When `relay` is `Some`,
+    /// the WG TX seams forward a packet through the relay instead of
+    /// dropping it when no direct endpoint is known. The joiner passes
+    /// `Some` when relay is enabled; `with_route_sink` (relay `None`) and
+    /// `new` stay the no-relay paths.
+    #[must_use]
+    pub fn with_route_sink_and_relay(
+        route_sink: Arc<dyn RouteSink>,
+        relay: Option<RelayHandle>,
+    ) -> Self {
+        Self {
+            route_sink: Some(route_sink),
+            relay,
+            ..Self::default()
+        }
+    }
+
+    /// Borrow the relay handle, if this table was built with one. The WG
+    /// TX/timer loops call this to relay a packet when no direct endpoint
+    /// is known.
+    #[must_use]
+    pub const fn relay(&self) -> Option<&RelayHandle> {
+        self.relay.as_ref()
     }
 
     /// Number of registered sessions.
@@ -153,6 +193,14 @@ impl SessionTable {
     #[must_use]
     pub fn by_endpoint(&self, endpoint: SocketAddr) -> Option<Arc<PeerSession>> {
         self.by_endpoint.get(&endpoint).map(|kv| kv.value().clone())
+    }
+
+    /// Look up a session by its peer's raw WG public key (relay RX demux).
+    /// The relay read-loop receives a frame whose 32-byte prefix is the
+    /// SOURCE pubkey and resolves it here to find the `Tunn` to feed.
+    #[must_use]
+    pub fn by_pubkey(&self, pubkey: [u8; 32]) -> Option<Arc<PeerSession>> {
+        self.by_pubkey.get(&pubkey).map(|kv| kv.value().clone())
     }
 
     /// Record that remote peer `host_ula` hosts `app_ula` (per-app-ULA
@@ -276,16 +324,25 @@ impl SessionTable {
             if let Some(addr) = old.endpoint() {
                 self.by_endpoint.remove(&addr);
             }
+            // Drop the prior pubkey index entry when the peer rotated its
+            // key (same ULA, new pubkey) so a stale pubkey → session
+            // pointer never lingers. A re-upsert with the same key is
+            // re-inserted below, so this is safe either way.
+            if old.peer_pubkey != info.wg_public_key {
+                self.by_pubkey.remove(&old.peer_pubkey);
+            }
         }
 
         let mut idx_bytes = [0u8; 4];
         OsRng.fill_bytes(&mut idx_bytes);
         let index = u32::from_le_bytes(idx_bytes);
 
-        let peer_pubkey = PublicKey::from(info.wg_public_key);
+        // The x25519 `PublicKey` boringtun needs; distinct from the raw
+        // `[u8; 32]` we store on the session for relay demux below.
+        let tunn_pubkey = PublicKey::from(info.wg_public_key);
         let tunn = Tunn::new(
             our_private.clone(),
-            peer_pubkey,
+            tunn_pubkey,
             None,                               // no preshared key in MVP
             Some(WG_PERSISTENT_KEEPALIVE_SECS), // keep NAT mapping open
             index,
@@ -295,6 +352,7 @@ impl SessionTable {
         let session = Arc::new(PeerSession {
             peer_id: info.peer_id,
             ula: info.ula,
+            peer_pubkey: info.wg_public_key,
             allowed_ips: parking_lot::RwLock::new(allowed_ips_for(info)),
             endpoint: parking_lot::RwLock::new(info.listen_endpoint),
             tunn: Mutex::new(tunn),
@@ -315,6 +373,7 @@ impl SessionTable {
             }
         }
         self.by_ula.insert(info.ula, session.clone());
+        self.by_pubkey.insert(info.wg_public_key, session.clone());
         if let Some(addr) = info.listen_endpoint {
             self.by_endpoint.insert(addr, session);
         }
@@ -336,6 +395,7 @@ impl SessionTable {
         if let Some(addr) = session.endpoint() {
             self.by_endpoint.remove(&addr);
         }
+        self.by_pubkey.remove(&session.peer_pubkey);
         // Tear down every app-ULA route that pointed at this peer — the
         // host is gone, so the app is no longer reachable through it
         // (per-app-ULA routing). Collect first to avoid mutating the map
@@ -369,6 +429,7 @@ impl SessionTable {
         }
         self.by_ula.clear();
         self.by_endpoint.clear();
+        self.by_pubkey.clear();
         self.app_routes.clear();
     }
 }

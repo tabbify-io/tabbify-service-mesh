@@ -35,6 +35,8 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         tls_key,
         tls_ca,
         insecure_no_mtls,
+        no_relay,
+        relay_url,
     } = args;
 
     println!("joining... coordinator={coordinator}");
@@ -56,6 +58,11 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         tls_key,
         tls_ca,
         insecure_no_mtls,
+        // Relay is on by default (the connectivity floor); `--no-relay`
+        // opts out. `relay_url` overrides the default derivation from the
+        // coordinator URL.
+        relay_enabled: !no_relay,
+        relay_url,
         // Runner-specific fields are not exposed via CLI — plain join is
         // always a plain peer. Per-app-runner processes set these
         // programmatically via JoinConfig directly.

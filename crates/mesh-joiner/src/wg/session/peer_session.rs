@@ -17,6 +17,10 @@ pub struct PeerSession {
     pub peer_id: uuid::Uuid,
     /// IPv6 ULA assigned to this peer.
     pub ula: Ipv6Addr,
+    /// The peer's raw 32-byte X25519 `WireGuard` public key. Captured at
+    /// [`super::SessionTable::upsert`] time so the relay RX path can demux
+    /// an inbound frame (keyed by source pubkey) to the right session.
+    pub peer_pubkey: [u8; 32],
     /// The set of `/128` source addresses this peer is permitted to use
     /// (spec §5.5 — cryptokey-routing invariant). Built from the
     /// coordinator's roster at [`super::SessionTable::upsert`] time: at minimum
@@ -99,6 +103,7 @@ impl std::fmt::Debug for PeerSession {
         f.debug_struct("PeerSession")
             .field("peer_id", &self.peer_id)
             .field("ula", &self.ula)
+            .field("peer_pubkey", &"<pubkey>")
             .field("allowed_ips", &self.allowed_ips.read())
             .field("endpoint", &self.endpoint())
             .field("tunn", &"<Tunn>")

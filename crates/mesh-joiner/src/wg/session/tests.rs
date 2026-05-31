@@ -68,6 +68,37 @@ fn empty_table_starts_empty() {
     assert!(t.snapshot().is_empty());
 }
 
+/// A session built by `upsert` carries the peer's raw WG public key, and
+/// the `by_pubkey` index resolves to that same session — the demux the
+/// relay RX path uses to find the right `Tunn` for an inbound frame.
+#[test]
+fn upsert_indexes_session_by_pubkey() {
+    let t = SessionTable::new();
+    let me = StaticSecret::from([42u8; 32]);
+    let p = info(1, "fd5a:1f00:1::1", Some("127.0.0.1:51820"));
+    t.upsert(&me, &p);
+    let session = t.by_pubkey(p.wg_public_key).expect("session by pubkey");
+    assert_eq!(
+        session.peer_pubkey, p.wg_public_key,
+        "session stores the peer's pubkey"
+    );
+    // The pubkey index resolves to the same session as the ULA index.
+    assert_eq!(session.ula, p.ula);
+}
+
+/// Removing a session drops its `by_pubkey` entry too, so a later relay
+/// frame for that pubkey no longer resolves to a stale session.
+#[test]
+fn remove_clears_pubkey_index() {
+    let t = SessionTable::new();
+    let me = StaticSecret::from([42u8; 32]);
+    let p = info(1, "fd5a:1f00:1::1", Some("127.0.0.1:51820"));
+    t.upsert(&me, &p);
+    assert!(t.by_pubkey(p.wg_public_key).is_some());
+    assert!(t.remove(p.ula));
+    assert!(t.by_pubkey(p.wg_public_key).is_none());
+}
+
 #[test]
 fn upsert_inserts_and_indexes_both_lookups() {
     let t = SessionTable::new();

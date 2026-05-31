@@ -29,6 +29,14 @@ reqwest      = { workspace = true }
 # `/v1/mesh/peers/stream` endpoint.
 eventsource-stream = "0.2"
 
+# Relay client transport: a persistent WebSocket to the coordinator's
+# `/v1/mesh/relay` endpoint (Stage 3 connectivity floor). ws:// only for
+# the POC — `connect` + `handshake` are the minimal client features; the
+# wss/mTLS path is structured-for but out of scope (the relay task returns
+# early under secure mode). `futures-util` splits the WS into sink/stream.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+futures-util      = "0.3"
+
 # Codec
 serde       = { workspace = true }
 serde_json  = { workspace = true }
@@ -57,6 +65,9 @@ tabbify-mesh-fabric = { path = "../mesh-fabric", features = ["wireguard"] }
 tokio-test = { workspace = true }
 tempfile   = { workspace = true }
 wiremock   = { workspace = true }
+# Implement a recording `TunDevice` (an `#[async_trait]` trait) in the
+# relay client task's unit tests.
+async-trait = { workspace = true }
 # Generate throwaway self-signed certs in mTLS unit tests so we don't
 # need to ship PEM fixtures with the crate.
 rcgen      = "0.13"
