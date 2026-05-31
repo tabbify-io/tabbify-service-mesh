@@ -29,6 +29,14 @@ reqwest      = { workspace = true }
 # `/v1/mesh/peers/stream` endpoint.
 eventsource-stream = "0.2"
 
+# Relay client transport: a persistent WebSocket to the coordinator's
+# `/v1/mesh/relay` endpoint (Stage 3 connectivity floor). ws:// only for
+# the POC — `connect` + `handshake` are the minimal client features; the
+# wss/mTLS path is structured-for but out of scope (the relay task returns
+# early under secure mode). `futures-util` splits the WS into sink/stream.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+futures-util      = "0.3"
+
 # Codec
 serde       = { workspace = true }
 serde_json  = { workspace = true }

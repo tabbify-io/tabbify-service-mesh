@@ -24,7 +24,9 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
     /// Join the mesh and run as a foreground daemon until Ctrl-C.
-    Join(JoinArgs),
+    /// Boxed: `JoinArgs` is much larger than the other variants, so
+    /// boxing it keeps `Cmd` small (clippy `large_enum_variant`).
+    Join(Box<JoinArgs>),
     /// Print a local status snapshot written by a running `join` daemon.
     Status,
     /// List peers currently registered with the coordinator.
@@ -124,6 +126,22 @@ pub struct JoinArgs {
     /// the three `--tls-*` paths.
     #[arg(long)]
     pub insecure_no_mtls: bool,
+
+    /// Opt OUT of the Stage-3 relay (the connectivity floor). By default
+    /// the joiner keeps a persistent relay connection to the coordinator
+    /// and forwards WG packets through it to any peer it has no direct
+    /// path to — so connectivity works even behind a hard NAT. Pass
+    /// `--no-relay` to disable that and rely solely on direct +
+    /// hole-punch.
+    #[arg(long)]
+    pub no_relay: bool,
+
+    /// Explicit relay endpoint URL, OVERRIDING the default derivation from
+    /// `--coordinator`. Normally unset: the joiner derives
+    /// `ws(s)://<coordinator-host>/v1/mesh/relay`. Set only when the relay
+    /// lives at a non-default location.
+    #[arg(long, env = "TABBIFY_MESH_RELAY_URL")]
+    pub relay_url: Option<String>,
 }
 
 /// Arguments for the `peers` subcommand.
