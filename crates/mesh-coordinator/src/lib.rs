@@ -17,6 +17,7 @@ pub mod nat;
 pub mod openapi;
 pub mod policy;
 pub mod publisher;
+pub mod relay;
 pub mod roster;
 
 // Re-export the timeout sweeper at the crate root so `main.rs` keeps using
@@ -31,6 +32,7 @@ pub use http::policy_api::PolicyApiState;
 pub use http::sse::PeerEvent;
 pub use nat::holepunch::{PunchPair, PunchPeer, PunchTracker, canonical_pair, try_emit_pair};
 pub use policy::{AclRule, Policy, PolicyReplaceError, PolicySnapshot, PolicyStore};
+pub use relay::RelayRegistry;
 pub use publisher::{EventPublisher, NoopPublisher};
 pub use roster::allocator::{DEFAULT_NETWORK_SLOT, ULA_PREFIX_LITERAL, UlaAllocator, network_slot};
 pub use roster::coordinator::{Coordinator, CoordinatorError, PeerEntry};
