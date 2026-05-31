@@ -68,8 +68,8 @@ pub mod error;
 pub mod joiner;
 pub mod nat;
 pub mod peer;
-pub mod relay;
 pub mod platform;
+pub mod relay;
 pub mod wg;
 
 // `anyhow::Result` is the documented return type of `Joiner::join` and

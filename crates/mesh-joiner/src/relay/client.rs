@@ -156,9 +156,10 @@ enum ConnOutcome {
 }
 
 /// One relay connection lifecycle: connect, then concurrently drain
-/// `outbound_rx` to the sink and feed inbound frames into boringtun. On a
-/// successful connect the backoff counter is implicitly reset by the
-/// caller treating each `connect_once` call freshly.
+/// `outbound_rx` to the sink and feed inbound frames into boringtun. The
+/// backoff counter is owned by [`run`] and is monotonic
+/// (`saturating_add`, never reset) — a connection that succeeds and is
+/// then dropped does NOT reset the backoff, mirroring `peer_sync::run`.
 async fn connect_once(url: &str, task: &mut RelayTask) -> ConnOutcome {
     let ws = tokio::select! {
         biased;
