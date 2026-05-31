@@ -118,6 +118,9 @@ impl Coordinator {
         };
         if let Some((_, entry)) = self.inner.roster.remove(&peer_id) {
             self.inner.by_pubkey.remove(&entry.wg_public_key);
+            // Tear down any live relay connection for this pubkey — a peer
+            // that left the roster must no longer be a relay endpoint.
+            self.inner.relay.drop_pubkey(&entry.wg_public_key);
         }
     }
 }
@@ -184,6 +187,50 @@ mod tests {
         };
         coord.apply_peer_left(&left);
         assert_eq!(coord.snapshot().len(), 0);
+    }
+
+    /// A relay connection registered for a peer's pubkey must be torn down
+    /// when that peer leaves the roster — otherwise a stale connection could
+    /// keep receiving relayed frames for a pubkey that is no longer a peer.
+    #[tokio::test]
+    async fn apply_peer_left_drops_relay_conn() {
+        let coord = Coordinator::new(Arc::new(NoopPublisher), Duration::from_secs(60));
+        let peer_id = uuid::Uuid::now_v7();
+        let pubkey = vec![1u8; 32];
+        let joined = PeerJoined {
+            peer_id: peer_id.to_string(),
+            wg_public_key: pubkey.clone(),
+            ula: "fd5a:1f00:1:5::1".into(),
+            listen_endpoint: String::new(),
+            display_name: "test".into(),
+            network: "n1".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            joined_at_micros: 1,
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
+            software_version: None,
+        };
+        coord.apply_peer_joined(&joined).expect("apply joined");
+        // Register a live relay connection for this peer's pubkey.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        coord.relay().register(pubkey.clone(), tx);
+        assert!(
+            coord.relay().forward(&pubkey, vec![1, 2, 3]),
+            "relay forward should reach the live conn before peer-left"
+        );
+        // Peer leaves -> its relay conn must be dropped.
+        let left = PeerLeft {
+            peer_id: peer_id.to_string(),
+            reason: "shutdown".into(),
+            left_at_micros: 2,
+        };
+        coord.apply_peer_left(&left);
+        assert!(
+            !coord.relay().forward(&pubkey, vec![4, 5, 6]),
+            "relay conn must be gone after peer-left"
+        );
     }
 
     #[tokio::test]

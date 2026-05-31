@@ -63,6 +63,10 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
         .route("/v1/mesh/deregister", post(deregister_handler))
         .route("/v1/mesh/peers", get(peers_handler))
         .route("/v1/mesh/peers/stream", get(stream_handler))
+        .route(
+            "/v1/mesh/relay",
+            get(crate::http::relay::relay_ws_handler),
+        )
         .with_state(coordinator.clone());
 
     let policy_state = PolicyApiState {

@@ -8,4 +8,5 @@
 pub mod api;
 pub mod mtls;
 pub mod policy_api;
+pub(crate) mod relay;
 pub mod sse;
