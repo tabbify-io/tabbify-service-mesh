@@ -49,6 +49,7 @@ use crate::roster::events::HolePunchInitiate;
         crate::http::api::handlers::deregister_handler,
         crate::http::api::handlers::peers_handler,
         crate::http::api::stream::stream_handler,
+        crate::http::relay::relay_ws_handler,
         crate::http::policy_api::get_policy_handler,
         crate::http::policy_api::put_policy_handler,
     ),
@@ -144,6 +145,7 @@ mod tests {
                 "/v1/mesh/peers",
                 "/v1/mesh/peers/stream",
                 "/v1/mesh/register",
+                "/v1/mesh/relay",
                 "/v1/policy",
             ],
         );
