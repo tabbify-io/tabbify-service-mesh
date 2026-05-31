@@ -72,3 +72,8 @@ wiremock   = { workspace = true }
 # fixture .pem files in the repo. Matches the rustls 0.23 cert / key types
 # via the pki-types re-export.
 rcgen      = "0.13"
+# WebSocket client for the cross-crate relay integration test: drives the
+# real `/v1/mesh/relay` endpoint over a loopback TCP socket. Same version /
+# feature set the joiner relay client uses, so the test exercises the exact
+# handshake + binary-frame path a real joiner takes.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }

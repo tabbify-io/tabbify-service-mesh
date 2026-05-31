@@ -2239,6 +2239,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-test",
+ "tokio-tungstenite",
  "tracing",
  "utoipa",
  "utoipa-swagger-ui",
