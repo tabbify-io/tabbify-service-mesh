@@ -15,6 +15,7 @@ use super::WG_PERSISTENT_KEEPALIVE_SECS;
 use super::peer_session::{PeerSession, allowed_ips_for};
 use super::route_sink::RouteSink;
 use crate::peer::PeerInfo;
+use crate::relay::RelayHandle;
 use boringtun::noise::Tunn;
 use dashmap::DashMap;
 use rand_core::{OsRng, RngCore};
@@ -49,6 +50,12 @@ pub struct SessionTable {
     /// route management entirely — used by unit tests and by callers
     /// that manage routes out of band.
     route_sink: Option<Arc<dyn RouteSink>>,
+    /// Optional relay handle (Stage-3 connectivity floor). When `Some`,
+    /// the WG TX seams forward a packet through the relay instead of
+    /// silently dropping it when no direct endpoint is known. `None` (the
+    /// default) preserves the pre-relay drop behaviour — used by tests and
+    /// by a joiner started with `--no-relay`.
+    relay: Option<RelayHandle>,
 }
 
 impl std::fmt::Debug for SessionTable {
@@ -62,6 +69,7 @@ impl std::fmt::Debug for SessionTable {
                 "route_sink",
                 &self.route_sink.as_ref().map(|_| "<RouteSink>"),
             )
+            .field("relay", &self.relay.as_ref().map(|_| "<RelayHandle>"))
             .finish()
     }
 }
@@ -85,6 +93,32 @@ impl SessionTable {
             route_sink: Some(route_sink),
             ..Self::default()
         }
+    }
+
+    /// Construct an empty table wired to `route_sink` AND an optional
+    /// relay handle (Stage-3 connectivity floor). When `relay` is `Some`,
+    /// the WG TX seams forward a packet through the relay instead of
+    /// dropping it when no direct endpoint is known. The joiner passes
+    /// `Some` when relay is enabled; `with_route_sink` (relay `None`) and
+    /// `new` stay the no-relay paths.
+    #[must_use]
+    pub fn with_route_sink_and_relay(
+        route_sink: Arc<dyn RouteSink>,
+        relay: Option<RelayHandle>,
+    ) -> Self {
+        Self {
+            route_sink: Some(route_sink),
+            relay,
+            ..Self::default()
+        }
+    }
+
+    /// Borrow the relay handle, if this table was built with one. The WG
+    /// TX/timer loops call this to relay a packet when no direct endpoint
+    /// is known.
+    #[must_use]
+    pub const fn relay(&self) -> Option<&RelayHandle> {
+        self.relay.as_ref()
     }
 
     /// Number of registered sessions.

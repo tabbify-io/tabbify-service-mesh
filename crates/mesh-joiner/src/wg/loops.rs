@@ -15,6 +15,7 @@
 //! None of these loops own any data — they hand back to the
 //! [`crate::wg::session::SessionTable`] for routing decisions.
 
+use crate::relay::RelayHandle;
 use crate::wg::session::{PeerSession, SessionTable, WgAction, classify_tunn_result};
 use std::net::Ipv6Addr;
 use std::sync::Arc;
@@ -63,9 +64,10 @@ pub(crate) async fn udp_recv_loop(
                 match recv {
                     Ok((n, peer_addr)) => {
                         let datagram = &buf[..n];
+                        let relay = sessions.relay();
                         // Fast path: known endpoint → known session.
                         if let Some(session) = sessions.by_endpoint(peer_addr) {
-                            process_inbound_datagram(&socket, &tun, &session, datagram).await;
+                            process_inbound_datagram(&socket, relay, &tun, &session, datagram).await;
                             continue;
                         }
                         // Slow path: unknown source addr. WireGuard
@@ -104,7 +106,7 @@ pub(crate) async fn udp_recv_loop(
                                 "udp_recv: learned endpoint from successful decapsulate"
                             );
                             sessions.learn_endpoint(&session, peer_addr);
-                            apply_wg_action(&socket, &tun, &session, attempt).await;
+                            apply_wg_action(&socket, relay, &tun, &session, attempt).await;
                             // Drain any queued frames (mirrors process_inbound_datagram).
                             loop {
                                 let next = {
@@ -116,7 +118,7 @@ pub(crate) async fn udp_recv_loop(
                                 if matches!(next, WgAction::Nothing) {
                                     break;
                                 }
-                                apply_wg_action(&socket, &tun, &session, next).await;
+                                apply_wg_action(&socket, relay, &tun, &session, next).await;
                             }
                             accepted = true;
                             break;
@@ -138,8 +140,9 @@ pub(crate) async fn udp_recv_loop(
 /// Feed one inbound UDP datagram into `session`'s tunnel, dispatching
 /// any emitted plaintext frames to the TUN device and any
 /// boringtun-emitted handshake responses back to the wire.
-async fn process_inbound_datagram(
+pub(crate) async fn process_inbound_datagram(
     socket: &UdpSocket,
+    relay: Option<&RelayHandle>,
     tun: &Arc<dyn TunDevice>,
     session: &Arc<PeerSession>,
     datagram: &[u8],
@@ -151,7 +154,7 @@ async fn process_inbound_datagram(
         let res = tunn.decapsulate(None, datagram, &mut scratch);
         classify_tunn_result(res)
     };
-    apply_wg_action(socket, tun, session, first).await;
+    apply_wg_action(socket, relay, tun, session, first).await;
 
     // boringtun documents that after `WriteToNetwork`, the caller
     // should keep calling `decapsulate` with an empty datagram until
@@ -167,12 +170,13 @@ async fn process_inbound_datagram(
         if matches!(next, WgAction::Nothing) {
             break;
         }
-        apply_wg_action(socket, tun, session, next).await;
+        apply_wg_action(socket, relay, tun, session, next).await;
     }
 }
 
 async fn apply_wg_action(
     socket: &UdpSocket,
+    relay: Option<&RelayHandle>,
     tun: &Arc<dyn TunDevice>,
     session: &Arc<PeerSession>,
     action: WgAction,
@@ -184,10 +188,18 @@ async fn apply_wg_action(
         }
         WgAction::SendToPeer(bytes) => {
             let Some(endpoint) = session.endpoint() else {
-                tracing::trace!(
-                    peer = %session.peer_id,
-                    "passive peer with bytes to send — buffering by no-op (Stage 2 will add hole-punch)"
-                );
+                // No direct path for this peer (e.g. a relay-only peer we
+                // are responding to). Carry the handshake RESPONSE back
+                // over the relay when a handle exists; else keep the
+                // pre-relay no-op.
+                if let Some(relay) = relay {
+                    relay.try_relay(session.peer_pubkey, bytes);
+                } else {
+                    tracing::trace!(
+                        peer = %session.peer_id,
+                        "no direct path, no relay — dropping outbound response"
+                    );
+                }
                 return;
             };
             if let Err(e) = socket.send_to(&bytes, endpoint).await {
@@ -283,7 +295,7 @@ pub(crate) async fn tun_read_loop(
                             endpoint = ?session.endpoint(),
                             "tun_read: encapsulating + sending"
                         );
-                        encapsulate_and_send(&socket, &session, packet).await;
+                        encapsulate_and_send(&socket, sessions.relay(), &session, packet).await;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "tun_read: error");
@@ -295,7 +307,12 @@ pub(crate) async fn tun_read_loop(
     }
 }
 
-async fn encapsulate_and_send(socket: &UdpSocket, session: &Arc<PeerSession>, packet: &[u8]) {
+async fn encapsulate_and_send(
+    socket: &UdpSocket,
+    relay: Option<&RelayHandle>,
+    session: &Arc<PeerSession>,
+    packet: &[u8],
+) {
     let action: WgAction = {
         // Size for the largest WireGuard message, NOT the input packet. When no
         // session exists yet, encapsulate() emits a 148-byte handshake-init
@@ -311,10 +328,17 @@ async fn encapsulate_and_send(socket: &UdpSocket, session: &Arc<PeerSession>, pa
     match action {
         WgAction::SendToPeer(bytes) => {
             let Some(endpoint) = session.endpoint() else {
-                tracing::trace!(
-                    peer = %session.peer_id,
-                    "passive peer — dropping outbound until they initiate"
-                );
+                // No direct path. Relay the (already-encrypted) datagram
+                // through the coordinator when a relay handle exists; else
+                // keep the pre-relay silent drop.
+                if let Some(relay) = relay {
+                    relay.try_relay(session.peer_pubkey, bytes);
+                } else {
+                    tracing::trace!(
+                        peer = %session.peer_id,
+                        "no direct path, no relay — dropping outbound until they initiate"
+                    );
+                }
                 return;
             };
             if let Err(e) = socket.send_to(&bytes, endpoint).await {
@@ -389,6 +413,12 @@ pub(crate) async fn timer_loop(
                     };
                     if let Some(bytes) = outbound {
                         let Some(endpoint) = session.endpoint() else {
+                            // No direct path — carry the timer-driven WG
+                            // output (rekey / keepalive) over the relay so a
+                            // relay-only session stays alive; else drop.
+                            if let Some(relay) = sessions.relay() {
+                                relay.try_relay(session.peer_pubkey, bytes);
+                            }
                             continue;
                         };
                         if let Err(e) = socket.send_to(&bytes, endpoint).await {
@@ -544,6 +574,98 @@ mod tests {
         assert!(inner_source_allowed(&session, &ipv6_packet_from(a)));
         assert!(inner_source_allowed(&session, &ipv6_packet_from(b)));
         assert!(!inner_source_allowed(&session, &ipv6_packet_from(denied)));
+    }
+
+    // ---- Stage 3: relay the TX drops ----
+
+    /// No-op route sink so a relay-carrying table can be built in tests
+    /// without shelling out to `route` / `ifconfig`.
+    struct NoopSink;
+    impl crate::wg::session::RouteSink for NoopSink {
+        fn add_allowed(&self, _ula: Ipv6Addr) {}
+        fn remove_allowed(&self, _ula: Ipv6Addr) {}
+        fn add_app_route(&self, _app_ula: Ipv6Addr) {}
+        fn remove_app_route(&self, _app_ula: Ipv6Addr) {}
+    }
+
+    /// Build a `PeerInfo` for a peer with a known pubkey and the given
+    /// endpoint, then upsert it into `table` and return its session.
+    fn upsert_peer(
+        table: &SessionTable,
+        ula: &str,
+        endpoint: Option<&str>,
+    ) -> Arc<PeerSession> {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let me = StaticSecret::from([9u8; 32]);
+        let info = crate::peer::PeerInfo {
+            peer_id: uuid::Uuid::nil(),
+            wg_public_key: *PublicKey::from(&StaticSecret::from([3u8; 32])).as_bytes(),
+            ula: ula.parse().unwrap(),
+            listen_endpoint: endpoint.map(|s| s.parse().unwrap()),
+            display_name: "peer".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            software_version: None,
+            joined_at_micros: 0,
+        };
+        table.upsert(&me, &info);
+        table.by_ula(ula.parse().unwrap()).unwrap()
+    }
+
+    /// When a session has NO direct endpoint and the table carries a relay
+    /// handle, `encapsulate_and_send` relays the (encrypted) datagram
+    /// instead of dropping it. The relayed payload targets the peer's
+    /// pubkey and is non-empty (a WG handshake-init).
+    #[tokio::test]
+    async fn encapsulate_relays_when_no_endpoint() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", None); // passive: no endpoint
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // An inner IPv6 packet destined for the peer triggers a handshake.
+        let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
+
+        encapsulate_and_send(&socket, table.relay(), &session, &packet).await;
+
+        let out = rx.recv().await.expect("packet relayed when no endpoint");
+        assert_eq!(out.dst_pubkey, session.peer_pubkey, "relay targets the peer pubkey");
+        assert!(!out.payload.is_empty(), "relayed payload is the WG handshake-init");
+    }
+
+    /// With a direct endpoint bound, `encapsulate_and_send` sends over UDP
+    /// and does NOT relay — the relay is a fallback, never the primary
+    /// path when a direct endpoint exists.
+    #[tokio::test]
+    async fn encapsulate_uses_udp_not_relay_when_endpoint_known() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new();
+        // Bind a receiver socket so the UDP send has a live destination.
+        let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst = receiver.local_addr().unwrap();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
+        let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
+
+        encapsulate_and_send(&sender, table.relay(), &session, &packet).await;
+
+        // The datagram went to UDP, not the relay.
+        let mut buf = vec![0u8; MAX_UDP_FRAME];
+        let recv = tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf)).await;
+        assert!(recv.is_ok(), "handshake-init delivered over UDP to the direct endpoint");
+        assert!(rx.try_recv().is_err(), "nothing relayed when a direct endpoint exists");
+    }
+
+    /// With NO relay handle, a no-endpoint session keeps the pre-relay
+    /// silent-drop behaviour — `encapsulate_and_send` is a no-op that does
+    /// not panic.
+    #[tokio::test]
+    async fn encapsulate_drops_when_no_endpoint_and_no_relay() {
+        let table = SessionTable::new();
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", None);
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
+        // No relay handle (table.relay() == None) → drop, must not panic.
+        encapsulate_and_send(&socket, table.relay(), &session, &packet).await;
     }
 
     // ---- per-app-ULA routing: TX lookup + RX source check ----
