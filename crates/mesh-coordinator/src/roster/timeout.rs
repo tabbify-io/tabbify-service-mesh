@@ -34,6 +34,11 @@ pub fn spawn(coordinator: Coordinator) -> JoinHandle<()> {
 
 /// One sweep pass — kept public so unit tests can drive it deterministically.
 pub async fn sweep_once(coordinator: &Coordinator) {
+    // Reap stale ephemeral state (dead relay conns + aged-out punch pairs) every
+    // pass, before the peer sweep + independent of whether any peer timed out —
+    // these grow even when the roster is steady.
+    coordinator.reap_stale_resources();
+
     let now = Instant::now();
     let stale = coordinator.stale_peers(now);
     if stale.is_empty() {

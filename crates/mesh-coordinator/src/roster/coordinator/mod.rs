@@ -432,6 +432,26 @@ impl Coordinator {
         entries.iter().map(PeerEntry::to_info).collect()
     }
 
+    /// Reap stale ephemeral (non-event-sourced) state: relay connections whose
+    /// WS task died without cleanup, and hole-punch pairs whose peers vanished
+    /// without a clean deregister. Logs the reaped counts + current sizes for
+    /// ops visibility. Called periodically by the background sweeper so neither
+    /// the relay registry nor the punch tracker can grow unbounded.
+    pub fn reap_stale_resources(&self) {
+        let relay_reaped = self.inner.relay.reap_closed();
+        let cutoff = now_unix_micros() - crate::nat::holepunch::PUNCH_PAIR_TTL_MICROS;
+        let punch_reaped = self.inner.punch_tracker.reap_older_than(cutoff);
+        if relay_reaped > 0 || punch_reaped > 0 {
+            tracing::info!(relay_reaped, punch_reaped, "reaped stale ephemeral mesh state");
+        }
+        tracing::debug!(
+            relay_conns = self.inner.relay.len(),
+            punch_pairs = self.inner.punch_tracker.len(),
+            roster = self.inner.roster.len(),
+            "ephemeral mesh-state sizes",
+        );
+    }
+
     /// Iterate over peer ids whose `last_heartbeat` is older than
     /// `heartbeat_timeout`. Used by the background sweeper.
     #[must_use]

@@ -56,6 +56,20 @@ impl RelayRegistry {
         self.conns.remove(pubkey);
     }
 
+    /// Reap entries whose receiver has been dropped — i.e. the relay WS task
+    /// ended without a matched [`Self::unregister`] (a panic or abnormal close).
+    /// Returns the number removed.
+    ///
+    /// `UnboundedSender::is_closed()` is `true` exactly when the paired receiver
+    /// was dropped, so this is a PRECISE liveness signal: it never evicts a
+    /// live-but-idle connection (no TTL guesswork). Called periodically by the
+    /// background sweeper so a stalled/leaked entry can't accumulate forever.
+    pub fn reap_closed(&self) -> usize {
+        let before = self.conns.len();
+        self.conns.retain(|_, c| !c.tx.is_closed());
+        before - self.conns.len()
+    }
+
     /// Number of live connections tracked.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -123,5 +137,32 @@ mod tests {
         reg.drop_pubkey(&[3u8; 32]);
         assert!(reg.is_empty());
         assert!(!reg.forward(&[3u8; 32], vec![1]));
+    }
+
+    #[test]
+    fn reap_closed_removes_only_dead_connections() {
+        let reg = RelayRegistry::new();
+        // A live connection — keep its receiver alive so the sender stays open.
+        let (tx_live, _rx_live) = mpsc::unbounded_channel();
+        reg.register(vec![1u8; 32], tx_live);
+        // A dead connection — drop the receiver so the sender reports closed.
+        let (tx_dead, rx_dead) = mpsc::unbounded_channel();
+        reg.register(vec![2u8; 32], tx_dead);
+        drop(rx_dead);
+
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.reap_closed(), 1, "only the dead conn is reaped");
+        assert_eq!(reg.len(), 1);
+        assert!(reg.forward(&[1u8; 32], vec![9]), "live conn survives");
+        assert!(!reg.forward(&[2u8; 32], vec![9]), "dead conn is gone");
+    }
+
+    #[test]
+    fn reap_closed_is_a_noop_when_all_live() {
+        let reg = RelayRegistry::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        reg.register(vec![4u8; 32], tx);
+        assert_eq!(reg.reap_closed(), 0);
+        assert_eq!(reg.len(), 1);
     }
 }

@@ -121,6 +121,10 @@ impl Coordinator {
             // Tear down any live relay connection for this pubkey — a peer
             // that left the roster must no longer be a relay endpoint.
             self.inner.relay.drop_pubkey(&entry.wg_public_key);
+            // Drop this peer's hole-punch pairs immediately (the precise path;
+            // the TTL reaper is only a backstop for peers that vanish without
+            // a clean deregister) so the tracker doesn't accumulate dead pairs.
+            self.inner.punch_tracker.remove_peer(peer_id);
         }
     }
 }

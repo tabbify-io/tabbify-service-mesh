@@ -55,6 +55,16 @@ use uuid::Uuid;
 /// costs at most one (no-op'd) directive per window.
 pub const PUNCH_REEMIT_COOLDOWN_MICROS: i64 = 15_000_000; // 15s
 
+/// TTL after which a punch pair is reaped as stale.
+///
+/// A live pair re-claims (refreshing `last_emit`) every
+/// [`PUNCH_REEMIT_COOLDOWN_MICROS`] while either side keeps heartbeating, so a
+/// pair only ages past this when a peer vanished WITHOUT a clean deregister
+/// (the precise case — a graceful deregister calls [`PunchTracker::remove_peer`]
+/// immediately). Set well above the cooldown so a merely-quiet-but-live pair is
+/// never reaped. This bounds the tracker's growth over a long-running mesh.
+pub const PUNCH_PAIR_TTL_MICROS: i64 = 300_000_000; // 5 min (≫ cooldown)
+
 /// Pair tracking key. Stored in canonical (smaller, larger) form so
 /// heartbeats from either side hit the same entry. Single source of
 /// truth for "already emitted hole-punch for this pair".
@@ -132,6 +142,26 @@ impl PunchTracker {
     /// Forget the pair — used in tests / by future eviction logic.
     pub fn clear(&self, pair: PunchPair) -> bool {
         self.last_emit.remove(&pair).is_some()
+    }
+
+    /// Remove every pair involving `peer_id`. Called when a peer deregisters or
+    /// times out so its punch pairs are cleaned up immediately (the precise,
+    /// non-TTL path). Returns the number of pairs removed.
+    pub fn remove_peer(&self, peer_id: Uuid) -> usize {
+        let before = self.last_emit.len();
+        self.last_emit
+            .retain(|&(a, b), _| a != peer_id && b != peer_id);
+        before - self.last_emit.len()
+    }
+
+    /// Reap pairs whose last emit is older than `cutoff_micros` — a backstop for
+    /// pairs whose peers vanished without a clean deregister. Returns the number
+    /// removed. A live pair keeps a fresh `last_emit` (re-claims on the cooldown
+    /// while either side heartbeats), so only genuinely stale pairs age out.
+    pub fn reap_older_than(&self, cutoff_micros: i64) -> usize {
+        let before = self.last_emit.len();
+        self.last_emit.retain(|_, &mut last| last >= cutoff_micros);
+        before - self.last_emit.len()
     }
 
     /// Number of pairs tracked.
@@ -385,6 +415,36 @@ mod tests {
         assert!(tracker.contains(pair));
         assert!(tracker.clear(pair));
         assert!(!tracker.contains(pair));
+    }
+
+    #[test]
+    fn remove_peer_drops_all_pairs_involving_it() {
+        let tracker = PunchTracker::new();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let c = Uuid::from_u128(3);
+        tracker.claim(canonical_pair(a, b), 0);
+        tracker.claim(canonical_pair(a, c), 0);
+        tracker.claim(canonical_pair(b, c), 0);
+        assert_eq!(tracker.len(), 3);
+        // Removing `a` drops (a,b) and (a,c) but keeps (b,c).
+        assert_eq!(tracker.remove_peer(a), 2);
+        assert_eq!(tracker.len(), 1);
+        assert!(tracker.contains(canonical_pair(b, c)));
+        assert!(!tracker.contains(canonical_pair(a, b)));
+    }
+
+    #[test]
+    fn reap_older_than_removes_only_stale_pairs() {
+        let tracker = PunchTracker::new();
+        let fresh = canonical_pair(Uuid::from_u128(1), Uuid::from_u128(2));
+        let stale = canonical_pair(Uuid::from_u128(3), Uuid::from_u128(4));
+        tracker.claim(stale, 1_000); // old last_emit
+        tracker.claim(fresh, 10_000); // recent last_emit
+        // Cutoff between the two — only `stale` is older than it.
+        assert_eq!(tracker.reap_older_than(5_000), 1);
+        assert!(tracker.contains(fresh), "fresh pair survives");
+        assert!(!tracker.contains(stale), "stale pair reaped");
     }
 
     #[test]
