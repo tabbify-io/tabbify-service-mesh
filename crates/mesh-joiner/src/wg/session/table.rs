@@ -16,6 +16,8 @@ use super::peer_session::{PeerSession, allowed_ips_for};
 use super::route_sink::RouteSink;
 use crate::peer::PeerInfo;
 use crate::relay::RelayHandle;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use boringtun::noise::Tunn;
 use dashmap::DashMap;
 use rand_core::{OsRng, RngCore};
@@ -167,24 +169,33 @@ impl SessionTable {
     /// topologies where the peer's source port differs from its
     /// advertised endpoint.
     ///
-    /// IMPORTANT: this does NOT overwrite the session's primary
-    /// `endpoint`. The primary endpoint is the peer's *advertised*
-    /// reachable address — the one the coordinator stored — and is
-    /// stable for new outbound traffic. The ephemeral source addr seen
-    /// on inbound is good only for keeping the existing conntrack
-    /// flow alive (e.g. our response to an incoming handshake). New
-    /// Mac-initiated traffic must still target the advertised port
-    /// because the NAT mapping for the ephemeral source has limited
-    /// lifetime. The exception: peers that registered passively (no
-    /// advertised endpoint) — for those we promote the learned source
-    /// to be authoritative since it's the only address we have.
+    /// IMPORTANT: a CONFIRMED-direct endpoint is never clobbered. Once a
+    /// decrypted data packet proved the path works bidirectionally, the
+    /// confirmed endpoint is authoritative and an ephemeral inbound source
+    /// (good only for keeping a transient NAT mapping alive) must not
+    /// regress it.
+    ///
+    /// While the session is UNCONFIRMED, however, the "advertised"
+    /// endpoint the coordinator stored is only a CANDIDATE — and for a
+    /// no-inbound-port peer (a container netns, a symmetric-NAT peer whose
+    /// reflexive endpoint we can't actually reach) it may be a BLACK HOLE.
+    /// A real inbound datagram from a different source proves a live return
+    /// path exists, so we adopt that source as the outbound default. This
+    /// lets a relayed inbound repoint an unconfirmed session off a
+    /// hole-punch-written dead endpoint if a genuine direct path appears.
+    ///
+    /// Adoption rule: take the learned source as the outbound default when
+    /// the endpoint is unset, OR when the session is unconfirmed AND the
+    /// source differs from the current candidate. Passive peers (no
+    /// advertised endpoint) are the `is_none()` case.
     pub fn learn_endpoint(&self, session: &Arc<PeerSession>, source: SocketAddr) {
         // Always index the source for inbound demux + response targeting.
         self.by_endpoint.insert(source, session.clone());
-        // Only adopt as the outbound default when we don't have a
-        // stable advertised endpoint already.
+        // Adopt as the outbound default when (a) we have no endpoint yet,
+        // or (b) the path is unconfirmed and this is a NEW source — never
+        // clobber a confirmed-direct endpoint with an ephemeral source.
         let mut guard = session.endpoint.write();
-        if guard.is_none() {
+        if guard.is_none() || (!session.direct_confirmed() && *guard != Some(source)) {
             *guard = Some(source);
         }
     }
@@ -306,46 +317,50 @@ impl SessionTable {
 
     /// Insert or replace a peer's session.
     ///
-    /// Building a fresh `Tunn` on every insert is correct (replacing an
-    /// existing session means the peer rotated its key or the
-    /// coordinator re-issued its endpoint), even though it means we
-    /// re-handshake. Stage 2 may keep the session warm across endpoint
-    /// changes; that requires API knowledge boringtun 0.7 does not
-    /// stably expose.
+    /// A FRESH `Tunn` is built only when there is no prior session for this
+    /// ULA, OR when the peer ROTATED its WG key (same ULA, new pubkey — the
+    /// old `Tunn` is keyed to a dead identity and could never complete a
+    /// handshake). On an endpoint- / metadata-only change with the SAME
+    /// pubkey the existing session is KEPT IN PLACE — its `Tunn` (and the
+    /// boringtun handshake/rekey timer) survives so a needless re-handshake
+    /// isn't forced on every ~20s `peer_updated`, and the timer-driven
+    /// relay-retransmit backstop stays reliable. Endpoint roaming is
+    /// handled out of band (`send_wire`'s `endpoint()` read +
+    /// [`Self::learn_endpoint`] + `downgrade_direct_if_stale`), so keeping
+    /// the `Tunn` across an endpoint-only change is correct.
     pub fn upsert(&self, our_private: &StaticSecret, info: &PeerInfo) {
-        // Drop the old endpoint binding before installing the new one
-        // so a stale (endpoint -> session) pointer never lingers when a
-        // peer changes address. `is_new` tracks whether this ULA had no
-        // prior session — only then do we install a fresh `/128` route
-        // (re-handshakes for an already-routed ULA must not churn the
-        // kernel routing table).
         let prior = self.by_ula.get(&info.ula).map(|kv| kv.value().clone());
+        // SAME-pubkey re-upsert (endpoint / metadata only): keep the live
+        // session + Tunn, repointing the endpoint indexes in place.
+        if let Some(old) = &prior {
+            if old.peer_pubkey == info.wg_public_key {
+                self.update_in_place(old, info);
+                return;
+            }
+        }
+
+        // From here on we BUILD a fresh session: either the first insert
+        // for this ULA (`is_new`) or a key rotation (drop the stale state).
         let is_new = prior.is_none();
         if let Some(old) = prior {
+            // Key rotation (same ULA, new pubkey). Drop the stale endpoint
+            // binding and the stale pubkey alias so no dead pointer lingers.
             if let Some(addr) = old.endpoint() {
                 self.by_endpoint.remove(&addr);
             }
-            // Drop the prior pubkey index entry when the peer rotated its
-            // key (same ULA, new pubkey) so a stale pubkey → session
-            // pointer never lingers. A re-upsert with the same key is
-            // re-inserted below, so this is safe either way.
-            if old.peer_pubkey != info.wg_public_key {
-                // Identity rotation: surface the key change so a relay-frame
-                // drop "no session for source pubkey" can be correlated with
-                // the peer that just re-keyed (observability — no behaviour
-                // change; the index roll-over already happens below).
-                use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-                use base64::Engine as _;
-                tracing::info!(
-                    event = "peer_rekey",
-                    peer_id = %info.peer_id,
-                    ula = %info.ula,
-                    old_pubkey = %B64URL.encode(old.peer_pubkey),
-                    new_pubkey = %B64URL.encode(info.wg_public_key),
-                    "session: peer rotated its WG key — rolling over the pubkey index"
-                );
-                self.by_pubkey.remove(&old.peer_pubkey);
-            }
+            // Identity rotation: surface the key change so a relay-frame
+            // drop "no session for source pubkey" can be correlated with
+            // the peer that just re-keyed (observability — no behaviour
+            // change; the index roll-over already happens below).
+            tracing::info!(
+                event = "peer_rekey",
+                peer_id = %info.peer_id,
+                ula = %info.ula,
+                old_pubkey = %B64URL.encode(old.peer_pubkey),
+                new_pubkey = %B64URL.encode(info.wg_public_key),
+                "session: peer rotated its WG key — rolling over the pubkey index"
+            );
+            self.by_pubkey.remove(&old.peer_pubkey);
         }
 
         let mut idx_bytes = [0u8; 4];
@@ -379,13 +394,13 @@ impl SessionTable {
             tunn: Mutex::new(tunn),
         });
         // Re-apply any app-ULAs this peer already hosts onto the FRESH
-        // session's allowed-set. A re-upsert (endpoint roam / re-handshake)
-        // builds a brand-new `PeerSession` whose allowed-set starts at just
-        // the peer's own ULA, which would silently drop the app-ULAs a
-        // prior session had accumulated. The `app_routes` index is the
-        // durable source of truth for which app-ULAs map to this peer, so
-        // replay them here (per-app-ULA routing, additive — a no-op when
-        // the peer hosts no apps, i.e. the common peer-only case).
+        // session's allowed-set. A key ROTATION (`!is_new`) builds a
+        // brand-new `PeerSession` whose allowed-set starts at just the
+        // peer's own ULA, which would silently drop the app-ULAs the prior
+        // session had accumulated. The `app_routes` index is the durable
+        // source of truth for which app-ULAs map to this peer, so replay
+        // them here (per-app-ULA routing, additive — a no-op when the peer
+        // hosts no apps, i.e. the common peer-only case).
         if !is_new {
             for kv in self.app_routes.iter() {
                 if *kv.value() == info.ula {
@@ -403,6 +418,45 @@ impl SessionTable {
         if is_new {
             if let Some(sink) = &self.route_sink {
                 sink.add_allowed(info.ula);
+            }
+        }
+    }
+
+    /// Update an EXISTING session whose pubkey is unchanged (endpoint /
+    /// metadata-only re-upsert) WITHOUT rebuilding it. Keeps the live
+    /// `Tunn` — and so the boringtun handshake/rekey timer — intact, while
+    /// repointing the routing indexes to the freshly-advertised endpoint:
+    ///
+    /// 1. Evict the stale `by_endpoint` alias and install the new one so an
+    ///    inbound datagram from the new endpoint still demuxes here.
+    /// 2. Repoint the session's outbound `endpoint` to the advertised
+    ///    address (or `None` if the peer went passive). The advertised
+    ///    endpoint is authoritative roster state; `learn_endpoint` /
+    ///    `downgrade_direct_if_stale` continue to handle live roaming.
+    /// 3. Reconcile the allowed-set against the durable `app_routes` index
+    ///    so a newly-hosted app-ULA is permitted as a source. Strictly
+    ///    additive — the peer's own ULA is already present from the
+    ///    original insert.
+    ///
+    /// The per-peer `/128` route is left untouched (it was installed on the
+    /// first insert and the ULA hasn't changed).
+    fn update_in_place(&self, session: &Arc<PeerSession>, info: &PeerInfo) {
+        // (1) Repoint the by_endpoint index: drop the old alias, add the new.
+        let old_endpoint = session.endpoint();
+        if old_endpoint != info.listen_endpoint {
+            if let Some(addr) = old_endpoint {
+                self.by_endpoint.remove(&addr);
+            }
+        }
+        if let Some(addr) = info.listen_endpoint {
+            self.by_endpoint.insert(addr, session.clone());
+        }
+        // (2) Repoint the outbound endpoint to the advertised address.
+        *session.endpoint.write() = info.listen_endpoint;
+        // (3) Reconcile hosted app-ULAs onto the (preserved) allowed-set.
+        for kv in self.app_routes.iter() {
+            if *kv.value() == info.ula {
+                session.add_allowed_source(*kv.key());
             }
         }
     }
