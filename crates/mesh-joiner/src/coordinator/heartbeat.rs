@@ -289,17 +289,62 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
     }
 }
 
-/// Issue a single `register` to the coordinator with an explicit
-/// `requested_ula` override (the rest of the identity comes from `inputs`).
+/// Register against the coordinator, transparently self-healing a sticky-ULA
+/// `409`.
 ///
-/// Factored out so the roster-loss path can retry with a FREE allocation
-/// (`None`) after a sticky-ULA `409` without duplicating the long argument
-/// list. The control plane re-derives `software_version` from heartbeats, so
-/// the register only carries identity + roster — `software_version` is `None`.
-async fn register_once(
+/// Tries `requested_ula` first. A `409` means a DIFFERENT peer holds that ULA
+/// — e.g. a node redeploy churned its pubkey so the coordinator minted a new
+/// peer record while the STALE old record still pins the sticky ULA, or the
+/// coordinator's durable roster was lost on a box-replace and the slot was
+/// reallocated. Rather than dead-end on the same conflict, retry ONCE with a
+/// FREE allocation (`requested_ula = None`) so the node rejoins at a fresh
+/// coordinator-assigned address.
+///
+/// Shared by BOTH the cold-start (initial [`crate::joiner::Joiner::join`]) and
+/// the heartbeat roster-loss re-register paths so a node ALWAYS joins instead
+/// of failing the entire join on a 409 (defense in depth alongside the
+/// coordinator's adopt-on-stale eviction). The control plane re-derives
+/// `software_version` from heartbeats, so the FALLBACK register carries
+/// `None`; the first attempt carries the caller-supplied value.
+///
+/// # Errors
+/// Surfaces the underlying [`JoinerError`] when the first attempt fails with
+/// anything other than a 409, or when the free-allocation fallback also fails.
+pub(crate) async fn register_with_409_fallback(
     client: &CoordinatorClient,
     inputs: &ReregisterInputs,
     wg_listen_port: u16,
+    software_version: Option<String>,
+    requested_ula: Option<String>,
+) -> crate::error::Result<RegisterResponse> {
+    match register_attempt(client, inputs, wg_listen_port, software_version, requested_ula).await {
+        Ok(resp) => Ok(resp),
+        Err(JoinerError::HttpStatus { status: 409, body }) => {
+            tracing::warn!(
+                requested_ula = ?inputs.requested_ula,
+                body = %body,
+                "register: 409 (sticky ULA held by a different/stale peer) — \
+                 retrying with a coordinator-allocated address"
+            );
+            // Fallback carries no version (re-derived from heartbeats) and no
+            // requested_ula (free allocation).
+            register_attempt(client, inputs, wg_listen_port, None, None).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Issue a single `register` from `inputs` with explicit `requested_ula` +
+/// `software_version` overrides. Factored out so the sticky-then-free 409
+/// fallback can vary both without duplicating the long argument list. The
+/// cold-start path forwards a `software_version` so the host version is
+/// advertised on the first attempt; the heartbeat path passes `None` (the
+/// control plane re-derives it from heartbeats).
+async fn register_attempt(
+    client: &CoordinatorClient,
+    inputs: &ReregisterInputs,
+    wg_listen_port: u16,
+    software_version: Option<String>,
     requested_ula: Option<String>,
 ) -> crate::error::Result<RegisterResponse> {
     client
@@ -314,7 +359,7 @@ async fn register_once(
             inputs.kind.clone(),
             inputs.parent.clone(),
             inputs.app_uuid.clone(),
-            None,
+            software_version,
         )
         .await
 }
@@ -334,42 +379,22 @@ async fn reregister_after_roster_loss(
     inputs: &ReregisterInputs,
     wg_listen_port: u16,
 ) {
-    // Try with the sticky `requested_ula` first. A 409 means a DIFFERENT peer
-    // holds that ULA — e.g. the coordinator's durable roster was lost on a
-    // box-replace and the slot was reallocated before we re-registered. Rather
-    // than crash-loop on the same conflict every tick, fall back to a FREE
-    // allocation (no `requested_ula`) so we rejoin at a fresh coordinator-
-    // assigned address. (With the coordinator's durable roster this 409 is
-    // rare; this fallback keeps the joiner self-healing in the residual case.)
-    let resp = match register_once(client, inputs, wg_listen_port, inputs.requested_ula.clone()).await
-    {
-        Ok(resp) => resp,
-        Err(JoinerError::HttpStatus { status: 409, body }) => {
-            tracing::warn!(
-                requested_ula = ?inputs.requested_ula,
-                body = %body,
-                "heartbeat: re-register hit 409 (sticky ULA already claimed) — \
-                 retrying with a coordinator-allocated address"
-            );
-            match register_once(client, inputs, wg_listen_port, None).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "heartbeat: re-register fallback (free ULA) failed — will retry next tick"
-                    );
-                    return;
-                }
+    // Sticky-then-free 409 self-heal shared with the cold-start path. The
+    // control plane re-derives `software_version` from heartbeats, so the
+    // re-register carries identity + roster only (`software_version = None`).
+    let resp =
+        match register_with_409_fallback(client, inputs, wg_listen_port, None, inputs.requested_ula.clone())
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "heartbeat: re-register after roster loss failed — will retry next tick"
+                );
+                return;
             }
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "heartbeat: re-register after roster loss failed — will retry next tick"
-            );
-            return;
-        }
-    };
+        };
 
     // Adopt the freshly-assigned peer_id so subsequent heartbeats AND the
     // SSE consumer (on its next reconnect) use the LIVE id, not the dead
@@ -798,6 +823,69 @@ mod tests {
             !handling_roster_loss,
             "non-404 error must not set the roster-loss guard"
         );
+        drop(server);
+    }
+
+    /// Cold-start (initial join) self-heal: the FIRST `register` returns a
+    /// 409 (sticky ULA held by a stale peer the coordinator hasn't evicted
+    /// yet) → the shared fallback helper retries ONCE with no `requested_ula`
+    /// and joins at a coordinator-allocated address. This is the cold-start
+    /// counterpart of the heartbeat 409 fallback — both call the same helper,
+    /// so a node ALWAYS joins instead of dead-ending on a 409 at boot.
+    #[tokio::test]
+    async fn cold_start_register_409_retries_without_requested_ula_and_joins() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        // Sticky register (carries `requested_ula`) → 409 Conflict.
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .and(body_partial_json(serde_json::json!({
+                "requested_ula": "fd5a:1f00:0:5::1"
+            })))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_string("requested ULA already claimed"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Free-allocation register (no `requested_ula`) → 200 with a roster.
+        let new_peer_id = "01910f10-0000-7000-8000-00000000c01d";
+        let assigned_ula = "fd5a:1f00:0:42::1";
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "peer_id": new_peer_id,
+                "ula": assigned_ula,
+                "peers": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        let inputs = ReregisterInputs {
+            requested_ula: Some("fd5a:1f00:0:5::1".into()),
+            ..reregister_inputs()
+        };
+
+        // The shared cold-start helper: sticky 409 → retry free → 200.
+        let resp = register_with_409_fallback(
+            &client,
+            &inputs,
+            51820,
+            None,
+            inputs.requested_ula.clone(),
+        )
+        .await
+        .expect("cold-start register must self-heal past a sticky 409");
+
+        assert_eq!(
+            resp.peer_id,
+            Uuid::parse_str(new_peer_id).unwrap(),
+            "after a sticky 409 the cold-start join adopts the free-allocation peer_id"
+        );
+        assert_eq!(resp.ula, assigned_ula);
+        // Both `.expect(1)` verified on drop: one sticky 409 + one free 200.
         drop(server);
     }
 
