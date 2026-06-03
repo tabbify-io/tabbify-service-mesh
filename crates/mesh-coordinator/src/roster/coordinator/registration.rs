@@ -126,6 +126,14 @@ impl Coordinator {
         // validated claims win when present (production), else the request
         // (escape hatch). See `crate::roster::identity::stamp_identity`.
         let identity = stamp_identity(&req, claims.as_ref());
+        // Adopt-on-stale (identity rotation): if this fresh pubkey requests a
+        // ULA that a DIFFERENT, STALE peer still pins (the classic node-redeploy
+        // pubkey churn), evict the dead holder first so the ULA is free to
+        // grant below. A genuinely LIVE holder is kept and the request 409s in
+        // `resolve_ula`. Runs BEFORE `resolve_ula` so its uniqueness scan sees
+        // the freed ULA. No-op when `requested_ula` is absent / malformed.
+        self.evict_stale_ula_holder(req.requested_ula.as_deref())
+            .await;
         // First-time path. Resolve the ULA: honour `requested_ula` when it
         // is present, well-formed, and unclaimed (or claimed by this same
         // peer — prevented from reaching here by the re-registration guard
@@ -283,6 +291,94 @@ impl Coordinator {
         };
         info!(peer_id = %peer_id, "peer re-registered (idempotent)");
         Ok(entry)
+    }
+
+    /// Adopt-on-stale eviction (staleness-gated): if `requested_ula` is held
+    /// by a DIFFERENT peer whose `last_heartbeat` is older than
+    /// `heartbeat_timeout`, evict that dead holder so the ULA can be granted
+    /// to the requesting (fresh) pubkey.
+    ///
+    /// This is the coordinator half of identity-rotation resilience: a node
+    /// redeploy churns its WG pubkey, so its re-register misses the idempotent
+    /// `by_pubkey` fast path and arrives here as a "first-time" register that
+    /// re-requests its sticky ULA. The STALE old record still pins that ULA, so
+    /// without this it would 409 and the node couldn't rejoin until the old
+    /// record timed out (up to `heartbeat_timeout`), while peers loop on a dead
+    /// `WireGuard` session.
+    ///
+    /// Strictly staleness-gated: a holder whose heartbeat is CURRENT (a
+    /// genuinely live different peer) is NOT evicted — the caller's
+    /// `resolve_ula` then returns [`CoordinatorError::UlaConflict`] (409). This
+    /// is critical under `--insecure-no-mtls`, where a register is
+    /// unauthenticated and must never be able to kick a live peer off its ULA.
+    ///
+    /// Eviction order mirrors a clean deregister: publish `PeerLeft`, broadcast
+    /// `Removed(old)`, `apply_peer_left` (drops roster, `by_pubkey`, relay conn,
+    /// punch pairs), then persist the durable roster. The caller then grants the
+    /// ULA and broadcasts `Added(new)`, so subscribers always see
+    /// `Removed(old)` before `Added(new)`.
+    ///
+    /// No-op when `requested_ula` is `None` / malformed, unclaimed, or held by
+    /// a CURRENT peer.
+    async fn evict_stale_ula_holder(&self, requested_ula: Option<&str>) {
+        let Some(raw) = requested_ula else {
+            return;
+        };
+        let Ok(addr) = raw.parse::<Ipv6Addr>() else {
+            return;
+        };
+        // Find the peer (if any) holding this exact ULA. The same-pubkey
+        // re-register fast path already returned upstream, so a hit here is a
+        // DIFFERENT peer.
+        let Some(holder_id) = self
+            .inner
+            .roster
+            .iter()
+            .find(|kv| kv.value().ula == addr)
+            .map(|kv| kv.value().peer_id)
+        else {
+            return; // unclaimed — nothing to evict
+        };
+        // Staleness gate: only evict a holder whose last heartbeat is older
+        // than the timeout. A live holder is kept (→ 409 in resolve_ula).
+        let is_stale = self
+            .inner
+            .roster
+            .get(&holder_id)
+            .is_some_and(|e| e.last_heartbeat.elapsed() > self.inner.heartbeat_timeout);
+        if !is_stale {
+            return;
+        }
+        tracing::info!(
+            stale_peer_id = %holder_id,
+            ula = %addr,
+            event = "adopt_on_stale_evict",
+            "register: evicting stale peer pinning a requested ULA so a rotated identity can adopt it",
+        );
+        // Mirror a clean deregister: publish first, broadcast Removed, then
+        // apply (drops roster + by_pubkey + relay conn + punch pairs).
+        let event = crate::roster::events::PeerLeft {
+            peer_id: holder_id.to_string(),
+            reason: "evicted_stale_ula_holder".to_owned(),
+            left_at_micros: now_unix_micros(),
+        };
+        publish_event(self.inner.publisher.as_ref(), PEER_SEGMENT, &event).await;
+        // Capture the departing peer's tags so the SSE remove frame is
+        // ACL-filterable per viewer (same contract as `deregister`).
+        let tags = self
+            .inner
+            .roster
+            .get(&holder_id)
+            .map(|e| e.tags.clone())
+            .unwrap_or_default();
+        self.inner.broadcaster.broadcast(PeerEvent::Removed {
+            peer_id: holder_id.to_string(),
+            tags,
+        });
+        self.apply_peer_left(&event);
+        // Membership changed — persist so a coordinator restart doesn't
+        // resurrect the evicted holder at the now-reassigned ULA.
+        self.persist_roster().await;
     }
 
     /// Resolve the ULA and peer-index for a first-time register.

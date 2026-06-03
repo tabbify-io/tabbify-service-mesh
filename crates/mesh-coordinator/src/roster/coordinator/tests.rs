@@ -904,6 +904,136 @@ async fn register_rejects_requested_ula_claimed_by_different_peer() {
     assert_eq!(c.snapshot().len(), 1);
 }
 
+/// Raw 32-byte pubkey for a register seed — the bytes `pubkey(seed)`
+/// base64-encodes. Lets a test register a relay connection under the SAME
+/// key a peer registered with, so it can assert the connection is torn
+/// down when that peer is evicted.
+fn pubkey_bytes(seed: u8) -> Vec<u8> {
+    vec![seed; 32]
+}
+
+/// Backdate a peer's `last_heartbeat` past the coordinator's
+/// `heartbeat_timeout` so the staleness-gated adopt-on-stale path treats it
+/// as a dead holder.
+fn make_stale(c: &Coordinator, peer_id: Uuid) {
+    let timeout = c.heartbeat_timeout();
+    let mut e = c.inner.roster.get_mut(&peer_id).expect("entry");
+    e.last_heartbeat = Instant::now()
+        .checked_sub(timeout + Duration::from_secs(1))
+        .expect("instant arithmetic");
+}
+
+/// FIX B — adopt-on-stale: a node redeploy churns its pubkey, so a FRESH
+/// pubkey B requests the sticky ULA that a STALE peer A (pubkey A,
+/// `last_heartbeat` older than the timeout) still pins. The coordinator must
+/// EVICT the stale holder (drop its roster entry, `by_pubkey`, AND relay conn,
+/// broadcast `Removed(old)`) and GRANT the ULA to B (`Added(new)`), NOT 409.
+/// Without this the churned node fails to join until A times out, while peers
+/// loop on a stale `WireGuard` session.
+#[tokio::test]
+async fn register_evicts_stale_holder_and_adopts_requested_ula() {
+    let c = coordinator();
+    let want = "fd5a:1f02:dead::1";
+
+    // Peer A claims the sticky ULA, then goes stale.
+    let (a, _) = c
+        .register(req_with_requested_ula(40, "stale-peer", want))
+        .await
+        .expect("peer-a register");
+    let pubkey_a = pubkey_bytes(40);
+    // Register a live relay connection under A's pubkey — eviction must
+    // tear it down (proves `apply_peer_left` -> `relay.drop_pubkey(A)`).
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    c.relay().register(pubkey_a.clone(), tx);
+    assert!(
+        c.relay().forward(&pubkey_a, vec![1, 2, 3]),
+        "relay conn for A is live before eviction"
+    );
+    make_stale(&c, a.peer_id);
+
+    // Subscribe AFTER setup so the channel carries only the eviction +
+    // grant frames.
+    let mut rx = c.broadcaster().subscribe();
+
+    // Fresh pubkey B requests the SAME ULA → adopt-on-stale, NOT 409.
+    let (b, outcome) = c
+        .register(req_with_requested_ula(41, "fresh-peer", want))
+        .await
+        .expect("fresh peer must adopt the stale ULA, not 409");
+    assert_eq!(outcome, RegisterOutcome::Created);
+    assert_eq!(b.ula.to_string(), want, "B is granted the requested ULA");
+    assert_ne!(b.peer_id, a.peer_id, "B is a new peer record");
+
+    // The stale holder A is gone from the roster + by_pubkey; only B holds X.
+    assert_eq!(c.snapshot().len(), 1, "only the fresh peer remains");
+    assert_eq!(c.snapshot()[0].ula, want);
+    assert!(
+        !c.is_registered_pubkey(&pubkey_a),
+        "stale A's pubkey must be evicted from by_pubkey"
+    );
+    // A's relay connection was dropped by the eviction.
+    assert!(
+        !c.relay().forward(&pubkey_a, vec![4, 5, 6]),
+        "stale A's relay conn must be torn down on eviction"
+    );
+
+    // The broadcast carries Removed(A) BEFORE Added(B).
+    let mut removed_old = false;
+    let mut added_new = false;
+    let mut removed_before_added = false;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            PeerEvent::Removed { peer_id, .. } if peer_id == a.peer_id.to_string() => {
+                removed_old = true;
+            }
+            PeerEvent::Added(info) if info.peer_id == b.peer_id.to_string() => {
+                added_new = true;
+                // Removed must have been observed first.
+                if removed_old {
+                    removed_before_added = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(removed_old, "Removed(old) must be broadcast");
+    assert!(added_new, "Added(new) must be broadcast");
+    assert!(
+        removed_before_added,
+        "Removed(old) must be broadcast BEFORE Added(new)"
+    );
+}
+
+/// FIX B is staleness-gated: a CURRENT-heartbeat holder must NOT be evicted.
+/// A fresh/hostile peer requesting a ULA a genuinely LIVE different peer holds
+/// still gets a `409` — critical under `--insecure-no-mtls` where a register
+/// is unauthenticated and must never be able to kick a live peer off its ULA.
+#[tokio::test]
+async fn register_keeps_409_when_holder_heartbeat_is_current() {
+    let c = coordinator();
+    let want = "fd5a:1f02:beef::1";
+
+    // Peer A claims the ULA and is freshly registered (current heartbeat).
+    let (a, _) = c
+        .register(req_with_requested_ula(42, "live-peer", want))
+        .await
+        .expect("peer-a register");
+
+    // Fresh pubkey B requests the SAME ULA while A is still live → 409.
+    let err = c
+        .register(req_with_requested_ula(43, "intruder", want))
+        .await
+        .expect_err("a live holder must not be kicked off its ULA");
+    assert!(
+        matches!(err, CoordinatorError::UlaConflict(_)),
+        "expected UlaConflict for a current-heartbeat holder, got {err:?}"
+    );
+    // A is untouched: still the sole holder of the ULA.
+    assert_eq!(c.snapshot().len(), 1);
+    assert_eq!(c.snapshot()[0].peer_id, a.peer_id.to_string());
+    assert_eq!(c.snapshot()[0].ula, want);
+}
+
 /// The SAME peer re-registering with its own previously-assigned ULA
 /// (sticky identity on restart) must succeed — outcome Existed, same
 /// `peer_id`, same ULA.
