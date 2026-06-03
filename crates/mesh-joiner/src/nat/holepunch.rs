@@ -26,6 +26,7 @@
 //! requiring SSE-extension work today.
 
 use crate::coordinator::heartbeat::SharedPeerId;
+use crate::relay::RelayHandle;
 use crate::wg::session::{PeerSession, SessionTable, WgAction, classify_tunn_result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -117,15 +118,44 @@ async fn build_handshake_packet(session: &Arc<PeerSession>) -> Option<Vec<u8>> {
 
 /// Execute a planned punch.
 ///
-/// Repoints the session's outbound endpoint at the reflexive target, then
-/// fires a short burst of handshake-initiations so our `NAT` mapping opens
-/// and crosses with the peer's simultaneous burst.
-pub async fn execute_punch(socket: &UdpSocket, plan: &PunchPlan, burst: usize, interval: Duration) {
-    // Adopt the coordinator-provided reflexive endpoint as the outbound
-    // default — it is authoritative (same source as an advertised endpoint).
-    *plan.session.endpoint.write() = Some(plan.endpoint);
+/// Fires a short burst of handshake-initiations so our `NAT` mapping opens
+/// and crosses with the peer's simultaneous burst. The direct burst always
+/// targets `plan.endpoint` (the reflexive candidate) to open OUR local NAT
+/// mapping for a genuinely punchable peer.
+///
+/// Crucially this does NOT pin the session's outbound endpoint while the
+/// session is UNCONFIRMED: for a no-inbound-port peer (a container netns, a
+/// symmetric-NAT peer we can't reach) the coordinator-advertised reflexive
+/// endpoint is a BLACK HOLE, and regressing the session onto it would
+/// defeat `send_wire`'s relay floor and loop boringtun's `REKEY_TIMEOUT`
+/// forever. The candidate is adopted as the outbound default only once a
+/// direct path is already confirmed.
+///
+/// While unconfirmed AND a `relay` is configured, each burst init is ALSO
+/// queued on the relay floor (keyed by the peer's pubkey) — this is what
+/// guarantees a black-hole peer receives the init so the handshake
+/// completes. The relay double-fire stops the moment the direct path is
+/// confirmed (`send_wire`'s confirmed-direct branch takes over), so steady
+/// state never doubles handshake traffic. Tolerates `relay == None`
+/// (no-relay / `--no-relay` builds): `try_relay` is best-effort and this
+/// branch is simply skipped.
+pub async fn execute_punch(
+    socket: &UdpSocket,
+    relay: Option<&RelayHandle>,
+    plan: &PunchPlan,
+    burst: usize,
+    interval: Duration,
+) {
+    let confirmed = plan.session.direct_confirmed();
+    // Adopt the reflexive endpoint as the outbound default ONLY when the
+    // direct path is already confirmed — never regress an unconfirmed
+    // session onto a possibly black-hole candidate.
+    if confirmed {
+        *plan.session.endpoint.write() = Some(plan.endpoint);
+    }
     for i in 0..burst {
         if let Some(bytes) = build_handshake_packet(&plan.session).await {
+            // (a) Direct: open OUR local NAT mapping toward the candidate.
             if let Err(e) = socket.send_to(&bytes, plan.endpoint).await {
                 tracing::warn!(error = %e, endpoint = %plan.endpoint, "holepunch: send failed");
             } else {
@@ -142,6 +172,15 @@ pub async fn execute_punch(socket: &UdpSocket, plan: &PunchPlan, burst: usize, i
                     event = "handshake_init",
                     "holepunch: fired handshake-init"
                 );
+            }
+            // (b) Relay floor: while unconfirmed, ALSO route the init through
+            // the relay so a black-hole / no-inbound peer receives it and the
+            // handshake can complete. Stop once confirmed — `send_wire` then
+            // owns the (direct) path and a relay double-fire would be waste.
+            if !confirmed {
+                if let Some(relay) = relay {
+                    relay.try_relay(plan.session.peer_pubkey, bytes.clone());
+                }
             }
         }
         if i + 1 < burst {
@@ -207,7 +246,7 @@ pub async fn run(
                             endpoint = %plan.endpoint,
                             "holepunch: punching",
                         );
-                        execute_punch(&socket, &plan, PUNCH_BURST, PUNCH_INTERVAL).await;
+                        execute_punch(&socket, sessions.relay(), &plan, PUNCH_BURST, PUNCH_INTERVAL).await;
                     }
                     None => {
                         debug!(
@@ -297,10 +336,14 @@ mod tests {
         assert!(plan_punch(&sessions, me, &ev(me, target, "not-an-addr")).is_none());
     }
 
-    /// Executing a plan must (a) repoint the session's outbound endpoint
-    /// at the reflexive target and (b) actually emit a `WireGuard`
-    /// handshake-initiation datagram to that endpoint — that datagram is
-    /// the "punch" that opens our NAT mapping.
+    /// Executing a plan must actually emit a `WireGuard` handshake-init
+    /// datagram DIRECT to the reflexive target — that datagram is the
+    /// "punch" that opens our local NAT mapping for a genuinely punchable
+    /// peer. (Fix A) For an UNCONFIRMED session the direct burst must NOT
+    /// pin the session's outbound endpoint at the candidate: a no-inbound
+    /// peer's reflexive endpoint is a black hole, and regressing the
+    /// session onto it would defeat `send_wire`'s relay floor. The endpoint
+    /// stays where it was (here: `None`, a passive target).
     #[tokio::test]
     async fn execute_punch_sends_handshake_init_to_endpoint() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
@@ -312,8 +355,10 @@ mod tests {
         let sessions = session_table_with(target, "fd5a:1f00:1::2", None);
         let plan =
             plan_punch(&sessions, me, &ev(me, target, &target_addr.to_string())).expect("a plan");
+        assert!(!plan.session.direct_confirmed(), "fresh session is unconfirmed");
 
-        execute_punch(&sender, &plan, 2, Duration::from_millis(1)).await;
+        // No relay wired — proves the relay==None path still fires direct.
+        execute_punch(&sender, None, &plan, 2, Duration::from_millis(1)).await;
 
         let mut buf = [0u8; 256];
         let (n, _from) = tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
@@ -325,8 +370,136 @@ mod tests {
             buf[0], 1,
             "first byte is the WG handshake-init message type"
         );
-        // The session now targets the reflexive endpoint for outbound.
-        assert_eq!(plan.session.endpoint(), Some(target_addr));
+        // The direct burst must NOT pin an unconfirmed session onto the
+        // (possibly black-hole) candidate endpoint.
+        assert_eq!(
+            plan.session.endpoint(),
+            None,
+            "an unconfirmed punch must not regress the session's endpoint to the candidate"
+        );
+    }
+
+    /// No-op route sink so a relay-carrying session table can be built in
+    /// tests without shelling out to `route` / `ifconfig`.
+    struct NoopSink;
+    impl crate::wg::session::RouteSink for NoopSink {
+        fn add_allowed(&self, _ula: std::net::Ipv6Addr) {}
+        fn remove_allowed(&self, _ula: std::net::Ipv6Addr) {}
+        fn add_app_route(&self, _app_ula: std::net::Ipv6Addr) {}
+        fn remove_app_route(&self, _app_ula: std::net::Ipv6Addr) {}
+    }
+
+    /// Build a session table holding one peer session, wired to the given
+    /// relay handle — mirrors `session_table_with` but carries a relay so
+    /// `sessions.relay()` is `Some`. The session starts UNCONFIRMED.
+    fn relay_table_with(
+        peer_id: Uuid,
+        ula: &str,
+        endpoint: Option<&str>,
+        relay: crate::relay::RelayHandle,
+    ) -> SessionTable {
+        let t = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let me = StaticSecret::from([7u8; 32]);
+        let peer_pub = *PublicKey::from(&StaticSecret::from([9u8; 32])).as_bytes();
+        let info = PeerInfo {
+            peer_id,
+            wg_public_key: peer_pub,
+            ula: ula.parse().expect("ula"),
+            listen_endpoint: endpoint.map(|s| s.parse().expect("endpoint")),
+            display_name: "target".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            software_version: None,
+            joined_at_micros: 0,
+        };
+        t.upsert(&me, &info);
+        t
+    }
+
+    /// Fix A (PRIMARY): while a session is UNCONFIRMED, each punch burst
+    /// packet must ALSO be queued on the relay floor — not just fired
+    /// direct at the (possibly black-hole) reflexive endpoint. A
+    /// no-inbound-port peer (a container netns) only ever receives the
+    /// handshake-init via the relay, so without this the handshake never
+    /// completes and the tunnel never forms. The relayed frame targets the
+    /// session's `peer_pubkey`.
+    #[tokio::test]
+    async fn execute_punch_relays_init_while_unconfirmed() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
+        let target_addr = receiver.local_addr().expect("recv addr");
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind send"));
+
+        let me = Uuid::from_u128(1);
+        let target = Uuid::from_u128(2);
+        let (relay, mut relay_rx) = crate::relay::RelayHandle::new();
+        // Endpoint advertised but unreachable (a black hole for a
+        // no-inbound peer); the session is unconfirmed.
+        let sessions = relay_table_with(target, "fd5a:1f00:1::2", Some(&target_addr.to_string()), relay);
+        let plan =
+            plan_punch(&sessions, me, &ev(me, target, &target_addr.to_string())).expect("a plan");
+        assert!(!plan.session.direct_confirmed(), "fresh session is unconfirmed");
+        let peer_pubkey = plan.session.peer_pubkey;
+
+        execute_punch(&sender, sessions.relay(), &plan, 2, Duration::from_millis(1)).await;
+
+        // (a) The direct datagram still went out (opens our NAT mapping).
+        let mut buf = [0u8; 256];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .expect("a direct datagram within timeout")
+            .expect("recv ok");
+        assert!(n >= 148, "WireGuard handshake-init is 148 bytes, got {n}");
+        assert_eq!(buf[0], 1, "first byte is the WG handshake-init type");
+
+        // (b) AND the init was queued on the relay floor for the peer pubkey.
+        let relayed = tokio::time::timeout(Duration::from_secs(1), relay_rx.recv())
+            .await
+            .expect("the init must ALSO be relayed while unconfirmed")
+            .expect("relay channel delivered the frame");
+        assert_eq!(
+            relayed.dst_pubkey, peer_pubkey,
+            "the relayed init targets the target peer's pubkey"
+        );
+        assert!(!relayed.payload.is_empty(), "relayed payload is the WG handshake-init");
+    }
+
+    /// Fix A sibling: once the direct path is CONFIRMED, the punch must NOT
+    /// double-fire onto the relay — `send_wire`'s confirmed-direct branch
+    /// has taken over, and relaying would needlessly double handshake
+    /// traffic. The direct datagram still goes out (harmless NAT poke), but
+    /// nothing is queued on the relay.
+    #[tokio::test]
+    async fn execute_punch_does_not_relay_when_confirmed() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
+        let target_addr = receiver.local_addr().expect("recv addr");
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind send"));
+
+        let me = Uuid::from_u128(1);
+        let target = Uuid::from_u128(2);
+        let (relay, mut relay_rx) = crate::relay::RelayHandle::new();
+        let sessions = relay_table_with(target, "fd5a:1f00:1::2", Some(&target_addr.to_string()), relay);
+        let plan =
+            plan_punch(&sessions, me, &ev(me, target, &target_addr.to_string())).expect("a plan");
+        // Prove the direct path — the upgrade signal that stops relaying.
+        plan.session.confirm_direct(1_000);
+        assert!(plan.session.direct_confirmed());
+
+        execute_punch(&sender, sessions.relay(), &plan, 2, Duration::from_millis(1)).await;
+
+        // The direct datagram still goes out.
+        let mut buf = [0u8; 256];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .expect("a direct datagram within timeout")
+            .expect("recv ok");
+        assert!(n >= 148, "WireGuard handshake-init is 148 bytes, got {n}");
+
+        // But NOTHING is relayed — a confirmed path doesn't double-fire.
+        let relayed = tokio::time::timeout(Duration::from_millis(300), relay_rx.recv()).await;
+        assert!(
+            relayed.is_err(),
+            "a confirmed session must not double-relay the punch init"
+        );
     }
 
     fn ev(initiator: Uuid, target: Uuid, endpoint: &str) -> HolePunchInitiate {
