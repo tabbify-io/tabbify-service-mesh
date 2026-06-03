@@ -330,6 +330,20 @@ impl SessionTable {
             // pointer never lingers. A re-upsert with the same key is
             // re-inserted below, so this is safe either way.
             if old.peer_pubkey != info.wg_public_key {
+                // Identity rotation: surface the key change so a relay-frame
+                // drop "no session for source pubkey" can be correlated with
+                // the peer that just re-keyed (observability — no behaviour
+                // change; the index roll-over already happens below).
+                use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+                use base64::Engine as _;
+                tracing::info!(
+                    event = "peer_rekey",
+                    peer_id = %info.peer_id,
+                    ula = %info.ula,
+                    old_pubkey = %B64URL.encode(old.peer_pubkey),
+                    new_pubkey = %B64URL.encode(info.wg_public_key),
+                    "session: peer rotated its WG key — rolling over the pubkey index"
+                );
                 self.by_pubkey.remove(&old.peer_pubkey);
             }
         }

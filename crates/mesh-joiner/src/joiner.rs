@@ -156,21 +156,28 @@ impl Joiner {
             config.tls_ca.as_deref(),
             config.insecure_no_mtls,
         )?);
-        let resp = client
-            .register(
-                keypair.public.as_bytes(),
-                config.advertise_endpoint.clone(),
-                Some(wg_listen_port),
-                &config.display_name,
-                &config.tags,
-                config.join_token.as_deref(),
-                effective_requested_ula.clone(),
-                config.kind.clone(),
-                config.parent.clone(),
-                config.app_uuid.clone(),
-                config.software_version.clone(),
-            )
-            .await?;
+        // Build the re-register inputs ONCE — the same sticky identity is used
+        // for the cold-start register here AND the heartbeat task's 404
+        // recovery below.
+        let reregister = build_reregister_inputs(
+            &config,
+            *keypair.public.as_bytes(),
+            effective_requested_ula.as_ref(),
+        );
+        // Cold-start register, with the SAME sticky-then-free 409 self-heal the
+        // heartbeat re-register uses: if the requested (sticky) ULA is held by
+        // a stale peer the coordinator hasn't evicted yet, retry once with a
+        // coordinator-allocated address rather than failing the entire join.
+        // Guarantees a node ALWAYS joins (defense in depth alongside the
+        // coordinator's adopt-on-stale eviction).
+        let resp = heartbeat::register_with_409_fallback(
+            &client,
+            &reregister,
+            wg_listen_port,
+            config.software_version.clone(),
+            effective_requested_ula.clone(),
+        )
+        .await?;
         let peer_id = resp.peer_id;
         let my_ula: Ipv6Addr = resp.ula.parse().map_err(|e| {
             JoinerError::MalformedPeer(format!("coordinator returned bad ula {:?}: {e}", resp.ula))
@@ -235,11 +242,7 @@ impl Joiner {
             client: client.clone(),
             our_private: keypair.private,
             peer_id: shared_peer_id.clone(),
-            reregister: build_reregister_inputs(
-                &config,
-                *keypair.public.as_bytes(),
-                effective_requested_ula.as_ref(),
-            ),
+            reregister,
             my_ula,
             wg_listen_port,
             heartbeat_interval: config.heartbeat_interval,

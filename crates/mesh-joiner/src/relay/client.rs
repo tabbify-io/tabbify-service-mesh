@@ -238,7 +238,17 @@ async fn handle_inbound(task: &RelayTask, buf: &[u8]) {
         return; // too short — ignore
     };
     let Some(session) = task.sessions.by_pubkey(src) else {
-        tracing::debug!(src = %B64URL.encode(src), "relay inbound: no session for source pubkey, dropping");
+        // Promoted to info: during identity churn a peer rotates its pubkey,
+        // so relayed frames briefly arrive keyed to a STALE source key with no
+        // matching session. Surfacing this at info lets a `peer_rekey` log be
+        // correlated with the transient drop window instead of being buried at
+        // debug. Steady state this line should not appear, so it stays
+        // low-cardinality.
+        tracing::info!(
+            event = "relay_rx_no_session",
+            src = %B64URL.encode(src),
+            "relay inbound: no session for source pubkey, dropping (likely peer re-key in flight)"
+        );
         return;
     };
     tracing::debug!(peer = %session.peer_id, len = payload.len(), "relay inbound: injecting into tunnel");

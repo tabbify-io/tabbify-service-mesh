@@ -99,6 +99,41 @@ fn remove_clears_pubkey_index() {
     assert!(t.by_pubkey(p.wg_public_key).is_none());
 }
 
+/// Identity rotation: a peer keeps the SAME ULA but rotates its WG key.
+/// Re-upserting at ULA X with a new pubkey B must drop the stale pubkey A
+/// from the `by_pubkey` index (so a relay frame from the old key no longer
+/// resolves to a session) while B resolves to the surviving session, which
+/// now carries B's key. ULA X must still resolve throughout.
+#[test]
+fn upsert_same_ula_new_pubkey_rolls_over_pubkey_index() {
+    let t = SessionTable::new();
+    let me = StaticSecret::from([42u8; 32]);
+    let pubkey_a = pubkey_bytes_at(1);
+    let pubkey_b = pubkey_bytes_at(2);
+
+    // Upsert ULA X with pubkey A.
+    let first = info(1, "fd5a:1f00:1::7", Some("127.0.0.1:51820"));
+    t.upsert(&me, &first);
+    assert!(t.by_pubkey(pubkey_a).is_some(), "pubkey A indexed");
+
+    // Re-upsert the SAME ULA with pubkey B (the peer rotated its key).
+    let second = info(2, "fd5a:1f00:1::7", Some("127.0.0.1:51820"));
+    t.upsert(&me, &second);
+
+    // ULA X still resolves.
+    let by_ula = t
+        .by_ula("fd5a:1f00:1::7".parse::<Ipv6Addr>().unwrap())
+        .expect("ULA X still resolves after the key rotation");
+    assert_eq!(by_ula.peer_pubkey, pubkey_b);
+    // The stale pubkey A is gone; pubkey B resolves to the live session.
+    assert!(
+        t.by_pubkey(pubkey_a).is_none(),
+        "stale pubkey A must be dropped on rotation"
+    );
+    let by_pk = t.by_pubkey(pubkey_b).expect("pubkey B resolves");
+    assert_eq!(by_pk.peer_pubkey, pubkey_b, "session carries the new pubkey");
+}
+
 #[test]
 fn upsert_inserts_and_indexes_both_lookups() {
     let t = SessionTable::new();
