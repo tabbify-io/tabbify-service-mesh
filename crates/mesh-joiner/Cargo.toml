@@ -30,11 +30,15 @@ reqwest      = { workspace = true }
 eventsource-stream = "0.2"
 
 # Relay client transport: a persistent WebSocket to the coordinator's
-# `/v1/mesh/relay` endpoint (Stage 3 connectivity floor). ws:// only for
-# the POC — `connect` + `handshake` are the minimal client features; the
-# wss/mTLS path is structured-for but out of scope (the relay task returns
-# early under secure mode). `futures-util` splits the WS into sink/stream.
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+# `/v1/mesh/relay` endpoint (Stage 3 connectivity floor / DERP-style). `connect`
+# + `handshake` are the base client features; `rustls-tls-webpki-roots` adds TLS
+# so the relay can connect over `wss://` (TLS on :443) — REQUIRED to traverse
+# restrictive corporate networks/proxies that mangle or reset plaintext `ws://`
+# on non-standard ports (exactly how Tailscale's DERP rides HTTPS/443). With the
+# feature on, `connect_async` handles `wss://` and validates the server cert
+# against the bundled Mozilla webpki roots (covers Let's Encrypt). Pure-rustls →
+# musl-clean (no openssl). `futures-util` splits the WS into sink/stream.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 futures-util      = "0.3"
 
 # Codec

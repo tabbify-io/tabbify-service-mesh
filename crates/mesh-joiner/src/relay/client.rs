@@ -115,12 +115,15 @@ pub fn derive_relay_url(coordinator_url: &str, relay_url: Option<&str>) -> Strin
 /// inbound relayed datagrams back into boringtun. Reconnects with a
 /// `[1, 2, 5, 10]` s backoff (mirrors `peer_sync::run`); honors `shutdown`.
 pub async fn run(mut task: RelayTask) {
-    // The wss/mTLS relay path is structured-for but not yet implemented.
-    // Under secure mode, log once and return — direct + hole-punch still
-    // provide connectivity; only the relay floor is unavailable.
+    // Transport TLS (`wss://`) IS supported (tokio-tungstenite rustls feature),
+    // so the relay traverses TLS-terminating proxies on :443. CLIENT mTLS for the
+    // relay, however, is still unimplemented — so under secure mode (mTLS
+    // required) log once and return; direct + hole-punch still provide
+    // connectivity. In insecure mode the relay connects over ws:// OR wss://
+    // (server-cert-validated, no client cert).
     if !task.insecure_no_mtls {
         tracing::warn!(
-            "relay: wss/mTLS not implemented — relay disabled (direct + hole-punch still active)"
+            "relay: client mTLS not implemented — relay disabled under secure mode (direct + hole-punch still active)"
         );
         return;
     }
