@@ -134,6 +134,66 @@ fn upsert_same_ula_new_pubkey_rolls_over_pubkey_index() {
     assert_eq!(by_pk.peer_pubkey, pubkey_b, "session carries the new pubkey");
 }
 
+/// Fix C: a re-upsert with the SAME pubkey and only the endpoint changed
+/// must KEEP the existing session (and its `Tunn` + handshake timer) in
+/// place, repointing the endpoint without rebuilding. Rebuilding on every
+/// ~20s `peer_updated` wipes the boringtun handshake state and resets
+/// `direct_confirmed`, forcing a needless re-handshake and breaking the
+/// timer-driven relay-retransmit backstop. `Arc::ptr_eq` proves the SAME
+/// underlying session survived; the endpoint reflects the new address.
+#[test]
+fn upsert_same_pubkey_endpoint_change_keeps_session() {
+    let t = SessionTable::new();
+    let me = StaticSecret::from([42u8; 32]);
+    let ula: Ipv6Addr = "fd5a:1f00:1::5".parse().unwrap();
+
+    let first = info(1, "fd5a:1f00:1::5", Some("127.0.0.1:51820"));
+    t.upsert(&me, &first);
+    let before = t.by_ula(ula).expect("session after first upsert");
+
+    // Re-upsert SAME ULA + SAME pubkey, only the endpoint changed.
+    let moved = info(1, "fd5a:1f00:1::5", Some("10.0.0.5:51820"));
+    t.upsert(&me, &moved);
+    let after = t.by_ula(ula).expect("session after endpoint-only re-upsert");
+
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "endpoint-only re-upsert (same pubkey) must KEEP the same session/Tunn"
+    );
+    assert_eq!(
+        after.endpoint(),
+        Some("10.0.0.5:51820".parse().unwrap()),
+        "the endpoint must be repointed to the new advertised address"
+    );
+}
+
+/// Fix C sibling: a re-upsert with a ROTATED pubkey (same ULA) MUST rebuild
+/// the session — a brand-new `Tunn` keyed to the new key. This preserves
+/// the prior identity-rotation fix: a key change drops the stale `Tunn` (a
+/// handshake with the old key would never complete) and rolls over the
+/// `by_pubkey` alias. `Arc::ptr_eq` proves a DIFFERENT session was built.
+#[test]
+fn upsert_rotated_pubkey_rebuilds_session() {
+    let t = SessionTable::new();
+    let me = StaticSecret::from([42u8; 32]);
+    let ula: Ipv6Addr = "fd5a:1f00:1::6".parse().unwrap();
+
+    let first = info(1, "fd5a:1f00:1::6", Some("127.0.0.1:51820"));
+    t.upsert(&me, &first);
+    let before = t.by_ula(ula).expect("session after first upsert");
+
+    // Re-upsert SAME ULA with a NEW pubkey (the peer rotated its key).
+    let rotated = info(2, "fd5a:1f00:1::6", Some("127.0.0.1:51820"));
+    t.upsert(&me, &rotated);
+    let after = t.by_ula(ula).expect("session after key rotation");
+
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "a key rotation MUST rebuild the session (fresh Tunn for the new key)"
+    );
+    assert_eq!(after.peer_pubkey, pubkey_bytes_at(2), "session carries the new key");
+}
+
 #[test]
 fn upsert_inserts_and_indexes_both_lookups() {
     let t = SessionTable::new();
@@ -341,32 +401,64 @@ fn learn_endpoint_promotes_source_for_passive_peer() {
     assert!(t.by_endpoint(learned).is_some());
 }
 
-// Endpoint roaming, active-peer case: a peer that already has a stable
-// advertised endpoint (e.g. its reflexive endpoint from the
-// coordinator) keeps that endpoint as the OUTBOUND default even after
-// we observe inbound from a different source port — but the new source
-// IS indexed for inbound demux + response targeting. This matches
-// WireGuard semantics: new outbound traffic uses the advertised
-// endpoint, while the ephemeral inbound source keeps the existing flow
-// alive.
+// Fix B — endpoint roaming, UNCONFIRMED active-peer case: a peer that
+// has an advertised endpoint but whose direct path is NOT yet confirmed
+// is repointed onto a learned inbound source. The advertised endpoint may
+// be a BLACK HOLE (a no-inbound-port peer's reflexive endpoint) — a real
+// inbound datagram from a different source proves a live return path, so
+// adopt it as the outbound default while still unconfirmed. The new source
+// is also indexed for inbound demux. (Old behaviour kept the advertised
+// endpoint here, which black-holed TX on a dead candidate.)
 #[test]
-fn learn_endpoint_indexes_but_keeps_advertised_default_for_active_peer() {
+fn learn_endpoint_repoints_unconfirmed_active_peer() {
     let t = SessionTable::new();
     let me = StaticSecret::from([42u8; 32]);
     let advertised = "203.0.113.9:51820";
     let p = info(1, "fd5a:1f00:1::1", Some(advertised));
     t.upsert(&me, &p);
     let session = t.by_ula(p.ula).expect("session");
+    assert!(!session.direct_confirmed(), "fresh session starts unconfirmed");
 
     let inbound_src: SocketAddr = "203.0.113.9:40000".parse().unwrap(); // different port
     t.learn_endpoint(&session, inbound_src);
-    // Outbound default unchanged (still the advertised endpoint).
+    // Unconfirmed + differing source → repoint the outbound default so a
+    // dead reflexive candidate can't black-hole TX.
+    assert_eq!(
+        session.endpoint(),
+        Some(inbound_src),
+        "an unconfirmed session repoints onto a live learned source"
+    );
+    // And the new source is indexed so inbound from it routes here.
+    assert!(t.by_endpoint(inbound_src).is_some());
+}
+
+// Fix B sibling — a CONFIRMED direct path must NEVER be clobbered by an
+// ephemeral inbound source. Once a decrypted data packet proved the path
+// works bidirectionally, the confirmed endpoint is authoritative; a
+// differing inbound source is indexed for demux but does NOT repoint the
+// outbound default (that would regress a working path onto an ephemeral
+// NAT mapping with a short lifetime).
+#[test]
+fn learn_endpoint_does_not_repoint_confirmed_peer() {
+    let t = SessionTable::new();
+    let me = StaticSecret::from([42u8; 32]);
+    let advertised = "203.0.113.9:51820";
+    let p = info(1, "fd5a:1f00:1::1", Some(advertised));
+    t.upsert(&me, &p);
+    let session = t.by_ula(p.ula).expect("session");
+    // Prove the direct path so the confirmed endpoint becomes authoritative.
+    session.confirm_direct(1_000);
+    assert!(session.direct_confirmed());
+
+    let inbound_src: SocketAddr = "203.0.113.9:40000".parse().unwrap(); // different port
+    t.learn_endpoint(&session, inbound_src);
+    // Confirmed → outbound default unchanged (still the advertised endpoint).
     assert_eq!(
         session.endpoint(),
         Some(advertised.parse().unwrap()),
-        "advertised endpoint must remain the outbound default"
+        "a confirmed endpoint must not be clobbered by an ephemeral source"
     );
-    // But the new source is indexed so inbound from it routes here.
+    // The new source is still indexed for inbound demux + response targeting.
     assert!(t.by_endpoint(inbound_src).is_some());
 }
 
