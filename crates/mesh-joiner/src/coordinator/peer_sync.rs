@@ -347,11 +347,19 @@ mod tests {
         );
     }
 
+    /// The raw 32-byte X25519 public key for seed `n` — mirrors the bytes
+    /// `pubkey_b64(n)` encodes, so a test can assert the session table's
+    /// `by_pubkey` index keyed by the same identity.
+    fn pubkey_bytes(n: u8) -> [u8; 32] {
+        let secret = StaticSecret::from([n; 32]);
+        *PublicKey::from(&secret).as_bytes()
+    }
+
     #[tokio::test]
     async fn apply_updated_overwrites_existing_session() {
         let sessions = SessionTable::new();
         let me = StaticSecret::from([0xAA; 32]);
-        // Initial add.
+        // Initial add — pubkey A (seed 1).
         apply_event(
             &sessions,
             &me,
@@ -360,10 +368,18 @@ mod tests {
             &remote_json("fd5a:1f00:1::1", 1),
         )
         .await;
-        // Updated record — same ULA, different pubkey number — endpoint
-        // index should be replaced cleanly.
+        let pubkey_a = pubkey_bytes(1);
+        let pubkey_b = pubkey_bytes(2);
+        assert!(
+            sessions.by_pubkey(pubkey_a).is_some(),
+            "pubkey A indexed after the initial add"
+        );
+        // Updated record — SAME ULA but pubkey B (seed 2): the peer rotated
+        // its WG key (identity rotation). Both the endpoint index AND the
+        // pubkey index must roll over cleanly — a stale pubkey A pointer
+        // would silently misroute a later relay frame.
         let mut updated: RemotePeer =
-            serde_json::from_str(&remote_json("fd5a:1f00:1::1", 1)).unwrap();
+            serde_json::from_str(&remote_json("fd5a:1f00:1::1", 2)).unwrap();
         updated.listen_endpoint = Some("10.0.0.5:51820".into());
         apply_event(
             &sessions,
@@ -382,6 +398,19 @@ mod tests {
             sessions
                 .by_endpoint("10.0.0.5:51820".parse().unwrap())
                 .is_some()
+        );
+        // Identity rotation: the old pubkey no longer resolves; the new one
+        // does, and it points at the surviving (same-ULA) session.
+        assert!(
+            sessions.by_pubkey(pubkey_a).is_none(),
+            "stale pubkey A must be dropped after the key rotation"
+        );
+        let session_b = sessions
+            .by_pubkey(pubkey_b)
+            .expect("pubkey B resolves after the rotation");
+        assert_eq!(
+            session_b.peer_pubkey, pubkey_b,
+            "rotated session carries the new pubkey"
         );
     }
 
