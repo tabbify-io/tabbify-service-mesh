@@ -1,9 +1,9 @@
 # Release pipeline for tabbify-service-mesh.
 #
 # Builds the three mesh binaries as fully static Linux executables
-# (x86_64-unknown-linux-musl) and uploads them to S3 alongside
-# bootstrap.sh, so a fresh Ubuntu host can be provisioned with a single
-# curl | sh invocation of the script.
+# (x86_64 + aarch64, musl) and uploads them to S3 alongside the
+# one-command installer (mesh/install == bootstrap.sh), so a fresh
+# systemd Linux host joins the mesh with a single curl | sh.
 #
 # ---------------------------------------------------------------------------
 # REQUIRED REPO CONFIGURATION (Settings -> Secrets and variables -> Actions)
@@ -50,14 +50,23 @@ on:
       - "v*"
 
 env:
-  # musl gives us static binaries that run on any modern Linux without a
-  # matching libc. The active dependency graph uses rustls + ring for TLS
-  # (no OpenSSL C linkage), so musl builds cleanly here.
-  TARGET: x86_64-unknown-linux-musl
   CARGO_TERM_COLOR: always
 
 jobs:
   build-and-release:
+    # musl gives us static binaries that run on any modern Linux without a
+    # matching libc; both arches cross-compile on one x86_64 runner via
+    # cargo-zigbuild (zig supplies the cross-linker), mirroring the
+    # supervisor release pipeline. The coordinator container + redeploy
+    # steps run on the x86_64 leg only.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
     runs-on: ubuntu-latest
 
     # `id-token: write` is required for the OIDC handshake with AWS STS.
@@ -74,14 +83,15 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add "${TARGET}"
+          rustup target add "${{ matrix.target }}"
 
-      - name: Install musl build tools
-        # musl-gcc is needed to link the static C runtime (e.g. ring's
-        # assembly stubs) for the musl target.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+      - name: Install zig (cross-linker for cargo-zigbuild)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
@@ -90,15 +100,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-zig-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ env.TARGET }}-
+            ${{ runner.os }}-cargo-zig-${{ matrix.target }}-
 
       - name: Build static release binaries
-        # Builds the whole workspace for the musl target. The three
-        # binary-producing packages are tabbify-mesh-coordinator,
-        # tabbify-mesh and tabbify-mesh-ca (the other crates are libs).
-        run: cargo build --release --target "${TARGET}"
+        # cargo-zigbuild cross-links the musl C runtime for both targets
+        # from one x86_64 runner. The three binary-producing packages are
+        # tabbify-mesh-coordinator, tabbify-mesh and tabbify-mesh-ca.
+        run: cargo zigbuild --release --target "${{ matrix.target }}" --bin tabbify-mesh --bin tabbify-mesh-coordinator --bin tabbify-mesh-ca
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -108,8 +118,9 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Upload binaries and bootstrap.sh to S3
-        # Legacy overwrite-latest keys (compat aliases) + versioned layout
+      - name: Upload binaries and the installer to S3
+        # Legacy overwrite-latest keys (compat aliases, x86_64 only) + the
+        # one-command installer (mesh/install) + versioned layout
         # (<family>/v<SEMVER>/<arch>/<binaries> + sibling `latest` manifest)
         # when building a v* tag. Old hosts keep reading mesh/<bin>; the
         # self-updater reads mesh/v<SEMVER>/... + mesh/latest (spec P0).
@@ -117,17 +128,21 @@ jobs:
           BUCKET: ${{ vars.RELEASE_S3_BUCKET }}
         run: |
           set -euo pipefail
-          BIN_DIR="target/${TARGET}/release"
+          BIN_DIR="target/${{ matrix.target }}/release"
           DEST="s3://${BUCKET}/mesh"
-          ARCH="${TARGET%%-*}"   # x86_64-unknown-linux-musl -> x86_64
+          ARCH="${{ matrix.arch }}"
 
-          # 1) LEGACY overwrite-latest keys (compatibility aliases).
-          for bin in tabbify-mesh-coordinator tabbify-mesh tabbify-mesh-ca; do
-            echo "Uploading legacy alias ${bin}..."
-            aws s3 cp "${BIN_DIR}/${bin}" "${DEST}/${bin}"
-          done
-          echo "Uploading bootstrap.sh..."
-          aws s3 cp bootstrap.sh "${DEST}/bootstrap.sh"
+          if [ "${ARCH}" = "x86_64" ]; then
+            # 1) LEGACY overwrite-latest keys (compatibility aliases).
+            for bin in tabbify-mesh-coordinator tabbify-mesh tabbify-mesh-ca; do
+              echo "Uploading legacy alias ${bin}..."
+              aws s3 cp "${BIN_DIR}/${bin}" "${DEST}/${bin}"
+            done
+            # The one-command installer (curl -fsSL .../mesh/install | sh).
+            echo "Uploading installer..."
+            aws s3 cp bootstrap.sh "${DEST}/bootstrap.sh" --content-type text/x-shellscript
+            aws s3 cp bootstrap.sh "${DEST}/install"      --content-type text/x-shellscript
+          fi
 
           # 2) VERSIONED layout — only on a v* tag (SEMVER source = git tag).
           REF="${GITHUB_REF#refs/tags/}"
@@ -141,21 +156,25 @@ jobs:
               aws s3 cp "${BIN_DIR}/tabbify-mesh"    "${VDEST}/tabbify-mesh"
               aws s3 cp "${BIN_DIR}/tabbify-mesh-ca" "${VDEST}/tabbify-mesh-ca"
 
-              # TODO(P3+): `versions` currently lists only the current tag.
-              # Full history aggregation (merge with the previous `latest`
-              # manifest) is a separate task; for P0 a single-element list
-              # is sufficient.
-              TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-              MANIFEST=$(jq -n \
-                --arg latest "${SEMVER}" \
-                --arg sha_mesh "${SHA_MESH}" \
-                --arg sha_ca   "${SHA_CA}" \
-                --arg ts "${TS}" \
-                '{latest:$latest, versions:[$latest],
-                  sha256:{"tabbify-mesh":$sha_mesh,"tabbify-mesh-ca":$sha_ca},
-                  ts:$ts}')
-              echo "${MANIFEST}" | aws s3 cp - "${DEST}/latest" --content-type application/json
-              echo "Wrote ${DEST}/latest:"; echo "${MANIFEST}"
+              # The `latest` manifest is written once, by the x86_64 leader
+              # (single source of truth; hashes are the x86_64 ones — the
+              # installer skips sha verification on other arches).
+              if [ "${ARCH}" = "x86_64" ]; then
+                # TODO(P3+): `versions` currently lists only the current tag.
+                TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                # -c (compact): the installers grep this manifest with no-whitespace
+                # patterns; pretty-printed jq output would break every install.
+                MANIFEST=$(jq -nc \
+                  --arg latest "${SEMVER}" \
+                  --arg sha_mesh "${SHA_MESH}" \
+                  --arg sha_ca   "${SHA_CA}" \
+                  --arg ts "${TS}" \
+                  '{latest:$latest, versions:[$latest],
+                    sha256:{"tabbify-mesh":$sha_mesh,"tabbify-mesh-ca":$sha_ca},
+                    ts:$ts}')
+                echo "${MANIFEST}" | aws s3 cp - "${DEST}/latest" --content-type application/json
+                echo "Wrote ${DEST}/latest:"; echo "${MANIFEST}"
+              fi
               ;;
             *)
               echo "Not a v* tag (${GITHUB_REF}) — skipping versioned upload."
@@ -166,10 +185,12 @@ jobs:
       # the service host. joiner/CA stay as S3 binaries above (host TUN). The
       # Dockerfile wraps the static musl binary built above into distroless.
       - name: Log in to Amazon ECR
+        if: matrix.arch == 'x86_64'
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push coordinator image
+        if: matrix.arch == 'x86_64'
         run: |
           set -euo pipefail
           IMAGE="${{ steps.ecr.outputs.registry }}/tabbify-coordinator"
@@ -183,6 +204,7 @@ jobs:
       # it: if no digest is confirmed this step fails and the SSM redeploy below
       # never runs (closes bug#3, the redeploy race on a mutable tag).
       - name: Confirm coordinator image digest
+        if: matrix.arch == 'x86_64'
         env:
           AWS_REGION: ${{ vars.AWS_REGION }}
           REGISTRY: ${{ steps.ecr.outputs.registry }}
@@ -202,6 +224,7 @@ jobs:
       # ssm:SendCommand, both via terraform). Closes the gap where pushed images
       # never reached the running coordinator.
       - name: Redeploy coordinator via SSM
+        if: matrix.arch == 'x86_64'
         env:
           AWS_REGION: ${{ vars.AWS_REGION }}
           REGISTRY: ${{ steps.ecr.outputs.registry }}

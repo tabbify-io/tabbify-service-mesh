@@ -1,151 +1,132 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# bootstrap.sh — join this machine to the Tabbify mesh with one command
+# (Tailscale-style: no config, the production coordinator + TLS relay
+# are baked into the binary). Any systemd Linux:
 #
-# bootstrap.sh — provision a fresh Ubuntu host as a tabbify-service-mesh node.
+#   curl -fsSL https://tabbify-releases-leo.s3.eu-central-1.amazonaws.com/mesh/install | sudo sh
 #
-# Downloads the static mesh binaries from S3 into /usr/local/bin and lays
-# down a config stub at /etc/tabbify/mesh.env. Idempotent: re-running it
-# re-downloads the latest binaries and leaves an existing mesh.env untouched.
+# What it does:
+#   - downloads the static `tabbify-mesh` joiner for THIS arch
+#     (x86_64 / aarch64), sha256-verified against the release manifest
+#     (x86_64), into /usr/local/bin (it is also the CLI: status/peers)
+#   - installs the tabbify-mesh systemd service: joins on boot,
+#     auto-restarts, keeps a persistent identity (stable overlay
+#     address across restarts) under /var/lib/tabbify-mesh
+#   - the joiner SELF-MANAGES host integration: the firewall trust rule
+#     for its own TUN device (re-asserted every 60s, tailscaled-style),
+#     NAT traversal, and the TLS relay fallback — a machine behind any
+#     NAT/corporate firewall still becomes reachable
 #
-# Usage:
-#   curl -fsSL <base-url>/bootstrap.sh | sudo bash
-#   # or
-#   sudo ./bootstrap.sh
+# This is the MESH-ONLY install (a machine that should be on the network
+# without running apps). To also RUN apps (containers / Firecracker
+# microVMs), install the supervisor instead — the mesh is built into it:
 #
-# Configuration (environment variables):
-#   MESH_RELEASE_BASE_URL   Base URL the binaries are fetched from. Defaults
-#                           to the public S3 object URL of the release bucket.
-#                           >>> REPLACE the placeholder below (or export this
-#                           var) with your real bucket/region, e.g.:
-#                             https://tabbify-mesh-releases.s3.eu-central-1.amazonaws.com/mesh
-#                           This must match RELEASE_S3_BUCKET / AWS_REGION used
-#                           by the release workflow. If the bucket is private,
-#                           point this at a CloudFront/presigned URL instead.
+#   curl -fsSL https://tabbify-releases-leo.s3.eu-central-1.amazonaws.com/supervisor/install | sudo sh
+#
+# Re-running upgrades the binary in place and restarts the service.
+#
+# Uninstall:
+#   systemctl disable --now tabbify-mesh
+#   rm -rf /usr/local/bin/tabbify-mesh /var/lib/tabbify-mesh /etc/systemd/system/tabbify-mesh.service
+set -eu
 
-set -euo pipefail
+BASE="${TABBIFY_RELEASE_BASE_URL:-https://tabbify-releases-leo.s3.eu-central-1.amazonaws.com}"
+BIN=/usr/local/bin/tabbify-mesh
+STATE=/var/lib/tabbify-mesh
 
-# --- Configuration ---------------------------------------------------------
+if [ -t 1 ]; then G='\033[1;32m'; Y='\033[1;33m'; R='\033[1;31m'; N='\033[0m'; else G=''; Y=''; R=''; N=''; fi
+log()  { printf "${G}==>${N} %s\n" "$*"; }
+warn() { printf "${Y}warn:${N} %s\n" "$*" >&2; }
+die()  { printf "${R}error:${N} %s\n" "$*" >&2; exit 1; }
 
-# TODO(leo): replace <BUCKET> and <REGION> with the real release bucket.
-DEFAULT_BASE_URL="https://<BUCKET>.s3.<REGION>.amazonaws.com/mesh"
-BASE_URL="${MESH_RELEASE_BASE_URL:-${DEFAULT_BASE_URL}}"
+[ "$(id -u)" -eq 0 ] || die "run as root:  curl -fsSL .../mesh/install | sudo sh"
+command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v systemctl >/dev/null 2>&1 || die "systemd is required (this installer manages a systemd unit)"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required (coreutils/busybox)"
+command -v ip >/dev/null 2>&1 || die "iproute2 ('ip') is required to configure the mesh TUN device"
 
-INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/tabbify"
-CONFIG_FILE="${CONFIG_DIR}/mesh.env"
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64) : ;;
+  aarch64|arm64) ARCH=aarch64 ;;
+  *) die "unsupported architecture: $ARCH (x86_64 / aarch64 only)" ;;
+esac
 
-# Binaries produced by the release workflow. Keep this list in sync with the
-# upload step in .github/workflows/release.yml.
-BINARIES=(
-  "tabbify-mesh-coordinator"
-  "tabbify-mesh"
-  "tabbify-mesh-ca"
-)
+# ── resolve + download (sha256-verified on x86_64) ──────────────────────
+MANIFEST=$(curl -fsSL "$BASE/mesh/latest") || die "cannot fetch $BASE/mesh/latest"
+VER=$(printf '%s' "$MANIFEST" | grep -o '"latest":[[:space:]]*"[^"]*"' | grep -o '"v[^"]*"$' | tr -d '"')
+[ -n "$VER" ] || die "could not resolve the latest mesh version"
+log "Tabbify mesh joiner $VER ($ARCH)"
 
-# --- Helpers ---------------------------------------------------------------
+tmp=$(mktemp)
+curl -fSL -o "$tmp" "$BASE/mesh/$VER/$ARCH/tabbify-mesh" \
+  || die "download failed: $BASE/mesh/$VER/$ARCH/tabbify-mesh (no $ARCH build for $VER?)"
+if [ "$ARCH" = x86_64 ]; then
+  want=$(printf '%s' "$MANIFEST" | grep -o '"tabbify-mesh":[[:space:]]*"[a-f0-9]*"' | grep -o '[a-f0-9]\{64\}') || true
+  got=$(sha256sum "$tmp" | cut -d' ' -f1)
+  [ "$want" = "$got" ] || die "tabbify-mesh sha256 mismatch (manifest $want, downloaded $got)"
+fi
+chmod +x "$tmp"
+mv "$tmp" "$BIN"
+"$BIN" --version >/dev/null 2>&1 || die "downloaded binary failed its --version self-check"
 
-log() {
-  printf '==> %s\n' "$*"
-}
+# ── informational capability check ──────────────────────────────────────
+command -v ip6tables >/dev/null 2>&1 \
+  || warn "ip6tables missing — the joiner cannot self-manage firewall trust; inbound overlay connections may be filtered by your firewall"
 
-err() {
-  printf 'error: %s\n' "$*" >&2
-}
+# ── systemd unit ─────────────────────────────────────────────────────────
+NODE_NAME=$(uname -n)
+mkdir -p "$STATE"
+log "installing tabbify-mesh.service (node name: $NODE_NAME)"
 
-require_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    err "this script writes to ${INSTALL_DIR} and ${CONFIG_DIR}; run it as root (e.g. with sudo)."
-    exit 1
+cat > /etc/systemd/system/tabbify-mesh.service <<EOF
+[Unit]
+Description=Tabbify mesh joiner
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Foreground daemon. --manage-firewall: keep an iface-scoped INPUT
+# ACCEPT for the mesh TUN (asserted at bring-up, re-asserted every 60s,
+# removed on exit) so distro firewalls don't drop inbound overlay
+# connections — the tailscaled pattern.
+ExecStart=$BIN join --name $NODE_NAME --manage-firewall
+# HOME anchors the persistent identity ($STATE/.tabbify-mesh/keypair):
+# the same WireGuard key on every start means the same stable overlay
+# address (the coordinator's roster is keyed by public key).
+Environment=HOME=$STATE
+WorkingDirectory=$STATE
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable tabbify-mesh.service >/dev/null 2>&1
+systemctl restart tabbify-mesh.service
+
+# ── wait for the join and report the overlay address ───────────────────
+log "joining the mesh (up to 45s)..."
+i=0
+ULA=""
+while [ $i -lt 45 ]; do
+  # The standalone joiner logs JSON ("my_ula":"fd5a:…"), unlike the
+  # supervisor's key=value format — the two greps are NOT interchangeable.
+  ULA=$(journalctl -u tabbify-mesh --since "-3 min" --no-pager 2>/dev/null \
+    | grep -o '"my_ula":"[0-9a-f:]*"' | tail -1 | cut -d'"' -f4) || true
+  if [ -n "$ULA" ] && systemctl is-active --quiet tabbify-mesh; then
+    break
   fi
-}
-
-require_curl() {
-  if ! command -v curl >/dev/null 2>&1; then
-    err "curl is required but not installed. Install it with: apt-get install -y curl"
-    exit 1
-  fi
-}
-
-check_base_url() {
-  case "${BASE_URL}" in
-    *"<BUCKET>"* | *"<REGION>"*)
-      err "MESH_RELEASE_BASE_URL is not configured."
-      err "Set it to your release bucket URL, e.g.:"
-      err "  export MESH_RELEASE_BASE_URL=https://my-bucket.s3.eu-central-1.amazonaws.com/mesh"
-      exit 1
-      ;;
-  esac
-}
-
-# --- Main ------------------------------------------------------------------
-
-require_root
-require_curl
-check_base_url
-
-log "Installing mesh binaries from ${BASE_URL}"
-mkdir -p "${INSTALL_DIR}"
-
-for bin in "${BINARIES[@]}"; do
-  dest="${INSTALL_DIR}/${bin}"
-  log "Downloading ${bin}"
-  # Download to a temp file first so a failed fetch never leaves a
-  # half-written or non-executable binary in place.
-  tmp="$(mktemp)"
-  if ! curl -fsSL "${BASE_URL}/${bin}" -o "${tmp}"; then
-    err "failed to download ${bin} from ${BASE_URL}/${bin}"
-    rm -f "${tmp}"
-    exit 1
-  fi
-  chmod +x "${tmp}"
-  mv -f "${tmp}" "${dest}"
-  log "Installed ${dest}"
+  i=$((i + 3)); sleep 3
 done
 
-# Create the config stub only if it does not already exist, so re-running
-# bootstrap.sh never clobbers a host's real configuration.
-if [ ! -f "${CONFIG_FILE}" ]; then
-  log "Creating config stub at ${CONFIG_FILE}"
-  mkdir -p "${CONFIG_DIR}"
-  cat > "${CONFIG_FILE}" <<'EOF'
-# tabbify-service-mesh node configuration.
-# Fill these in before starting the mesh peer.
-
-# Coordinator endpoint this node joins, e.g. https://coordinator.example.com:8888
-MESH_COORDINATOR=
-
-# Join token issued by the coordinator / auth service.
-MESH_JOIN_TOKEN=
-EOF
-  chmod 600 "${CONFIG_FILE}"
-  log "Wrote ${CONFIG_FILE} (edit it to set MESH_COORDINATOR and MESH_JOIN_TOKEN)"
+if [ -n "$ULA" ]; then
+  log "machine '$NODE_NAME' is ON the mesh: $ULA"
+  log "peers:   $BIN peers"
+  log "leave:   systemctl disable --now tabbify-mesh"
 else
-  log "Config ${CONFIG_FILE} already exists — leaving it untouched"
+  warn "service started but the join was not confirmed within 45s"
+  warn "inspect:  journalctl -u tabbify-mesh -f"
 fi
-
-log "Done. Installed: ${BINARIES[*]}"
-cat <<EOF
-
-Next steps:
-  1. Edit ${CONFIG_FILE} and set MESH_COORDINATOR and MESH_JOIN_TOKEN.
-  2. Join the mesh as a peer, e.g.:
-       set -a && . ${CONFIG_FILE} && set +a
-       tabbify-mesh join --name "\$(hostname)"
-
-Optional — run the peer under systemd. Create
-/etc/systemd/system/tabbify-mesh.service with something like:
-
-  [Unit]
-  Description=Tabbify mesh peer
-  After=network-online.target
-  Wants=network-online.target
-
-  [Service]
-  EnvironmentFile=${CONFIG_FILE}
-  ExecStart=${INSTALL_DIR}/tabbify-mesh join --name %H
-  Restart=on-failure
-
-  [Install]
-  WantedBy=multi-user.target
-
-then: systemctl daemon-reload && systemctl enable --now tabbify-mesh
-EOF
