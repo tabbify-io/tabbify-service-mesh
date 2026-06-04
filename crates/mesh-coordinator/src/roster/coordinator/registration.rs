@@ -107,8 +107,12 @@ impl Coordinator {
         // explicit hostname verbatim. The `reflexive` flag records which it
         // was so the heartbeat path knows whether to roam it. Computed
         // identically on the re-register path inside `refresh_existing`.
-        let resolved =
-            resolve_listen_endpoint(req.listen_endpoint.as_deref(), observed, req.wg_listen_port);
+        let resolved = resolve_listen_endpoint(
+            req.listen_endpoint.as_deref(),
+            observed,
+            req.wg_listen_port,
+            req.relay_only,
+        );
 
         // Re-registration path. Holding the by_pubkey shard lock while
         // we look up the peer_id is fine — the roster is keyed by
@@ -161,6 +165,10 @@ impl Coordinator {
             parent: req.parent.clone(),
             app_uuid: req.app_uuid.clone(),
             software_version: req.software_version.clone(),
+            // Carry the relay-only declaration onto the durable event so it
+            // round-trips through replay + is visible to viewers. Drives the
+            // hole-punch suppression downstream (`punch_peer`).
+            relay_only: req.relay_only,
         };
         // Publish first so the sink sees the event before in-memory state
         // changes; then apply the event to in-memory state from the same
@@ -283,6 +291,10 @@ impl Coordinator {
             if req.software_version.is_some() {
                 e.software_version.clone_from(&req.software_version);
             }
+            // Re-assert relay-only on every re-register so a peer that flips
+            // its reachability is reflected (and the resolved endpoint above
+            // — already `None` for relay-only — stays consistent with it).
+            e.relay_only = req.relay_only;
             e.last_heartbeat = Instant::now();
             if let Some(obs) = observed {
                 e.observed_external = obs.to_string();

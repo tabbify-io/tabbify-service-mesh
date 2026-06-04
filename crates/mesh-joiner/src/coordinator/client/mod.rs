@@ -94,6 +94,15 @@ pub struct RegisterRequest {
     /// coordinators are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub software_version: Option<String>,
+    /// Declare this peer **relay-only** — it has no reachable direct endpoint
+    /// (e.g. a container netns with no inbound mesh port). When `true` the
+    /// coordinator advertises no direct endpoint for us and never emits a
+    /// hole-punch directive for a pair involving us, so a relay-only ↔ NAT'd
+    /// `WireGuard` handshake stays single-sided and completes over the relay.
+    /// Always serialized (a plain `bool`) so a coordinator reads our intent
+    /// explicitly; `#[serde(default)]` only matters on the read side.
+    #[serde(default)]
+    pub relay_only: bool,
 }
 
 /// Body of `POST /v1/mesh/register`'s response.
@@ -136,6 +145,12 @@ pub struct HeartbeatRequest {
     /// observe `actual` version (spec P0). Omitted from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub software_version: Option<String>,
+    /// Re-assert our relay-only flag on every heartbeat (same semantics as on
+    /// [`RegisterRequest`]) so a coordinator that lost + rebuilt our entry, or
+    /// a peer that flips reachability, stays consistent without a full
+    /// re-register. `#[serde(default)]` matters on the read side.
+    #[serde(default)]
+    pub relay_only: bool,
 }
 
 /// Body of the heartbeat response. The coordinator returns the current
@@ -277,6 +292,12 @@ impl CoordinatorClient {
     /// `software_version` — version of the binary the host is running
     /// (e.g. `"v1.4.0"`). Host-supplied; `None` for an older host —
     /// omitted from the wire (spec P0).
+    ///
+    /// `relay_only` — `true` when this peer has no reachable direct endpoint
+    /// (e.g. a container netns with no inbound mesh port). The coordinator
+    /// then advertises no direct endpoint for us and never makes us a
+    /// hole-punch target, so a relay-only ↔ NAT'd handshake completes over
+    /// the relay without simultaneous-init thrash. `false` for a normal peer.
     #[allow(clippy::too_many_arguments)]
     pub async fn register(
         &self,
@@ -291,6 +312,7 @@ impl CoordinatorClient {
         parent: Option<String>,
         app_uuid: Option<String>,
         software_version: Option<String>,
+        relay_only: bool,
     ) -> Result<RegisterResponse> {
         let body = RegisterRequest {
             wg_public_key: B64.encode(wg_public_key),
@@ -308,6 +330,7 @@ impl CoordinatorClient {
             parent,
             app_uuid,
             software_version,
+            relay_only,
         };
         let url = format!("{}/v1/mesh/register", self.base_url);
         let mut builder = self.http.post(&url).json(&body);
@@ -342,6 +365,7 @@ impl CoordinatorClient {
         wg_listen_port: Option<u16>,
         hosted_app_ulas: &[String],
         software_version: Option<String>,
+        relay_only: bool,
     ) -> Result<HeartbeatResponse> {
         let url = format!("{}/v1/mesh/heartbeat", self.base_url);
         let body = HeartbeatRequest {
@@ -349,6 +373,7 @@ impl CoordinatorClient {
             wg_listen_port,
             hosted_app_ulas: hosted_app_ulas.to_vec(),
             software_version,
+            relay_only,
         };
         let resp = self
             .http

@@ -67,6 +67,7 @@ impl Coordinator {
             parent: event.parent.clone(),
             app_uuid: event.app_uuid.clone(),
             software_version: event.software_version.clone(),
+            relay_only: event.relay_only,
         };
         self.inner.roster.insert(peer_id, entry.clone());
         self.inner
@@ -158,6 +159,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             software_version: None,
+            relay_only: false,
         };
         let entry = coord.apply_peer_joined(&joined).expect("apply joined");
         assert_eq!(entry.peer_index, 5);
@@ -215,6 +217,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             software_version: None,
+            relay_only: false,
         };
         coord.apply_peer_joined(&joined).expect("apply joined");
         // Register a live relay connection for this peer's pubkey.
@@ -261,6 +264,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             software_version: None,
+            relay_only: false,
         };
         coord.apply_peer_joined(&joined).expect("apply");
         // Next live register in net7 should land on index 8.
@@ -280,6 +284,7 @@ mod tests {
             app_uuid: None,
             requested_ula: None,
             software_version: None,
+            relay_only: false,
         };
         let (entry, _) = coord.register(req).await.expect("register");
         assert_eq!(entry.peer_index, 8);
@@ -302,6 +307,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             software_version: None,
+            relay_only: false,
         };
         let err = coord.apply_peer_joined(&bad).expect_err("bad uuid");
         assert!(matches!(

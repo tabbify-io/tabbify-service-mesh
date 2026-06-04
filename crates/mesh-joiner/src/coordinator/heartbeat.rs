@@ -81,6 +81,10 @@ pub struct ReregisterInputs {
     pub parent: Option<String>,
     /// UUID of the app this runner serves.
     pub app_uuid: Option<String>,
+    /// Declare this peer relay-only (no reachable direct endpoint). Re-sent on
+    /// every register + heartbeat so the coordinator suppresses our direct
+    /// endpoint + hole-punch directives. See [`crate::config::JoinConfig::relay_only`].
+    pub relay_only: bool,
 }
 
 /// Snapshot the locally-hosted app-ULA set into the wire form
@@ -242,7 +246,13 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
     let hosted = hosted_app_ula_strings(hosted_app_ulas);
     let current_id = *peer_id.read().await;
     match client
-        .heartbeat(current_id, Some(wg_listen_port), &hosted, software_version)
+        .heartbeat(
+            current_id,
+            Some(wg_listen_port),
+            &hosted,
+            software_version,
+            reregister.relay_only,
+        )
         .await
     {
         Ok(resp) => {
@@ -360,6 +370,7 @@ async fn register_attempt(
             inputs.parent.clone(),
             inputs.app_uuid.clone(),
             software_version,
+            inputs.relay_only,
         )
         .await
 }
@@ -551,6 +562,7 @@ mod tests {
             kind: None,
             parent: None,
             app_uuid: None,
+            relay_only: false,
         }
     }
 

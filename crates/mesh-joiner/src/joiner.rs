@@ -731,6 +731,7 @@ fn build_reregister_inputs(
         kind: config.kind.clone(),
         parent: config.parent.clone(),
         app_uuid: config.app_uuid.clone(),
+        relay_only: config.relay_only,
     }
 }
 

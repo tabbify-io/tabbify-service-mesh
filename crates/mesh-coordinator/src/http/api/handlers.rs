@@ -172,6 +172,7 @@ pub async fn heartbeat_handler(
             req.wg_listen_port,
             req.hosted_app_ulas,
             req.software_version,
+            req.relay_only,
         )
         .await
     {

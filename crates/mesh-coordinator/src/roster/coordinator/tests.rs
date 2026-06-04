@@ -37,6 +37,7 @@ fn req(seed: u8, name: &str) -> RegisterRequest {
         app_uuid: None,
         requested_ula: None,
         software_version: None,
+        relay_only: false,
     }
 }
 
@@ -84,6 +85,7 @@ async fn heartbeat_updates_only_known_peers() {
             Some(51820),
             vec![],
             None,
+            false,
         )
         .await
         .expect("heartbeat");
@@ -91,7 +93,7 @@ async fn heartbeat_updates_only_known_peers() {
 
     let bogus = Uuid::now_v7();
     let err = c
-        .heartbeat(bogus, "ignored".into(), None, vec![], None)
+        .heartbeat(bogus, "ignored".into(), None, vec![], None, false)
         .await
         .expect_err("unknown peer");
     assert!(matches!(err, CoordinatorError::UnknownPeer(_)));
@@ -143,6 +145,7 @@ async fn invalid_pubkey_length_is_rejected() {
             app_uuid: None,
             requested_ula: None,
             software_version: None,
+            relay_only: false,
         })
         .await
         .expect_err("invalid pubkey");
@@ -245,6 +248,7 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
         Some(51820),
         vec![],
         None,
+        false,
     )
     .await
     .expect("a hb1");
@@ -261,6 +265,7 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
         Some(51820),
         vec![],
         None,
+        false,
     )
     .await
     .expect("b hb1");
@@ -304,6 +309,7 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
         Some(51820),
         vec![],
         None,
+        false,
     )
     .await
     .expect("a hb2");
@@ -333,6 +339,7 @@ async fn heartbeat_broadcasts_holepunch_pair_to_sse_subscribers() {
         Some(51820),
         vec![],
         None,
+        false,
     )
     .await
     .expect("a hb");
@@ -342,6 +349,7 @@ async fn heartbeat_broadcasts_holepunch_pair_to_sse_subscribers() {
         Some(51820),
         vec![],
         None,
+        false,
     )
     .await
     .expect("b hb");
@@ -381,7 +389,7 @@ async fn heartbeat_does_not_emit_when_one_peer_lacks_external() {
 
     // Alice heartbeats with a known external — bob never heartbeats,
     // so its observed_external stays empty.
-    c.heartbeat(alice.peer_id, "203.0.113.30:33333".into(), None, vec![], None)
+    c.heartbeat(alice.peer_id, "203.0.113.30:33333".into(), None, vec![], None, false)
         .await
         .expect("a hb");
 
@@ -401,14 +409,14 @@ async fn heartbeat_with_empty_external_skips_emit() {
     let (bob, _) = c.register(req(61, "bob")).await.expect("b");
 
     // Alice gets an external on heartbeat 1.
-    c.heartbeat(alice.peer_id, "203.0.113.50:44444".into(), None, vec![], None)
+    c.heartbeat(alice.peer_id, "203.0.113.50:44444".into(), None, vec![], None, false)
         .await
         .expect("a hb");
 
     // Bob heartbeats but ConnectInfo wasn't captured — empty string.
     // This mirrors the test-router path that drives via Router::call
     // without the make_service wrapper.
-    c.heartbeat(bob.peer_id, String::new(), None, vec![], None)
+    c.heartbeat(bob.peer_id, String::new(), None, vec![], None, false)
         .await
         .expect("b hb empty external");
 
@@ -416,6 +424,119 @@ async fn heartbeat_with_empty_external_skips_emit() {
         pub_.count_by_type("holepunch_initiate"),
         0,
         "empty observed_external must not trigger an emit"
+    );
+}
+
+// -----------------------------------------------------------------
+// Fix D — relay-only peers are never punch targets.
+//
+// A relay-only peer (one declaring it has no reachable direct endpoint)
+// must NEVER be paired for a hole punch — punching at its black-hole
+// endpoint in parallel with the relay is the simultaneous-init thrash this
+// fix removes. Because the pairing builds each pair from BOTH ends, a punch
+// is suppressed when EITHER peer is relay-only; two normal peers still pair.
+// -----------------------------------------------------------------
+
+/// `relay_only = true` builds NO `PunchPeer`, so a heartbeat that would
+/// otherwise pair two dialable peers emits nothing when either is relay-only
+/// — and the non-relay-only baseline still emits, proving it's the flag (not
+/// some other gate) doing the suppression.
+#[tokio::test]
+async fn heartbeat_suppresses_holepunch_when_either_peer_relay_only() {
+    let pub_ = StdArc::new(CapturingPublisher::new());
+    let c = coordinator_with(pub_.clone());
+    let (alice, _) = c.register(req(80, "alice")).await.expect("a");
+    let (bob, _) = c.register(req(81, "bob")).await.expect("b");
+
+    // Mark bob relay-only AFTER register. Give bob a (non-empty) endpoint so
+    // the ONLY reason the pair is skipped is the relay_only guard, not a
+    // missing dial target — isolating the new behaviour from endpoint
+    // suppression (covered separately in `nat::reflexive` tests).
+    {
+        let mut e = c.inner.roster.get_mut(&bob.peer_id).expect("bob entry");
+        e.relay_only = true;
+        e.listen_endpoint = Some("198.51.100.81:51820".into());
+    }
+
+    // Both peers heartbeat with public observed addrs — alice is fully
+    // dialable, bob would be too if it weren't relay-only.
+    c.heartbeat(alice.peer_id, "203.0.113.80:11111".into(), Some(51820), vec![], None, false)
+        .await
+        .expect("a hb");
+    c.heartbeat(bob.peer_id, "198.51.100.81:22222".into(), Some(51820), vec![], None, true)
+        .await
+        .expect("b hb");
+
+    assert_eq!(
+        pub_.count_by_type("holepunch_initiate"),
+        0,
+        "no punch directive may be emitted for a pair involving a relay-only peer"
+    );
+    assert!(
+        c.punch_tracker().is_empty(),
+        "relay-only suppression must not even claim a punch pair"
+    );
+}
+
+/// Baseline: the SAME scenario with bob NOT relay-only DOES emit the pair.
+/// Guards against a false pass (e.g. a missing endpoint silently suppressing
+/// the punch regardless of the flag).
+#[tokio::test]
+async fn heartbeat_emits_holepunch_for_two_non_relay_only_peers() {
+    let pub_ = StdArc::new(CapturingPublisher::new());
+    let c = coordinator_with(pub_.clone());
+    let (alice, _) = c.register(req(82, "alice")).await.expect("a");
+    let (bob, _) = c.register(req(83, "bob")).await.expect("b");
+    // Give bob a dialable endpoint, but leave relay_only = false (the
+    // register default).
+    {
+        let mut e = c.inner.roster.get_mut(&bob.peer_id).expect("bob entry");
+        e.listen_endpoint = Some("198.51.100.83:51820".into());
+    }
+
+    c.heartbeat(alice.peer_id, "203.0.113.82:11111".into(), Some(51820), vec![], None, false)
+        .await
+        .expect("a hb");
+    c.heartbeat(bob.peer_id, "198.51.100.83:22222".into(), Some(51820), vec![], None, false)
+        .await
+        .expect("b hb");
+
+    assert_eq!(
+        pub_.count_by_type("holepunch_initiate"),
+        2,
+        "two directly-reachable, non-relay-only peers must still pair (2 events)"
+    );
+}
+
+/// A relay-only peer registered through the full `register_authenticated`
+/// path (with a public observed source) gets `listen_endpoint = None` — the
+/// coordinator advertises NO direct dial target for it. Verifies the
+/// reflexive-suppression wiring end-to-end, not just the pure resolver.
+#[tokio::test]
+async fn relay_only_register_advertises_no_listen_endpoint() {
+    let c = coordinator();
+    let observed: SocketAddr = "203.0.113.90:34812".parse().expect("addr");
+    let (entry, _) = c
+        .register_authenticated(
+            RegisterRequest {
+                relay_only: true,
+                // Even a self-reported public endpoint must be suppressed.
+                listen_endpoint: Some("203.0.113.90:51820".into()),
+                ..req(90, "relay-only-node")
+            },
+            None,
+            Some(observed),
+        )
+        .await
+        .expect("register relay-only");
+    assert_eq!(
+        entry.listen_endpoint, None,
+        "a relay-only peer must advertise no direct listen endpoint"
+    );
+    assert!(entry.relay_only, "relay_only flag must round-trip onto the entry");
+    assert!(
+        !entry.endpoint_is_reflexive,
+        "no endpoint → not reflexive"
     );
 }
 
@@ -474,6 +595,7 @@ async fn register_preserves_public_self_report_over_reflexive() {
         app_uuid: None,
         requested_ula: None,
         software_version: None,
+        relay_only: false,
     };
     let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
     let (entry, _) = c
@@ -522,6 +644,7 @@ async fn heartbeat_rolls_reflexive_endpoint_over_on_ip_change() {
             Some(51820),
             vec![],
             None,
+            false,
         )
         .await
         .expect("heartbeat");
@@ -551,6 +674,7 @@ async fn heartbeat_preserves_public_advertised_endpoint() {
         app_uuid: None,
         requested_ula: None,
         software_version: None,
+        relay_only: false,
     };
     let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
     let (entry, _) = c
@@ -565,6 +689,7 @@ async fn heartbeat_preserves_public_advertised_endpoint() {
             Some(51820),
             vec![],
             None,
+            false,
         )
         .await
         .expect("heartbeat");
@@ -596,6 +721,7 @@ async fn heartbeat_promotes_loopback_fallback_to_reflexive() {
             Some(51820),
             vec![],
             None,
+            false,
         )
         .await
         .expect("heartbeat");
@@ -691,6 +817,7 @@ async fn heartbeat_replaces_hosted_app_ula_set() {
             Some(51820),
             vec![app_b.to_owned()],
             None,
+            false,
         )
         .await
         .expect("heartbeat");
@@ -708,6 +835,7 @@ async fn heartbeat_replaces_hosted_app_ula_set() {
             Some(51820),
             vec![],
             None,
+            false,
         )
         .await
         .expect("heartbeat clear");
@@ -731,6 +859,7 @@ async fn heartbeat_broadcasts_updated_with_new_hosted_set() {
         Some(51820),
         vec![app_a.to_owned()],
         None,
+        false,
     )
     .await
     .expect("heartbeat");
@@ -1109,6 +1238,7 @@ async fn software_version_is_stored_and_broadcast() {
             Some(51820),
             vec![],
             Some("v1.5.0".to_owned()),
+            false,
         )
         .await
         .expect("heartbeat");
@@ -1122,7 +1252,7 @@ async fn software_version_is_stored_and_broadcast() {
 
     // A heartbeat that omits the version (None) must NOT wipe it.
     let kept = c
-        .heartbeat(entry.peer_id, String::new(), Some(51820), vec![], None)
+        .heartbeat(entry.peer_id, String::new(), Some(51820), vec![], None, false)
         .await
         .expect("heartbeat none");
     assert_eq!(

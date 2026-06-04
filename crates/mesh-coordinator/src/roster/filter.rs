@@ -148,6 +148,7 @@ mod tests {
             app_uuid: None,
             requested_ula: None,
             software_version: None,
+            relay_only: false,
         }
     }
 

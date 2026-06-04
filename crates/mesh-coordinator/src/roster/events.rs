@@ -65,6 +65,12 @@ pub struct PeerJoined {
     /// `#[serde(default)]` keeps replay / older events back-compatible.
     #[serde(default)]
     pub software_version: Option<String>,
+    /// Whether the peer declared itself **relay-only** (no reachable direct
+    /// endpoint). A relay-only peer is never advertised with a direct listen
+    /// endpoint and is never a hole-punch target. `#[serde(default)]` keeps
+    /// replay / older events back-compatible (→ `false`).
+    #[serde(default)]
+    pub relay_only: bool,
 }
 
 fn default_kind() -> String {

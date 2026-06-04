@@ -37,6 +37,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         insecure_no_mtls,
         no_relay,
         relay_url,
+        relay_only,
     } = args;
 
     println!("joining... coordinator={coordinator}");
@@ -63,6 +64,10 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         // coordinator URL.
         relay_enabled: !no_relay,
         relay_url,
+        // Relay-only: this peer has no reachable direct endpoint, so the
+        // coordinator must suppress its direct endpoint + hole-punch
+        // directives. Off by default (a normal directly-reachable peer).
+        relay_only,
         // Runner-specific fields are not exposed via CLI — plain join is
         // always a plain peer. Per-app-runner processes set these
         // programmatically via JoinConfig directly.

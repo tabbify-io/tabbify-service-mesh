@@ -140,12 +140,31 @@ pub struct ResolvedEndpoint {
 /// 3. Otherwise → keep whatever the joiner self-reported (possibly a
 ///    loopback address for same-host smoke tests, possibly `None`; NOT
 ///    reflexive). We have nothing better to offer.
+///
+/// `relay_only` short-circuits the whole table: a peer that declared it has
+/// no reachable direct endpoint is ALWAYS resolved to `None` (and never
+/// reflexive). Advertising any direct endpoint for such a peer — even a
+/// self-reported public one — would make other peers fire `WireGuard`
+/// handshake-inits at a black-hole endpoint in parallel with the relay,
+/// producing the simultaneous-init thrash this fix removes (see the joiner's
+/// `JoinConfig::relay_only`). The peer is reached exclusively via the relay.
 #[must_use]
 pub fn resolve_listen_endpoint(
     self_reported: Option<&str>,
     observed: Option<SocketAddr>,
     wg_listen_port: Option<u16>,
+    relay_only: bool,
 ) -> ResolvedEndpoint {
+    // (0) A relay-only peer never advertises a direct dial target. This wins
+    // over every other branch — its reflexive endpoint is unreachable and a
+    // self-reported one would be black-holed.
+    if relay_only {
+        return ResolvedEndpoint {
+            endpoint: None,
+            reflexive: false,
+        };
+    }
+
     let self_reported = self_reported.filter(|s| !s.is_empty());
 
     // (1) A self-reported PUBLIC endpoint (or hostname) is authoritative.
@@ -281,6 +300,7 @@ mod tests {
             Some("127.0.0.1:49046"),
             Some(sock("203.0.113.7:34812")), // observed: public IP, unrelated TCP port
             Some(51820),                     // reported WG UDP port
+            false,
         );
         // Reflexive endpoint pairs the OBSERVED IP with the REPORTED WG
         // port — NOT the HTTP source port 34812.
@@ -299,6 +319,7 @@ mod tests {
             Some("192.168.1.42:51820"),
             Some(sock("198.51.100.9:5555")),
             Some(51820),
+            false,
         );
         assert_eq!(got.endpoint.as_deref(), Some("198.51.100.9:51820"));
         assert!(got.reflexive);
@@ -314,6 +335,7 @@ mod tests {
             Some("203.0.113.50:51820"),
             Some(sock("198.51.100.9:5555")), // different public IP observed
             Some(51820),
+            false,
         );
         assert_eq!(got.endpoint.as_deref(), Some("203.0.113.50:51820"));
         assert!(!got.reflexive, "explicit public advert must be sticky");
@@ -328,6 +350,7 @@ mod tests {
             Some("host.lima.internal:51820"),
             Some(sock("203.0.113.7:34812")),
             Some(51820),
+            false,
         );
         assert_eq!(got.endpoint.as_deref(), Some("host.lima.internal:51820"));
         assert!(!got.reflexive);
@@ -342,6 +365,7 @@ mod tests {
             Some("127.0.0.1:49046"),
             Some(sock("203.0.113.7:34812")),
             None,
+            false,
         );
         assert_eq!(got.endpoint.as_deref(), Some("127.0.0.1:49046"));
         assert!(!got.reflexive);
@@ -352,7 +376,7 @@ mod tests {
     /// is somehow unavailable.
     #[test]
     fn no_observed_addr_keeps_self_report() {
-        let got = resolve_listen_endpoint(Some("127.0.0.1:49046"), None, Some(51820));
+        let got = resolve_listen_endpoint(Some("127.0.0.1:49046"), None, Some(51820), false);
         assert_eq!(got.endpoint.as_deref(), Some("127.0.0.1:49046"));
         assert!(!got.reflexive);
     }
@@ -367,6 +391,7 @@ mod tests {
             Some("127.0.0.1:49046"),
             Some(sock("10.0.0.5:5555")),
             Some(51820),
+            false,
         );
         assert_eq!(got.endpoint.as_deref(), Some("127.0.0.1:49046"));
         assert!(!got.reflexive);
@@ -377,7 +402,7 @@ mod tests {
     /// that declines to guess its own address becomes reachable.
     #[test]
     fn passive_peer_with_public_observed_gets_reflexive() {
-        let got = resolve_listen_endpoint(None, Some(sock("203.0.113.7:34812")), Some(51820));
+        let got = resolve_listen_endpoint(None, Some(sock("203.0.113.7:34812")), Some(51820), false);
         assert_eq!(got.endpoint.as_deref(), Some("203.0.113.7:51820"));
         assert!(got.reflexive);
     }
@@ -385,9 +410,9 @@ mod tests {
     /// Passive peer, no observed IP, no port → stays passive (`None`).
     #[test]
     fn fully_passive_peer_stays_none() {
-        assert_eq!(resolve_listen_endpoint(None, None, None).endpoint, None);
+        assert_eq!(resolve_listen_endpoint(None, None, None, false).endpoint, None);
         assert_eq!(
-            resolve_listen_endpoint(Some(""), None, Some(51820)).endpoint,
+            resolve_listen_endpoint(Some(""), None, Some(51820), false).endpoint,
             None
         );
     }
@@ -402,6 +427,64 @@ mod tests {
         assert!(!is_sticky_explicit_endpoint("127.0.0.1:51820")); // loopback fallback
         assert!(!is_sticky_explicit_endpoint("192.168.1.5:51820")); // LAN fallback
         assert!(!is_sticky_explicit_endpoint("10.0.0.1:51820")); // private fallback
+    }
+
+    // ---- relay-only suppression (Fix D) ----
+
+    /// A relay-only peer must NEVER be advertised with a direct endpoint,
+    /// even when the coordinator observes a public source IP + WG port that
+    /// would otherwise synthesize a reflexive endpoint. Its reflexive
+    /// endpoint is a black hole (no inbound mesh port), so advertising one
+    /// would make peers fire handshake-inits at it AND relay — the
+    /// simultaneous-init thrash this fix eliminates.
+    #[test]
+    fn relay_only_suppresses_reflexive_endpoint() {
+        let got = resolve_listen_endpoint(
+            None,
+            Some(sock("203.0.113.7:34812")), // public observed IP
+            Some(51820),                     // reported WG port
+            true,                            // relay_only
+        );
+        assert_eq!(got.endpoint, None, "relay-only peer must advertise no endpoint");
+        assert!(!got.reflexive);
+    }
+
+    /// Relay-only ALSO suppresses a self-reported endpoint — even a public
+    /// one or a hostname. A peer that knows it has no inbound path must not
+    /// be dialed directly under any circumstance.
+    #[test]
+    fn relay_only_suppresses_even_self_reported_public() {
+        let got = resolve_listen_endpoint(
+            Some("203.0.113.50:51820"),
+            Some(sock("198.51.100.9:5555")),
+            Some(51820),
+            true,
+        );
+        assert_eq!(got.endpoint, None);
+        assert!(!got.reflexive);
+
+        let got_host = resolve_listen_endpoint(
+            Some("host.lima.internal:51820"),
+            None,
+            Some(51820),
+            true,
+        );
+        assert_eq!(got_host.endpoint, None);
+        assert!(!got_host.reflexive);
+    }
+
+    /// Sanity: with `relay_only = false` the resolver behaves exactly as it
+    /// did before the flag existed (the reflexive happy path still fires).
+    #[test]
+    fn relay_only_false_preserves_reflexive_behaviour() {
+        let got = resolve_listen_endpoint(
+            None,
+            Some(sock("203.0.113.7:34812")),
+            Some(51820),
+            false,
+        );
+        assert_eq!(got.endpoint.as_deref(), Some("203.0.113.7:51820"));
+        assert!(got.reflexive);
     }
 
     /// IPv6 reflexive endpoint must bracket the host so it round-trips
