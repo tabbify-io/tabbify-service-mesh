@@ -57,6 +57,14 @@ pub struct PeerInfo {
     /// keeps the wire format back-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub software_version: Option<String>,
+    /// Whether this peer declared itself **relay-only** — it has NO reachable
+    /// direct endpoint (e.g. it runs in a container netns with no inbound mesh
+    /// port). A relay-only peer is advertised with `listen_endpoint = None`
+    /// and is NEVER a hole-punch target. `#[serde(default)]` keeps the wire
+    /// format back-compatible with coordinators/peers that predate the field
+    /// (→ `false`, the directly-reachable default).
+    #[serde(default)]
+    pub relay_only: bool,
 }
 
 pub(super) fn default_kind() -> String {
@@ -125,6 +133,15 @@ pub struct RegisterRequest {
     /// Host-supplied; `#[serde(default)]` → `None` for older joiners.
     #[serde(default)]
     pub software_version: Option<String>,
+    /// The registrant declares it is **relay-only**: no reachable direct
+    /// endpoint (e.g. a container netns with no inbound mesh port). When
+    /// `true`, the coordinator (a) advertises NO direct listen endpoint for
+    /// this peer (no reflexive synthesis) and (b) suppresses every hole-punch
+    /// directive for any pair involving it, so a relay-only ↔ NAT'd handshake
+    /// stays single-sided and completes over the relay instead of thrashing on
+    /// simultaneous inits. `#[serde(default)]` → `false` for older joiners.
+    #[serde(default)]
+    pub relay_only: bool,
 }
 
 /// Body of `POST /v1/mesh/register` response.
@@ -178,6 +195,12 @@ pub struct HeartbeatRequest {
     /// joiners; `None` leaves the stored value untouched.
     #[serde(default)]
     pub software_version: Option<String>,
+    /// Re-asserted relay-only flag (same semantics as on
+    /// [`RegisterRequest`]). Re-sent every heartbeat so a peer that flips
+    /// reachability is reflected without a full re-register.
+    /// `#[serde(default)]` → `false` for older joiners.
+    #[serde(default)]
+    pub relay_only: bool,
 }
 
 /// Body of `POST /v1/mesh/heartbeat` response.

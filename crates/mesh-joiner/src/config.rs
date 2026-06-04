@@ -129,6 +129,20 @@ pub struct JoinConfig {
     /// `ws(s)://{host}/v1/mesh/relay` from [`Self::coordinator_url`]. Set
     /// only when the relay lives at a non-default location.
     pub relay_url: Option<String>,
+    /// Declare this peer **relay-only**: it has NO reachable direct endpoint
+    /// (e.g. it runs in a container netns with no inbound mesh port, reachable
+    /// ONLY via its outbound DERP relay connection). `false` (default) — the
+    /// peer participates in direct + hole-punch traversal as usual.
+    ///
+    /// When `true`, the coordinator (a) never synthesizes a reflexive listen
+    /// endpoint for this peer (it advertises no direct dial target), and (b)
+    /// never emits a hole-punch directive for ANY pair involving this peer.
+    /// With no punch directive, neither side double-inits a `WireGuard`
+    /// handshake at an unreachable direct endpoint, so the handshake becomes
+    /// single-sided (whoever has data initiates, the other responds) and
+    /// completes cleanly over the relay — eliminating the simultaneous-init
+    /// thrash that otherwise stalls a relay-only ↔ NAT'd pair.
+    pub relay_only: bool,
 }
 
 impl Default for JoinConfig {
@@ -162,6 +176,11 @@ impl Default for JoinConfig {
             // even behind a hard NAT. Opt out via `--no-relay`.
             relay_enabled: true,
             relay_url: None,
+            // A peer is reachable directly by default; only a host that KNOWS
+            // it has no inbound mesh port (e.g. a container netns) opts into
+            // relay-only so the coordinator suppresses its direct endpoint +
+            // hole-punch directives.
+            relay_only: false,
         }
     }
 }
@@ -212,6 +231,7 @@ mod tests {
             software_version: Some("v1.4.0".into()),
             relay_enabled: false,
             relay_url: Some("ws://10.0.0.1:9000/v1/mesh/relay".into()),
+            relay_only: true,
         };
         let cloned = cfg.clone();
         assert_eq!(cloned.coordinator_url, cfg.coordinator_url);
@@ -232,6 +252,22 @@ mod tests {
         assert_eq!(cloned.software_version, cfg.software_version);
         assert_eq!(cloned.relay_enabled, cfg.relay_enabled);
         assert_eq!(cloned.relay_url, cfg.relay_url);
+        assert_eq!(cloned.relay_only, cfg.relay_only);
+    }
+
+    /// `relay_only` defaults OFF (a peer is directly reachable unless it
+    /// declares otherwise) and round-trips through Clone.
+    #[test]
+    fn relay_only_default_is_false_and_clones() {
+        let cfg = JoinConfig::default();
+        assert!(!cfg.relay_only, "relay_only must default off");
+        let cfg2 = JoinConfig {
+            relay_only: true,
+            ..JoinConfig::default()
+        };
+        let cloned = cfg2.clone();
+        assert!(cfg2.relay_only);
+        assert!(cloned.relay_only);
     }
 
     /// SV-2: the host-supplied `software_version` round-trips through clone

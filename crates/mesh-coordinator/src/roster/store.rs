@@ -172,6 +172,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             software_version: Some("v1.0.0".into()),
+            relay_only: false,
         }
     }
 

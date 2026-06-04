@@ -39,6 +39,57 @@ fn decode_pubkey_rejects_garbage_base64() {
     assert!(matches!(err, JoinerError::MalformedPeer(_)));
 }
 
+/// Fix D wire round-trip: a relay-only register body serializes
+/// `relay_only: true`, and a body that OMITS the field deserializes to
+/// `false` (back-compat with a coordinator/replay that predates it). Same
+/// for the heartbeat body. `relay_only` is a plain `bool` (no
+/// `skip_serializing_if`), so it is always present on the wire when set.
+#[test]
+fn relay_only_round_trips_and_defaults_false() {
+    let (b64, _) = sample_pubkey_b64();
+
+    let reg = RegisterRequest {
+        wg_public_key: b64.clone(),
+        listen_endpoint: None,
+        wg_listen_port: Some(51820),
+        display_name: "node-in-netns".into(),
+        tags: vec![],
+        hosted_app_ulas: vec![],
+        requested_ula: None,
+        kind: None,
+        parent: None,
+        app_uuid: None,
+        software_version: None,
+        relay_only: true,
+    };
+    let v = serde_json::to_value(&reg).unwrap();
+    assert_eq!(v["relay_only"], true, "relay_only must serialize: {v}");
+
+    // A body that omits relay_only (older joiner) → false.
+    let legacy: RegisterRequest = serde_json::from_value(serde_json::json!({
+        "wg_public_key": b64,
+        "display_name": "legacy",
+        "tags": [],
+    }))
+    .expect("legacy register body must parse");
+    assert!(!legacy.relay_only);
+
+    let hb = HeartbeatRequest {
+        peer_id: Uuid::nil(),
+        wg_listen_port: Some(51820),
+        hosted_app_ulas: vec![],
+        software_version: None,
+        relay_only: true,
+    };
+    let hv = serde_json::to_value(&hb).unwrap();
+    assert_eq!(hv["relay_only"], true);
+    let legacy_hb: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+        "peer_id": "00000000-0000-0000-0000-000000000000",
+    }))
+    .expect("legacy heartbeat body must parse");
+    assert!(!legacy_hb.relay_only);
+}
+
 #[tokio::test]
 async fn remote_to_info_parses_full_record() {
     let (b64, raw) = sample_pubkey_b64();
@@ -215,6 +266,7 @@ async fn register_round_trip_against_mock_coordinator() {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -261,6 +313,7 @@ async fn register_sends_bearer_header_when_join_token_present() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("register with bearer should succeed");
@@ -312,6 +365,7 @@ async fn register_sends_wg_port_and_omits_listen_endpoint() {
         parent: None,
         app_uuid: None,
         software_version: None,
+        relay_only: false,
     })
     .unwrap();
     assert!(
@@ -333,6 +387,7 @@ async fn register_sends_wg_port_and_omits_listen_endpoint() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("register should succeed and match the wg_listen_port body");
@@ -374,6 +429,7 @@ async fn register_parses_observed_reflexive_fields() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("register");
@@ -414,6 +470,7 @@ async fn register_tolerates_missing_observed_fields() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("register");
@@ -471,6 +528,7 @@ async fn register_omits_bearer_header_when_no_join_token() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("tokenless register should succeed");
@@ -495,7 +553,7 @@ async fn heartbeat_returns_roster_snapshot() {
         .await;
     let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
     let resp = client
-        .heartbeat(Uuid::nil(), Some(51820), &[], None)
+        .heartbeat(Uuid::nil(), Some(51820), &[], None, false)
         .await
         .unwrap();
     assert!(resp.peers.is_empty());
@@ -529,6 +587,7 @@ async fn heartbeat_sends_hosted_app_ulas() {
             Some(51820),
             &["fd5a:1f02:dead:beef:cafe:0:0:1".to_owned()],
             None,
+            false,
         )
         .await
         .expect("heartbeat with hosted app-ULAs should match the body");
@@ -543,6 +602,7 @@ async fn heartbeat_omits_empty_hosted_app_ulas() {
         wg_listen_port: Some(51820),
         hosted_app_ulas: vec![],
         software_version: None,
+        relay_only: false,
     })
     .unwrap();
     assert!(
@@ -614,6 +674,7 @@ async fn register_surfaces_json_codec_error_on_garbage_body() {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap_err();
@@ -668,6 +729,7 @@ async fn register_sends_requested_ula_and_peer_metadata() {
             Some(sup_ula.to_owned()),
             Some(app_uuid_str.to_owned()),
             None,
+            false,
         )
         .await
         .expect("register with requested_ula + metadata should succeed");
@@ -709,6 +771,7 @@ async fn register_sends_software_version_in_body() {
             None,
             None,
             Some("v1.4.0".to_owned()),
+            false,
         )
         .await
         .expect("register with software_version should match the body");
@@ -732,6 +795,7 @@ fn register_request_omits_optional_runner_fields_when_none() {
         parent: None,
         app_uuid: None,
         software_version: None,
+        relay_only: false,
     })
     .unwrap();
     assert!(

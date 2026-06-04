@@ -108,6 +108,15 @@ pub struct PeerEntry {
     /// every heartbeat that carries a value; a heartbeat with `None` leaves
     /// it untouched (never a downgrade trigger — spec P0).
     pub software_version: Option<String>,
+    /// Whether this peer declared itself **relay-only** — it has no reachable
+    /// direct endpoint (e.g. a container netns with no inbound mesh port). Set
+    /// on register, re-asserted on re-register + heartbeat. Drives two
+    /// suppressions: the reflexive-endpoint resolver returns `None` (no direct
+    /// dial target is advertised) and the Stage-2 hole-punch pairing skips any
+    /// pair involving this peer (so neither side double-inits a `WireGuard`
+    /// handshake at an unreachable endpoint — the session completes over the
+    /// relay instead). Defaults to `false` for peers that predate the field.
+    pub relay_only: bool,
 }
 
 impl PeerEntry {
@@ -133,6 +142,7 @@ impl PeerEntry {
             parent: self.parent.clone(),
             app_uuid: self.app_uuid.clone(),
             software_version: self.software_version.clone(),
+            relay_only: self.relay_only,
         }
     }
 
@@ -162,6 +172,7 @@ impl PeerEntry {
             parent: self.parent.clone(),
             app_uuid: self.app_uuid.clone(),
             software_version: self.software_version.clone(),
+            relay_only: self.relay_only,
         }
     }
 }

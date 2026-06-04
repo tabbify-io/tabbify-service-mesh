@@ -40,6 +40,7 @@ impl Coordinator {
     ///
     /// # Errors
     /// `UnknownPeer` if `peer_id` is not in the roster.
+    #[allow(clippy::too_many_arguments)]
     pub async fn heartbeat(
         &self,
         peer_id: Uuid,
@@ -47,6 +48,7 @@ impl Coordinator {
         wg_listen_port: Option<u16>,
         hosted_app_ulas: Vec<String>,
         software_version: Option<String>,
+        relay_only: bool,
     ) -> Result<PeerEntry, CoordinatorError> {
         // Pre-check membership so we can surface UnknownPeer without
         // emitting a heartbeat event for a peer that doesn't exist. Capture
@@ -76,11 +78,20 @@ impl Coordinator {
         };
         publish_event(self.inner.publisher.as_ref(), PEER_SEGMENT, &event).await;
         self.apply_peer_heartbeat(&event);
+        // Re-assert the relay-only flag from this heartbeat so a peer that
+        // flips reachability is reflected without a full re-register. Done
+        // BEFORE the reflexive refresh so the refresh sees the live value
+        // and never rolls a relay-only peer onto a (black-hole) endpoint.
+        if let Some(mut e) = self.inner.roster.get_mut(&peer_id) {
+            e.relay_only = relay_only;
+        }
         // Refresh the reflexive endpoint from this heartbeat's observed
         // source addr. The peer's existing stored endpoint is fed back in
         // as the "self-reported" input so a public / hostname endpoint is
         // preserved and only a NAT-derived reflexive endpoint rolls over.
-        self.refresh_reflexive_endpoint(peer_id, &observed_external, wg_listen_port);
+        // A relay-only peer is short-circuited inside the helper (its
+        // endpoint stays `None` — it has no reachable direct path).
+        self.refresh_reflexive_endpoint(peer_id, &observed_external, wg_listen_port, relay_only);
         // Re-read after apply so the snapshot reflects the new
         // last_heartbeat. If the entry vanished between contains_key and
         // here (concurrent deregister), bail with UnknownPeer.
@@ -135,7 +146,15 @@ impl Coordinator {
         peer_id: Uuid,
         observed_external: &str,
         wg_listen_port: Option<u16>,
+        relay_only: bool,
     ) {
+        // A relay-only peer has no reachable direct endpoint, so a heartbeat
+        // must never synthesize one for it (it would be a black hole that
+        // makes peers double-init handshakes). Leave its stored endpoint
+        // (`None`) untouched.
+        if relay_only {
+            return;
+        }
         let Ok(observed) = observed_external.parse::<SocketAddr>() else {
             return;
         };
@@ -158,7 +177,8 @@ impl Coordinator {
             // true on a public observed IP, false when the observed IP is
             // private (same-host) — in which case we leave the endpoint as
             // it was rather than regress a prior reflexive value to None.
-            let resolved = resolve_listen_endpoint(None, Some(observed), wg_listen_port);
+            // `relay_only == false` here (guarded above), so pass `false`.
+            let resolved = resolve_listen_endpoint(None, Some(observed), wg_listen_port, false);
             if resolved.reflexive && resolved.endpoint != e.listen_endpoint {
                 debug!(
                     peer_id = %peer_id,
@@ -178,7 +198,23 @@ impl Coordinator {
     /// The punch TARGET is that reflexive `WireGuard` endpoint (`ip:wg_port`),
     /// NOT the raw heartbeat TCP source — a punch fired at the TCP source
     /// would miss the `WireGuard` UDP NAT mapping entirely.
+    ///
+    /// A **relay-only** peer is NEVER a punch candidate (returns `None`),
+    /// regardless of any endpoint. Because `try_emit_holepunch_pairs` builds
+    /// each pair from `punch_peer(a)` AND `punch_peer(b)`, returning `None`
+    /// here for either end suppresses the whole pair — so a punch is never
+    /// emitted when EITHER peer is relay-only. A punch is pointless when one
+    /// end has no reachable direct path; firing handshake-inits at its
+    /// black-hole endpoint in parallel with the relay is exactly the
+    /// simultaneous-init thrash this fix eliminates. The pair must relay, and
+    /// with no punch directive the handshake stays single-sided and completes.
+    /// (A relay-only peer also has `listen_endpoint == None` via the reflexive
+    /// resolver, so the dial-endpoint check below would skip it too — this
+    /// explicit guard makes the intent unconditional and self-documenting.)
     fn punch_peer(e: &PeerEntry) -> Option<PunchPeer> {
+        if e.relay_only {
+            return None;
+        }
         if e.observed_external.is_empty() {
             return None;
         }

@@ -118,3 +118,73 @@ fn peer_info_omitting_software_version_defaults_to_none() {
         serde_json::from_value(body).expect("old roster entry must still parse");
     assert_eq!(info.software_version, None);
 }
+
+/// Back-compat (Fix D): a register body from a joiner that predates the
+/// `relay_only` field must still deserialize — the field defaults to
+/// `false` (the peer participates in direct + hole-punch as before).
+#[test]
+fn register_request_omitting_relay_only_defaults_to_false() {
+    let req: RegisterRequest = serde_json::from_value(serde_json::json!({
+        "wg_public_key": "AAAA",
+        "display_name": "legacy",
+    }))
+    .expect("legacy register body must parse");
+    assert!(!req.relay_only);
+}
+
+/// A relay-only joiner's register body round-trips the flag as `true`.
+#[test]
+fn register_request_carries_relay_only_when_present() {
+    let req: RegisterRequest = serde_json::from_value(serde_json::json!({
+        "wg_public_key": "AAAA",
+        "display_name": "node-in-netns",
+        "relay_only": true,
+    }))
+    .expect("register body parses");
+    assert!(req.relay_only);
+}
+
+/// Heartbeat re-asserts `relay_only`; older joiners omit it → `false`.
+#[test]
+fn heartbeat_request_relay_only_back_compat_and_present() {
+    let legacy: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+        "peer_id": "01910f10-0000-7000-8000-000000000001",
+    }))
+    .expect("legacy heartbeat body must parse");
+    assert!(!legacy.relay_only);
+
+    let modern: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+        "peer_id": "01910f10-0000-7000-8000-000000000001",
+        "relay_only": true,
+    }))
+    .expect("modern heartbeat body parses");
+    assert!(modern.relay_only);
+}
+
+/// A `PeerInfo` roster entry from an older coordinator omits `relay_only`;
+/// a consumer reads it back as `false` (visible + round-trips).
+#[test]
+fn peer_info_relay_only_back_compat_and_round_trips() {
+    let legacy: super::dto::PeerInfo = serde_json::from_value(serde_json::json!({
+        "peer_id": "01910f10-0000-7000-8000-000000000001",
+        "wg_public_key": "AAAA",
+        "ula": "fd5a:1f00:1::1",
+        "display_name": "p",
+        "tags": [],
+        "joined_at_micros": 0
+    }))
+    .expect("old roster entry must still parse");
+    assert!(!legacy.relay_only);
+
+    let modern: super::dto::PeerInfo = serde_json::from_value(serde_json::json!({
+        "peer_id": "01910f10-0000-7000-8000-000000000001",
+        "wg_public_key": "AAAA",
+        "ula": "fd5a:1f00:1::1",
+        "display_name": "p",
+        "tags": [],
+        "joined_at_micros": 0,
+        "relay_only": true
+    }))
+    .expect("modern roster entry parses");
+    assert!(modern.relay_only);
+}

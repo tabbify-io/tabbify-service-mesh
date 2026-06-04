@@ -142,6 +142,15 @@ pub struct JoinArgs {
     /// lives at a non-default location.
     #[arg(long, env = "TABBIFY_MESH_RELAY_URL")]
     pub relay_url: Option<String>,
+
+    /// Declare this peer RELAY-ONLY: it has no reachable direct endpoint
+    /// (e.g. it runs in a container netns with no inbound mesh port). The
+    /// coordinator then advertises no direct endpoint for it and never makes
+    /// it a hole-punch target, so a relay-only ↔ NAT'd `WireGuard` handshake
+    /// completes over the relay without simultaneous-init thrash. Off by
+    /// default — a normal peer participates in direct + hole-punch.
+    #[arg(long, env = "TABBIFY_MESH_RELAY_ONLY")]
+    pub relay_only: bool,
 }
 
 /// Arguments for the `peers` subcommand.
