@@ -103,14 +103,26 @@ pub fn plan_punch(
     Some(PunchPlan { session, endpoint })
 }
 
-/// Force a fresh `WireGuard` handshake-initiation for `session` and return
-/// the datagram to send. `force_resend = true` so a burst actually emits
-/// repeated inits (boringtun would otherwise suppress one sent recently).
-/// `None` if boringtun produced nothing to send.
+/// Produce a `WireGuard` handshake-initiation for `session` to send, or `None`
+/// if boringtun has nothing to emit right now.
+///
+/// `force_resend = FALSE` (deliberate — this was the relay-handshake bug):
+/// with `true`, boringtun mints a BRAND-NEW initiation (fresh ephemeral, reset
+/// handshake state) on EVERY call. The punch fires a burst (and re-fires per
+/// coordinator directive), so `true` reset the in-flight handshake several
+/// times a second. Over a DIRECT path (<1 ms RTT) the peer's response still
+/// beat the next reset, so it completed; over the RELAY floor (~100-300 ms RTT)
+/// the response for init #1 always arrived AFTER the runner had already reset to
+/// init #2-5 → the response never matched the current handshake → boringtun
+/// looped `REKEY_TIMEOUT` forever and NO relayed/NAT'd session ever reached
+/// DATA (`DeliverToTun = 0`). With `false`, boringtun emits ONE init then
+/// suppresses repeats within its retransmit window, and `update_timers` re-sends
+/// at the proper `WireGuard` cadence (~5 s ≫ relay RTT) — so the response lands
+/// against a stable handshake and the session completes over the relay.
 async fn build_handshake_packet(session: &Arc<PeerSession>) -> Option<Vec<u8>> {
     let mut out = vec![0u8; HANDSHAKE_BUF_LEN];
     let mut tunn = session.tunn.lock().await;
-    match classify_tunn_result(tunn.format_handshake_initiation(&mut out, true)) {
+    match classify_tunn_result(tunn.format_handshake_initiation(&mut out, false)) {
         WgAction::SendToPeer(bytes) => Some(bytes),
         _ => None,
     }
@@ -272,12 +284,14 @@ mod tests {
     use tokio::net::UdpSocket;
     use x25519_dalek::{PublicKey, StaticSecret};
 
-    /// Build a session table holding exactly one peer session keyed by
-    /// `peer_id`, so `plan_punch` has something to find.
-    fn session_table_with(peer_id: Uuid, ula: &str, endpoint: Option<&str>) -> SessionTable {
-        let t = SessionTable::new();
+    /// Insert one peer session into `t`, keyed by `peer_id` / `ula`, with a
+    /// WG pubkey derived from `key_seed`. A DISTINCT `key_seed` yields a
+    /// DISTINCT pubkey → a brand-new `Tunn` whose handshake hasn't been
+    /// initiated yet, so its first `build_handshake_packet` emits a fresh
+    /// init even under `force_resend = false`.
+    fn upsert_target(t: &SessionTable, peer_id: Uuid, ula: &str, endpoint: Option<&str>, key_seed: u8) {
         let me = StaticSecret::from([7u8; 32]);
-        let peer_pub = *PublicKey::from(&StaticSecret::from([9u8; 32])).as_bytes();
+        let peer_pub = *PublicKey::from(&StaticSecret::from([key_seed; 32])).as_bytes();
         let info = PeerInfo {
             peer_id,
             wg_public_key: peer_pub,
@@ -290,6 +304,13 @@ mod tests {
             joined_at_micros: 0,
         };
         t.upsert(&me, &info);
+    }
+
+    /// Build a session table holding exactly one peer session keyed by
+    /// `peer_id`, so `plan_punch` has something to find.
+    fn session_table_with(peer_id: Uuid, ula: &str, endpoint: Option<&str>) -> SessionTable {
+        let t = SessionTable::new();
+        upsert_target(&t, peer_id, ula, endpoint, 9);
         t
     }
 
@@ -502,6 +523,49 @@ mod tests {
         );
     }
 
+    /// Regression for the relay-handshake flood bug (the `force_resend =
+    /// false` fix in `build_handshake_packet`). With the old `true`, every
+    /// call minted a BRAND-NEW init (fresh ephemeral, reset handshake state),
+    /// so a punch burst reset the in-flight handshake several times a second
+    /// — over the relay floor (~100-300 ms RTT) the peer's response never
+    /// matched the current handshake and boringtun looped `REKEY_TIMEOUT`
+    /// forever. With `false`, boringtun emits ONE init then SUPPRESSES repeats
+    /// within its retransmit window. This test drives `build_handshake_packet`
+    /// twice in immediate succession on the SAME session: the first call must
+    /// emit a real WG init (`Some`, ≥148 bytes, byte[0]==1), the second must
+    /// be suppressed (`None`) — proving no repeated/reset inits are minted.
+    #[tokio::test]
+    async fn build_handshake_packet_suppresses_repeats_within_window() {
+        let target = Uuid::from_u128(2);
+        let sessions = session_table_with(target, "fd5a:1f00:1::2", None);
+        let session = sessions
+            .snapshot()
+            .into_iter()
+            .find(|s| s.peer_id == target)
+            .expect("the target session");
+
+        // First call: a fresh Tunn emits a real handshake-init.
+        let first = build_handshake_packet(&session)
+            .await
+            .expect("the first call must emit a WG handshake-init");
+        assert!(
+            first.len() >= 148,
+            "WireGuard handshake-init is 148 bytes, got {}",
+            first.len()
+        );
+        assert_eq!(first[0], 1, "first byte is the WG handshake-init message type");
+
+        // Immediate second call on the SAME session: force_resend=false means
+        // boringtun suppresses the repeat within its retransmit window, so no
+        // new init is minted.
+        let second = build_handshake_packet(&session).await;
+        assert!(
+            second.is_none(),
+            "force_resend=false must suppress an immediate repeat init (no flood), got {} bytes",
+            second.map_or(0, |b| b.len())
+        );
+    }
+
     fn ev(initiator: Uuid, target: Uuid, endpoint: &str) -> HolePunchInitiate {
         HolePunchInitiate {
             initiator_peer_id: initiator.to_string(),
@@ -524,13 +588,23 @@ mod tests {
     /// Two phases, ordered so the swap is observably AFTER the task is
     /// running (no spawn-time read race):
     ///
-    /// 1. With the OLD id live, an initiate keyed to OLD punches — proving
-    ///    the task is up and reading the shared handle per event.
+    /// 1. With the OLD id live, an initiate keyed to OLD (targeting
+    ///    `target1`) punches — proving the task is up and reading the shared
+    ///    handle per event.
     /// 2. We then swap the shared handle to a NEW id (the 404 recovery) and
-    ///    send an initiate keyed to the NEW id. It MUST punch too. Under the
-    ///    old "capture a plain `Uuid` at spawn" behaviour the task would
-    ///    still compare against OLD, skip (`initiator NEW != OLD`), and no
-    ///    datagram would arrive — so phase 2 is the load-bearing assertion.
+    ///    send an initiate keyed to the NEW id, targeting a DISTINCT session
+    ///    (`target2`). It MUST punch too. Under the old "capture a plain
+    ///    `Uuid` at spawn" behaviour the task would still compare against
+    ///    OLD, skip (`initiator NEW != OLD`), and no datagram would arrive —
+    ///    so phase 2 is the load-bearing assertion.
+    ///
+    /// Phase 2 deliberately targets a SECOND, distinct session (distinct WG
+    /// pubkey → a fresh `Tunn`). With `build_handshake_packet`'s
+    /// `force_resend = false`, re-punching the SAME session that already
+    /// handshaked in phase 1 would be correctly SUPPRESSED (no new init), so
+    /// re-using `target1` could not produce a phase-2 datagram. In
+    /// production an id-swap (key rotation) likewise yields a new session, so
+    /// a distinct target faithfully models the recovery path.
     #[tokio::test]
     async fn run_filters_on_live_peer_id_after_swap() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
@@ -539,8 +613,14 @@ mod tests {
 
         let old_id = Uuid::from_u128(1);
         let new_id = Uuid::from_u128(99);
-        let target = Uuid::from_u128(2);
-        let sessions = session_table_with(target, "fd5a:1f00:1::2", None);
+        // Two DISTINCT target peers: distinct peer_id, distinct ULA, distinct
+        // WG pubkey (key_seed) → two independent `Tunn`s. Phase 2 punches the
+        // second so `force_resend = false` still emits a fresh init.
+        let target1 = Uuid::from_u128(2);
+        let target2 = Uuid::from_u128(3);
+        let sessions = SessionTable::new();
+        upsert_target(&sessions, target1, "fd5a:1f00:1::2", None, 9);
+        upsert_target(&sessions, target2, "fd5a:1f00:1::3", None, 11);
         let live_id = shared(old_id);
         let (punch_tx, punch_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_sd_tx, sd_rx) = watch::channel(false);
@@ -553,25 +633,27 @@ mod tests {
             })
         };
 
-        // Phase 1: OLD id is live; an OLD-keyed initiate punches. Receiving
-        // a datagram proves the task is running and has consumed the first
-        // event, so the swap below is strictly ordered after spawn. A single
-        // punch fires a BURST of `PUNCH_BURST` datagrams; we must DRAIN them
-        // all before phase 2, otherwise phase 2's read could pick up a
-        // leftover phase-1 packet and falsely "pass". The drain loop ends
-        // when the burst is exhausted (a short per-packet timeout elapses).
+        // Phase 1: OLD id is live; an OLD-keyed initiate (target1) punches.
+        // Receiving a datagram proves the task is running and has consumed
+        // the first event, so the swap below is strictly ordered after spawn.
+        // Under `force_resend = false` a single punch emits ONE init (not the
+        // full `PUNCH_BURST`): boringtun suppresses repeats within its
+        // retransmit window. We still DRAIN defensively before phase 2 so no
+        // stray phase-1 packet can masquerade as a phase-2 punch; with
+        // force=false the drain loop simply finds nothing more and times out
+        // quickly.
         let mut buf = [0u8; 256];
         punch_tx
-            .send(ev(old_id, target, &target_addr.to_string()))
+            .send(ev(old_id, target1, &target_addr.to_string()))
             .expect("send initiate (old)");
         let (n1, _from) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
             .await
             .expect("phase-1 datagram (old id should punch)")
             .expect("recv ok");
         assert!(n1 >= 148, "expected a WG handshake-init, got {n1} bytes");
-        // Drain the rest of the phase-1 burst so none can masquerade as a
-        // phase-2 punch. PUNCH_INTERVAL is 300ms; 1s per packet is ample —
-        // the loop ends when a read times out (burst exhausted).
+        // Drain any remainder of the phase-1 burst so none can masquerade as
+        // a phase-2 punch. With force=false the burst emits a single init, so
+        // this loop typically times out immediately on the first read.
         while let Ok(r) =
             tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buf)).await
         {
@@ -579,13 +661,15 @@ mod tests {
         }
 
         // Phase 2: simulate the 404 re-register adopting a fresh peer id,
-        // then send a NEW-keyed initiate. With the burst fully drained, the
-        // ONLY way a datagram now arrives is the task re-reading the live id
-        // and punching for the NEW-keyed event. A spawn-captured id would
-        // compare NEW against OLD, skip, and this read would time out.
+        // then send a NEW-keyed initiate targeting the DISTINCT `target2`
+        // session (fresh Tunn → emits under force=false). With the burst
+        // fully drained, the ONLY way a datagram now arrives is the task
+        // re-reading the live id and punching for the NEW-keyed event. A
+        // spawn-captured id would compare NEW against OLD, skip, and this
+        // read would time out.
         *live_id.write().await = new_id;
         punch_tx
-            .send(ev(new_id, target, &target_addr.to_string()))
+            .send(ev(new_id, target2, &target_addr.to_string()))
             .expect("send initiate (new)");
         let (n2, _from) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
             .await
@@ -594,8 +678,9 @@ mod tests {
         assert!(n2 >= 148, "expected a WG handshake-init, got {n2} bytes");
         assert_eq!(buf[0], 1, "first byte is the WG handshake-init type");
 
-        // The task is mid-burst on phase 2 (PUNCH_BURST * PUNCH_INTERVAL),
-        // so allow well over the burst duration for it to drain and exit.
+        // The task may still be mid-burst on phase 2 (PUNCH_BURST *
+        // PUNCH_INTERVAL), so allow well over the burst duration for it to
+        // drain and exit.
         drop(punch_tx);
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
