@@ -224,8 +224,13 @@ impl SessionTable {
     ///    session;
     /// 2. the host session's `allowed_ips` (so a RESPONSE sourced from
     ///    `app_ula` passes the RX source check);
-    /// 3. the kernel `/128` host route via the [`RouteSink`] (so the OS
-    ///    hands `app_ula`-bound packets to our TUN read side).
+    /// 3. an `add_app_route` poke at the [`RouteSink`]. NOTE: the
+    ///    production `TunRouteSink` currently inherits the trait's NO-OP
+    ///    default for app routes — no kernel `/128` is installed yet, so
+    ///    consumer-side reachability of an app-ULA relies on the hosting
+    ///    runner's own peer ULA *being* the app-ULA (the fly-model case,
+    ///    covered by `add_allowed`). A future `TunRouteSink` override
+    ///    must honor its source scope (route into the scoped table).
     ///
     /// Idempotent: re-recording the same `(app_ula, host_ula)` is a no-op
     /// for the index + allowed-set and only re-pokes the (idempotent)

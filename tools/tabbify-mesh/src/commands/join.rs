@@ -38,6 +38,8 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         no_relay,
         relay_url,
         relay_only,
+        source_scoped_routes,
+        manage_firewall,
     } = args;
 
     println!("joining... coordinator={coordinator}");
@@ -68,6 +70,10 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         // coordinator must suppress its direct endpoint + hole-punch
         // directives. Off by default (a normal directly-reachable peer).
         relay_only,
+        // Host-integration toggles (multi-joiner-per-netns routing +
+        // tailscaled-style firewall trust). Off by default.
+        source_scoped_routes,
+        manage_firewall,
         // Runner-specific fields are not exposed via CLI — plain join is
         // always a plain peer. Per-app-runner processes set these
         // programmatically via JoinConfig directly.

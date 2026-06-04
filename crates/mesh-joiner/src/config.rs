@@ -9,6 +9,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Caller-facing configuration for `Joiner::join`.
+//
+// `struct_excessive_bools`: this is a flat, caller-facing config struct;
+// each bool is an independent opt-in documented on its field. Folding
+// them into enums would only obscure the clap/env mapping.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct JoinConfig {
     /// HTTP base URL of the mesh-coordinator (e.g.
@@ -143,6 +148,36 @@ pub struct JoinConfig {
     /// completes cleanly over the relay — eliminating the simultaneous-init
     /// thrash that otherwise stalls a relay-only ↔ NAT'd pair.
     pub relay_only: bool,
+    /// Install this joiner's peer `/128` routes into a PRIVATE,
+    /// source-scoped routing table instead of `main` (Linux policy
+    /// routing). For hosts that run MORE THAN ONE joiner in a single
+    /// network namespace (a supervisor + its per-app runners): every
+    /// joiner tries to install the same peer `/128`s into `main`, the
+    /// kernel keeps only the first (`File exists` is swallowed as
+    /// idempotent), and the loser's RETURN traffic egresses through the
+    /// WRONG TUN — the remote peer then drops it against the per-session
+    /// source allowed-set (spec §5.5). With this flag the joiner derives
+    /// a per-instance table from its own ULA, routes its peers there, and
+    /// installs one `ip -6 rule from <own_ula> lookup <table>` so its
+    /// egress always uses its OWN TUN regardless of what `main` says —
+    /// the lightweight equivalent of "≤1 joiner per netns". `false`
+    /// (default): plain `main`-table routes (single joiner per netns —
+    /// the common case). Linux-only; falls back to `main` elsewhere.
+    pub source_scoped_routes: bool,
+    /// Self-manage host-firewall trust for the overlay TUN, the way
+    /// tailscaled does: keep an `INPUT -i <tun> -j ACCEPT` rule for THIS
+    /// joiner's TUN device (asserted at bring-up, re-asserted
+    /// periodically so a firewall reload cannot strand it, removed on
+    /// [`leave`](crate::Joiner::leave)). Without it, distro default
+    /// firewalls (e.g. NixOS `nixos-fw`) DROP decrypted overlay packets
+    /// arriving inbound on the TUN, so app listeners never even see the
+    /// SYN. The overlay is the trust boundary: packets only reach the
+    /// TUN after `WireGuard` authenticated the sender, and RX enforces
+    /// the per-peer source allowed-set (spec §5.5). Best-effort: a
+    /// missing or unprivileged `ip6tables` logs a warning and NEVER
+    /// fails the join (containers). `false` (default): firewall
+    /// untouched.
+    pub manage_firewall: bool,
 }
 
 impl Default for JoinConfig {
@@ -181,6 +216,14 @@ impl Default for JoinConfig {
             // relay-only so the coordinator suppresses its direct endpoint +
             // hole-punch directives.
             relay_only: false,
+            // Both host-integration behaviors are OPT-IN: a plain peer is
+            // the only joiner in its netns (no route collision to scope
+            // away) and may live in a container without ip6tables / with a
+            // host-shared netns where touching the firewall is wrong
+            // (tabbify-node). Hosts that run multiple joiners per netns
+            // (supervisor + runners) flip both.
+            source_scoped_routes: false,
+            manage_firewall: false,
         }
     }
 }
@@ -205,6 +248,16 @@ mod tests {
         // peer is reachable even when direct + hole-punch fail.
         assert!(cfg.relay_enabled, "relay must default on");
         assert!(cfg.relay_url.is_none());
+        // Host-integration behaviors are opt-in: a plain peer must not
+        // touch policy routing or the host firewall.
+        assert!(
+            !cfg.source_scoped_routes,
+            "source-scoped routes must default off"
+        );
+        assert!(
+            !cfg.manage_firewall,
+            "firewall self-management must default off"
+        );
     }
 
     #[test]
@@ -232,6 +285,8 @@ mod tests {
             relay_enabled: false,
             relay_url: Some("ws://10.0.0.1:9000/v1/mesh/relay".into()),
             relay_only: true,
+            source_scoped_routes: true,
+            manage_firewall: true,
         };
         let cloned = cfg.clone();
         assert_eq!(cloned.coordinator_url, cfg.coordinator_url);
@@ -253,6 +308,8 @@ mod tests {
         assert_eq!(cloned.relay_enabled, cfg.relay_enabled);
         assert_eq!(cloned.relay_url, cfg.relay_url);
         assert_eq!(cloned.relay_only, cfg.relay_only);
+        assert_eq!(cloned.source_scoped_routes, cfg.source_scoped_routes);
+        assert_eq!(cloned.manage_firewall, cfg.manage_firewall);
     }
 
     /// `relay_only` defaults OFF (a peer is directly reachable unless it

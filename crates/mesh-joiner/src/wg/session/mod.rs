@@ -71,6 +71,20 @@ pub enum WgAction {
     Error(String),
 }
 
+impl WgAction {
+    /// Short variant name for diagnostic logging (the `rx_decap` debug
+    /// signal in `wg::loops`).
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::SendToPeer(_) => "SendToPeer",
+            Self::DeliverToTun(_) => "DeliverToTun",
+            Self::Nothing => "Nothing",
+            Self::Error(_) => "Error",
+        }
+    }
+}
+
 /// Translate boringtun's `TunnResult` into an owned, lock-free form.
 /// `WriteToTunnelV4` collapses to `Nothing` because our overlay is
 /// IPv6-only.

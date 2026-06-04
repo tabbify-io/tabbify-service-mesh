@@ -220,6 +220,20 @@ pub(crate) async fn process_inbound_datagram(
         let res = tunn.decapsulate(None, datagram, &mut scratch);
         classify_tunn_result(res)
     };
+    // Per-datagram decap outcome, DEBUG-gated. The single most valuable
+    // data-plane signal when chasing "frames arrive but nothing reaches
+    // the app": a silent `Nothing` (no matching session index) is
+    // otherwise indistinguishable from a delivered packet. It exposed
+    // both 2026-06-04 root causes (host firewall + return-path routing)
+    // by proving decryption worked — the blocker had to be downstream.
+    // Free unless `tabbify_mesh_joiner=debug` is enabled.
+    tracing::debug!(
+        peer = %session.peer_id,
+        in_len = datagram.len(),
+        action = first.name(),
+        via_direct,
+        "rx_decap"
+    );
     // A valid WG packet (anything that isn't an error — handshake or data,
     // incl. keepalives) arrived over UDP: refresh the staleness clock so a
     // confirmed-but-idle path doesn't age out. This does NOT confirm; only
@@ -650,11 +664,7 @@ mod tests {
 
     /// Build a `PeerInfo` for a peer with a known pubkey and the given
     /// endpoint, then upsert it into `table` and return its session.
-    fn upsert_peer(
-        table: &SessionTable,
-        ula: &str,
-        endpoint: Option<&str>,
-    ) -> Arc<PeerSession> {
+    fn upsert_peer(table: &SessionTable, ula: &str, endpoint: Option<&str>) -> Arc<PeerSession> {
         use x25519_dalek::{PublicKey, StaticSecret};
         let me = StaticSecret::from([9u8; 32]);
         let info = crate::peer::PeerInfo {
@@ -688,8 +698,14 @@ mod tests {
         encapsulate_and_send(&socket, table.relay(), &session, &packet).await;
 
         let out = rx.recv().await.expect("packet relayed when no endpoint");
-        assert_eq!(out.dst_pubkey, session.peer_pubkey, "relay targets the peer pubkey");
-        assert!(!out.payload.is_empty(), "relayed payload is the WG handshake-init");
+        assert_eq!(
+            out.dst_pubkey, session.peer_pubkey,
+            "relay targets the peer pubkey"
+        );
+        assert!(
+            !out.payload.is_empty(),
+            "relayed payload is the WG handshake-init"
+        );
     }
 
     /// REGRESSION (this fix): a `Some` endpoint is only a CANDIDATE, not a
@@ -709,7 +725,10 @@ mod tests {
         let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
         // Endpoint KNOWN (a candidate) but the direct path is unconfirmed.
         let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
-        assert!(!session.direct_confirmed(), "a fresh session starts unconfirmed");
+        assert!(
+            !session.direct_confirmed(),
+            "a fresh session starts unconfirmed"
+        );
         let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
 
@@ -723,12 +742,21 @@ mod tests {
             .await
             .expect("frame must be relayed (not sent direct) while direct is unconfirmed")
             .expect("relay channel delivered the frame");
-        assert_eq!(out.dst_pubkey, session.peer_pubkey, "relay targets the peer pubkey");
-        assert!(!out.payload.is_empty(), "relayed payload is the WG handshake-init");
+        assert_eq!(
+            out.dst_pubkey, session.peer_pubkey,
+            "relay targets the peer pubkey"
+        );
+        assert!(
+            !out.payload.is_empty(),
+            "relayed payload is the WG handshake-init"
+        );
         let mut buf = vec![0u8; MAX_UDP_FRAME];
         let recv =
             tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf)).await;
-        assert!(recv.is_err(), "nothing sent to the unconfirmed candidate endpoint");
+        assert!(
+            recv.is_err(),
+            "nothing sent to the unconfirmed candidate endpoint"
+        );
     }
 
     /// Once the direct path is CONFIRMED (a decrypted data packet arrived
@@ -753,9 +781,16 @@ mod tests {
 
         // The datagram went to UDP, not the relay.
         let mut buf = vec![0u8; MAX_UDP_FRAME];
-        let recv = tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf)).await;
-        assert!(recv.is_ok(), "handshake-init delivered over UDP to the confirmed endpoint");
-        assert!(rx.try_recv().is_err(), "nothing relayed once the direct path is confirmed");
+        let recv =
+            tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf)).await;
+        assert!(
+            recv.is_ok(),
+            "handshake-init delivered over UDP to the confirmed endpoint"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing relayed once the direct path is confirmed"
+        );
     }
 
     /// A TUN device that swallows every write — lets the `DeliverToTun` path

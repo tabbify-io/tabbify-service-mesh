@@ -37,13 +37,19 @@ use crate::error::{JoinerError, Result};
 use std::net::Ipv6Addr;
 use tokio::process::Command;
 
+pub mod firewall;
 pub mod route;
 
 // Per-peer `/128` route management + the kernel-backed [`RouteSink`]
 // (spec §5.5 — TX route scoping) lives in [`route`]. Re-exported here so
 // callers keep using `platform::TunRouteSink` / `platform::add_peer_route`
-// regardless of the internal split.
-pub use route::{TunRouteSink, add_peer_route, del_peer_route};
+// regardless of the internal split. [`SourceScope`] + the source-rule
+// helpers back the multi-joiner-per-netns mode (`source_scoped_routes`);
+// [`firewall`] is the tailscaled-style TUN trust (`manage_firewall`).
+pub use route::{
+    SourceScope, TunRouteSink, add_peer_route, del_peer_route, install_source_rule,
+    remove_source_rule, stable_tun_name,
+};
 
 /// The full overlay prefix covered by tabbify's coordinator.
 ///

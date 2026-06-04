@@ -88,6 +88,15 @@ pub struct Joiner {
     /// `hosted_app_ulas` so other peers learn to route to us. Shared with
     /// the heartbeat task (lock-free reads via `DashMap`).
     hosted_app_ulas: Arc<dashmap::DashMap<Ipv6Addr, ()>>,
+    /// Source-scoped policy-routing parameters when this joiner runs in
+    /// `source_scoped_routes` mode. Kept so [`Self::leave`] can remove
+    /// the policy rule and flush the private table — unlike the peer
+    /// `/128`s (which die with the TUN device), neither is bound to the
+    /// iface and both would LEAK past TUN teardown otherwise.
+    source_scope: Option<platform::SourceScope>,
+    /// Whether this joiner manages the host-firewall trust rule for its
+    /// TUN — kept so [`Self::leave`] removes the rule it added.
+    manage_firewall: bool,
 }
 
 impl Joiner {
@@ -121,13 +130,7 @@ impl Joiner {
         //    test) we fall back to an OS-picked port so the bind still
         //    succeeds.
         let preferred_port = config.listen_port.unwrap_or(DEFAULT_WG_LISTEN_PORT);
-        let socket = bind_udp_with_fallback(preferred_port).await?;
-        let bound = socket
-            .local_addr()
-            .map_err(|e| JoinerError::HttpTransport(format!("udp local_addr: {e}")))?;
-        let wg_listen_port = bound.port();
-        let socket = Arc::new(socket);
-        tracing::info!(local = %bound, wg_listen_port, "joiner: udp socket bound");
+        let (socket, wg_listen_port) = bind_wg_socket(preferred_port).await?;
 
         // 2) Register with the coordinator.
         //
@@ -196,7 +199,8 @@ impl Joiner {
         // 3) Open + configure the TUN device (cross-platform open() in
         //    the fabric crate). Extracted into a helper to keep this
         //    constructor under the clippy line cap.
-        let (tun_arc, iface_name) = open_tun_device(config.tun_name.clone(), my_ula).await?;
+        let (tun_arc, iface_name) =
+            open_tun_device(resolve_tun_name(&config, my_ula), my_ula).await?;
 
         // 4) Tell the kernel about our ULA. We DO NOT add a blanket
         //    `/48` overlay route any more (spec §5.5): per-peer `/128`
@@ -207,6 +211,11 @@ impl Joiner {
         //    skeleton; the Linux backend assigns the address itself, so
         //    the call is a no-op there modulo `File exists` tolerance.
         platform::assign_ula(&iface_name, my_ula).await?;
+
+        // 4b/4c) Host-integration opt-ins (scoped routing + firewall
+        //     trust) — BEFORE the roster seeds the first session, so the
+        //     first peer `/128` already lands in the scoped table.
+        let source_scope = setup_host_integration(&config, my_ula, &iface_name).await?;
 
         // 5) Seed the session table from the initial roster. The table is
         //    wired to a `TunRouteSink` so every upsert installs the peer's
@@ -220,7 +229,10 @@ impl Joiner {
         let (relay_handle, relay_outbound_rx) =
             build_relay_channel(config.relay_enabled, config.insecure_no_mtls);
 
-        let route_sink = Arc::new(platform::TunRouteSink::new(iface_name.clone()));
+        let route_sink = Arc::new(source_scope.map_or_else(
+            || platform::TunRouteSink::new(iface_name.clone()),
+            |scope| platform::TunRouteSink::source_scoped(iface_name.clone(), scope),
+        ));
         let sessions = SessionTable::with_route_sink_and_relay(route_sink, relay_handle);
         let peer_info: Arc<dashmap::DashMap<Ipv6Addr, PeerInfo>> = Arc::default();
         seed_initial_roster(&sessions, &peer_info, &keypair.private, &resp.peers).await;
@@ -235,7 +247,7 @@ impl Joiner {
         let hosted_app_ulas: Arc<dashmap::DashMap<Ipv6Addr, ()>> = Arc::default();
         let shared_peer_id: SharedPeerId = Arc::new(tokio::sync::RwLock::new(peer_id));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let tasks = spawn_background_tasks(SpawnContext {
+        let mut tasks = spawn_background_tasks(SpawnContext {
             socket: socket.clone(),
             sessions: sessions.clone(),
             tun: tun_arc.clone(),
@@ -256,6 +268,15 @@ impl Joiner {
             shutdown_rx,
         });
 
+        spawn_host_integration_loops(
+            &config,
+            source_scope,
+            &iface_name,
+            &sessions,
+            &shutdown_tx,
+            &mut tasks,
+        );
+
         Ok(Self {
             peer_id,
             shared_peer_id,
@@ -268,6 +289,8 @@ impl Joiner {
             tun: Some(tun_arc),
             iface_name: Some(iface_name),
             hosted_app_ulas,
+            source_scope,
+            manage_firewall: config.manage_firewall,
         })
     }
 
@@ -384,6 +407,22 @@ impl Joiner {
             }
         }
         self.sessions.clear();
+        // Remove host-level state that is NOT bound to the TUN device and
+        // would therefore outlive it: the firewall trust rule and the
+        // source-scoped policy rule + its private table. Best-effort —
+        // an abrupt Drop/SIGKILL skips this entirely, which is safe
+        // BECAUSE every key is stable across respawns: the table id and
+        // the iface name are both derived from the ULA (`stable_tun_name`),
+        // so the next start re-adopts the leaked rule (check-then-insert)
+        // and re-replaces the leaked routes instead of orphaning them.
+        if self.manage_firewall {
+            if let Some(iface) = &self.iface_name {
+                platform::firewall::remove_tun_trust(iface).await;
+            }
+        }
+        if let Some(scope) = self.source_scope.take() {
+            platform::remove_source_rule(&scope).await;
+        }
         // Drop the TUN device last so the kernel tears the interface
         // down only after every other consumer has stopped.
         self.tun.take();
@@ -745,6 +784,153 @@ fn default_keypair_path() -> std::path::PathBuf {
     std::path::PathBuf::from(home)
         .join(".tabbify-mesh")
         .join("keypair")
+}
+
+/// Spawn the host-integration healing loops onto `tasks`.
+///
+/// * Firewall re-assert ([`platform::firewall::trust_loop`]): a host
+///   firewall reload flushes our INPUT rule; this keeps it alive (and is
+///   the warn-once site for hosts where the assert can never succeed).
+/// * Source-scope re-assert ([`source_scope_reassert_loop`]): policy
+///   rules and scoped routes have the SAME external-flush exposure
+///   (networkd / `NetworkManager` reconciles, `nixos-rebuild switch`
+///   wipe FOREIGN policy rules), so they get the same periodic healing.
+fn spawn_host_integration_loops(
+    config: &JoinConfig,
+    source_scope: Option<platform::SourceScope>,
+    iface_name: &str,
+    sessions: &SessionTable,
+    shutdown_tx: &watch::Sender<bool>,
+    tasks: &mut Vec<JoinHandle<()>>,
+) {
+    if config.manage_firewall {
+        tasks.push(tokio::spawn(platform::firewall::trust_loop(
+            iface_name.to_owned(),
+            shutdown_tx.subscribe(),
+        )));
+    }
+    if let Some(scope) = source_scope {
+        tasks.push(tokio::spawn(source_scope_reassert_loop(
+            scope,
+            iface_name.to_owned(),
+            sessions.clone(),
+            shutdown_tx.subscribe(),
+        )));
+    }
+}
+
+/// Periodic re-assert for the source-scoped policy rule + scoped peer
+/// routes — the policy-routing twin of `firewall::trust_loop`. Both
+/// guard against the reload/reconcile class of external flushes: a
+/// `nixos-rebuild switch` or a networkd/NetworkManager reconcile can
+/// drop foreign `ip -6 rule`s, after which return traffic silently
+/// egresses via the wrong TUN with no local error. The rule re-assert
+/// is presence-checked (read-only in steady state); the per-session
+/// route re-assert rides `ip -6 route replace` (atomic + idempotent).
+async fn source_scope_reassert_loop(
+    scope: platform::SourceScope,
+    iface: String,
+    sessions: SessionTable,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
+            _ = ticker.tick() => {
+                platform::route::reassert_source_rule(&scope).await;
+                for session in sessions.snapshot() {
+                    if let Err(e) =
+                        platform::route::add_peer_route_in_table(&iface, session.ula, scope.table)
+                            .await
+                    {
+                        tracing::debug!(error = %e, ula = %session.ula, "route: scoped re-assert failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Bind the WG UDP socket (preferred port, OS-picked fallback) and
+/// report the actually-bound port — the one the coordinator advertises
+/// for reflexive endpoint discovery.
+///
+/// # Errors
+/// [`JoinerError::HttpTransport`] when the local addr cannot be read.
+async fn bind_wg_socket(preferred_port: u16) -> anyhow::Result<(Arc<UdpSocket>, u16)> {
+    let socket = bind_udp_with_fallback(preferred_port).await?;
+    let bound = socket
+        .local_addr()
+        .map_err(|e| JoinerError::HttpTransport(format!("udp local_addr: {e}")))?;
+    let wg_listen_port = bound.port();
+    tracing::info!(local = %bound, wg_listen_port, "joiner: udp socket bound");
+    Ok((Arc::new(socket), wg_listen_port))
+}
+
+/// Pick the TUN device name for this join.
+///
+/// An explicit `config.tun_name` always wins. Otherwise host-integrated
+/// joiners (scoped routes / managed firewall) get a STABLE, ULA-derived
+/// name ([`platform::stable_tun_name`]) instead of the kernel's recycled
+/// `tun%d`: their host state (the firewall trust rule, the scoped
+/// routes' `dev`) is keyed on the iface NAME, and a SIGKILL respawn
+/// landing on a different auto-index would orphan the old entries
+/// instead of re-adopting them. Linux-only (macOS requires `utun%d`
+/// names); plain joiners keep kernel auto-naming.
+fn resolve_tun_name(config: &JoinConfig, my_ula: Ipv6Addr) -> Option<String> {
+    config.tun_name.clone().or_else(|| {
+        (cfg!(target_os = "linux") && (config.source_scoped_routes || config.manage_firewall))
+            .then(|| platform::stable_tun_name(my_ula))
+    })
+}
+
+/// Apply the host-integration opt-ins right after TUN bring-up.
+///
+/// * `source_scoped_routes`: derive the per-instance routing table from
+///   our OWN ULA and install the `from <own_ula>` policy rule, so this
+///   joiner's egress always uses its OWN TUN even when another joiner in
+///   the same netns owns the `main`-table `/128`s (supervisor + per-app
+///   runners on one machine). Installation failure propagates like
+///   `assign_ula`'s: a host that opted in but cannot install the rule
+///   would silently egress via the wrong TUN — fail loudly instead.
+/// * `manage_firewall`: assert the tailscaled-style `INPUT -i <tun> -j
+///   ACCEPT` trust rule. Best-effort by contract (containers without
+///   ip6tables must still join); re-asserted by the background loop.
+///
+/// Returns the [`platform::SourceScope`] to hand to the route sink
+/// (`None` when scoping is off).
+///
+/// # Errors
+/// [`JoinerError::TunSetup`] when the opted-in policy rule cannot be
+/// installed.
+async fn setup_host_integration(
+    config: &JoinConfig,
+    my_ula: Ipv6Addr,
+    iface_name: &str,
+) -> anyhow::Result<Option<platform::SourceScope>> {
+    let source_scope = if config.source_scoped_routes {
+        let scope = platform::SourceScope::for_ula(my_ula);
+        platform::install_source_rule(&scope).await?;
+        tracing::info!(
+            table = scope.table,
+            pref = scope.pref,
+            "joiner: source-scoped routing installed (from {my_ula} lookup {})",
+            scope.table
+        );
+        Some(scope)
+    } else {
+        None
+    };
+    if config.manage_firewall {
+        platform::firewall::ensure_tun_trust(iface_name).await;
+    }
+    Ok(source_scope)
 }
 
 /// Open + configure the overlay TUN device, returning the shared device

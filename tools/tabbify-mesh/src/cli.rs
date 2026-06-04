@@ -36,6 +36,10 @@ pub enum Cmd {
 }
 
 /// Arguments for the `join` subcommand.
+//
+// `struct_excessive_bools`: flat clap surface; every bool is an
+// independent opt-in flag mirroring a `JoinConfig` field.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args, Clone)]
 pub struct JoinArgs {
     /// Coordinator base URL.
@@ -151,6 +155,22 @@ pub struct JoinArgs {
     /// default — a normal peer participates in direct + hole-punch.
     #[arg(long, env = "TABBIFY_MESH_RELAY_ONLY")]
     pub relay_only: bool,
+
+    /// Install this joiner's peer routes into a private SOURCE-SCOPED
+    /// routing table (`ip -6 rule from <own-ula> lookup <table>`) instead
+    /// of `main`. For hosts that run multiple joiners in ONE network
+    /// namespace (a supervisor + per-app runners), so each joiner's
+    /// egress always uses its OWN TUN. Linux-only.
+    #[arg(long, env = "TABBIFY_MESH_SOURCE_SCOPED_ROUTES")]
+    pub source_scoped_routes: bool,
+
+    /// Self-manage the host firewall (tailscaled-style): keep an
+    /// `INPUT -i <tun> -j ACCEPT` rule for this joiner's TUN device
+    /// (asserted at bring-up, re-asserted periodically, removed on exit)
+    /// so distro default firewalls don't drop inbound overlay
+    /// connections. Best-effort: missing ip6tables only warns.
+    #[arg(long, env = "TABBIFY_MESH_MANAGE_FIREWALL")]
+    pub manage_firewall: bool,
 }
 
 /// Arguments for the `peers` subcommand.
