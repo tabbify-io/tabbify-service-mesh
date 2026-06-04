@@ -115,13 +115,8 @@ async fn register(
 async fn open_relay(
     addr: SocketAddr,
     seed: u8,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
-    let url = format!(
-        "ws://{addr}/v1/mesh/relay?pubkey={}",
-        pubkey_b64url(seed)
-    );
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let url = format!("ws://{addr}/v1/mesh/relay?pubkey={}", pubkey_b64url(seed));
     let (ws, _resp) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(url))
         .await
         .expect("relay WS connect did not time out")
@@ -186,9 +181,12 @@ async fn relay_denies_isolated_peer() {
     let mut c_ws = open_relay(addr, 3).await;
 
     // C sends a frame addressed to A — the policy has no C→A edge.
-    c_ws.send(Message::Binary(encode_relay_frame(&a_pubkey, b"should-be-dropped")))
-        .await
-        .expect("C uplink sent");
+    c_ws.send(Message::Binary(encode_relay_frame(
+        &a_pubkey,
+        b"should-be-dropped",
+    )))
+    .await
+    .expect("C uplink sent");
 
     // A must receive NOTHING: recv times out (no frame crossed the ACL).
     let result = tokio::time::timeout(DENY_TIMEOUT, recv_binary(&mut a_ws)).await;
@@ -232,7 +230,9 @@ where
     loop {
         match ws.next().await {
             Some(Ok(Message::Binary(buf))) => return Some(buf),
-            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_))) => {
+            Some(Ok(
+                Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_),
+            )) => {
                 // Keepalive / non-relay frame — keep waiting for a binary.
             }
             // Clean close, stream end, or a transport error: no relay frame.

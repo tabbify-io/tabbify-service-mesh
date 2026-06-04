@@ -80,8 +80,7 @@ where
         // can inject our `service` key right after the opening brace —
         // keeping `service` a flat, top-level field on every line.
         let mut buf = String::new();
-        self.inner
-            .format_event(ctx, Writer::new(&mut buf), event)?;
+        self.inner.format_event(ctx, Writer::new(&mut buf), event)?;
 
         let trimmed = buf.trim_end_matches(['\n', '\r']);
         if let Some(rest) = trimmed.strip_prefix('{') {
@@ -144,8 +143,8 @@ pub fn init_logging(service: &str) {
     // EnvFilter from RUST_LOG; fall back to a plain `info` directive when
     // the env var is missing or unparseable (a bad RUST_LOG must not take
     // the whole process down at boot).
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
 
     // Stock JSON event format, flattening the event's own fields to the
     // top level. We wrap it in `ServiceJson` to also splice in a flat

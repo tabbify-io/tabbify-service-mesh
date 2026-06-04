@@ -289,7 +289,13 @@ mod tests {
     /// DISTINCT pubkey → a brand-new `Tunn` whose handshake hasn't been
     /// initiated yet, so its first `build_handshake_packet` emits a fresh
     /// init even under `force_resend = false`.
-    fn upsert_target(t: &SessionTable, peer_id: Uuid, ula: &str, endpoint: Option<&str>, key_seed: u8) {
+    fn upsert_target(
+        t: &SessionTable,
+        peer_id: Uuid,
+        ula: &str,
+        endpoint: Option<&str>,
+        key_seed: u8,
+    ) {
         let me = StaticSecret::from([7u8; 32]);
         let peer_pub = *PublicKey::from(&StaticSecret::from([key_seed; 32])).as_bytes();
         let info = PeerInfo {
@@ -376,7 +382,10 @@ mod tests {
         let sessions = session_table_with(target, "fd5a:1f00:1::2", None);
         let plan =
             plan_punch(&sessions, me, &ev(me, target, &target_addr.to_string())).expect("a plan");
-        assert!(!plan.session.direct_confirmed(), "fresh session is unconfirmed");
+        assert!(
+            !plan.session.direct_confirmed(),
+            "fresh session is unconfirmed"
+        );
 
         // No relay wired — proves the relay==None path still fires direct.
         execute_punch(&sender, None, &plan, 2, Duration::from_millis(1)).await;
@@ -455,13 +464,28 @@ mod tests {
         let (relay, mut relay_rx) = crate::relay::RelayHandle::new();
         // Endpoint advertised but unreachable (a black hole for a
         // no-inbound peer); the session is unconfirmed.
-        let sessions = relay_table_with(target, "fd5a:1f00:1::2", Some(&target_addr.to_string()), relay);
+        let sessions = relay_table_with(
+            target,
+            "fd5a:1f00:1::2",
+            Some(&target_addr.to_string()),
+            relay,
+        );
         let plan =
             plan_punch(&sessions, me, &ev(me, target, &target_addr.to_string())).expect("a plan");
-        assert!(!plan.session.direct_confirmed(), "fresh session is unconfirmed");
+        assert!(
+            !plan.session.direct_confirmed(),
+            "fresh session is unconfirmed"
+        );
         let peer_pubkey = plan.session.peer_pubkey;
 
-        execute_punch(&sender, sessions.relay(), &plan, 2, Duration::from_millis(1)).await;
+        execute_punch(
+            &sender,
+            sessions.relay(),
+            &plan,
+            2,
+            Duration::from_millis(1),
+        )
+        .await;
 
         // (a) The direct datagram still went out (opens our NAT mapping).
         let mut buf = [0u8; 256];
@@ -481,7 +505,10 @@ mod tests {
             relayed.dst_pubkey, peer_pubkey,
             "the relayed init targets the target peer's pubkey"
         );
-        assert!(!relayed.payload.is_empty(), "relayed payload is the WG handshake-init");
+        assert!(
+            !relayed.payload.is_empty(),
+            "relayed payload is the WG handshake-init"
+        );
     }
 
     /// Fix A sibling: once the direct path is CONFIRMED, the punch must NOT
@@ -498,14 +525,26 @@ mod tests {
         let me = Uuid::from_u128(1);
         let target = Uuid::from_u128(2);
         let (relay, mut relay_rx) = crate::relay::RelayHandle::new();
-        let sessions = relay_table_with(target, "fd5a:1f00:1::2", Some(&target_addr.to_string()), relay);
+        let sessions = relay_table_with(
+            target,
+            "fd5a:1f00:1::2",
+            Some(&target_addr.to_string()),
+            relay,
+        );
         let plan =
             plan_punch(&sessions, me, &ev(me, target, &target_addr.to_string())).expect("a plan");
         // Prove the direct path — the upgrade signal that stops relaying.
         plan.session.confirm_direct(1_000);
         assert!(plan.session.direct_confirmed());
 
-        execute_punch(&sender, sessions.relay(), &plan, 2, Duration::from_millis(1)).await;
+        execute_punch(
+            &sender,
+            sessions.relay(),
+            &plan,
+            2,
+            Duration::from_millis(1),
+        )
+        .await;
 
         // The direct datagram still goes out.
         let mut buf = [0u8; 256];
@@ -553,7 +592,10 @@ mod tests {
             "WireGuard handshake-init is 148 bytes, got {}",
             first.len()
         );
-        assert_eq!(first[0], 1, "first byte is the WG handshake-init message type");
+        assert_eq!(
+            first[0], 1,
+            "first byte is the WG handshake-init message type"
+        );
 
         // Immediate second call on the SAME session: force_resend=false means
         // boringtun suppresses the repeat within its retransmit window, so no
@@ -646,10 +688,11 @@ mod tests {
         punch_tx
             .send(ev(old_id, target1, &target_addr.to_string()))
             .expect("send initiate (old)");
-        let (n1, _from) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
-            .await
-            .expect("phase-1 datagram (old id should punch)")
-            .expect("recv ok");
+        let (n1, _from) =
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+                .await
+                .expect("phase-1 datagram (old id should punch)")
+                .expect("recv ok");
         assert!(n1 >= 148, "expected a WG handshake-init, got {n1} bytes");
         // Drain any remainder of the phase-1 burst so none can masquerade as
         // a phase-2 punch. With force=false the burst emits a single init, so
@@ -671,10 +714,11 @@ mod tests {
         punch_tx
             .send(ev(new_id, target2, &target_addr.to_string()))
             .expect("send initiate (new)");
-        let (n2, _from) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
-            .await
-            .expect("phase-2 datagram (punch must use the live, swapped peer id)")
-            .expect("recv ok");
+        let (n2, _from) =
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+                .await
+                .expect("phase-2 datagram (punch must use the live, swapped peer id)")
+                .expect("recv ok");
         assert!(n2 >= 148, "expected a WG handshake-init, got {n2} bytes");
         assert_eq!(buf[0], 1, "first byte is the WG handshake-init type");
 

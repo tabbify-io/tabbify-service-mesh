@@ -291,9 +291,18 @@ mod tests {
     async fn can_relay_honours_policy_and_unknown_pubkeys() {
         let c = coordinator_with(shared_service_policy());
         // a1 + svc are visible to each other (user-*→svc edge); a1 + b1 are not.
-        let _ = c.register(req(1, "a1", "a", &["tag:user-a"])).await.expect("a1");
-        let _ = c.register(req(2, "svc1", "svc", &["tag:svc"])).await.expect("svc");
-        let _ = c.register(req(3, "b1", "b", &["tag:user-b"])).await.expect("b1");
+        let _ = c
+            .register(req(1, "a1", "a", &["tag:user-a"]))
+            .await
+            .expect("a1");
+        let _ = c
+            .register(req(2, "svc1", "svc", &["tag:svc"]))
+            .await
+            .expect("svc");
+        let _ = c
+            .register(req(3, "b1", "b", &["tag:user-b"]))
+            .await
+            .expect("b1");
         let a_pubkey = [1u8; 32];
         let svc_pubkey = [2u8; 32];
         let b_pubkey = [3u8; 32];

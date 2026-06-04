@@ -389,9 +389,16 @@ async fn heartbeat_does_not_emit_when_one_peer_lacks_external() {
 
     // Alice heartbeats with a known external — bob never heartbeats,
     // so its observed_external stays empty.
-    c.heartbeat(alice.peer_id, "203.0.113.30:33333".into(), None, vec![], None, false)
-        .await
-        .expect("a hb");
+    c.heartbeat(
+        alice.peer_id,
+        "203.0.113.30:33333".into(),
+        None,
+        vec![],
+        None,
+        false,
+    )
+    .await
+    .expect("a hb");
 
     assert_eq!(
         pub_.count_by_type("holepunch_initiate"),
@@ -409,9 +416,16 @@ async fn heartbeat_with_empty_external_skips_emit() {
     let (bob, _) = c.register(req(61, "bob")).await.expect("b");
 
     // Alice gets an external on heartbeat 1.
-    c.heartbeat(alice.peer_id, "203.0.113.50:44444".into(), None, vec![], None, false)
-        .await
-        .expect("a hb");
+    c.heartbeat(
+        alice.peer_id,
+        "203.0.113.50:44444".into(),
+        None,
+        vec![],
+        None,
+        false,
+    )
+    .await
+    .expect("a hb");
 
     // Bob heartbeats but ConnectInfo wasn't captured — empty string.
     // This mirrors the test-router path that drives via Router::call
@@ -460,12 +474,26 @@ async fn heartbeat_suppresses_holepunch_when_either_peer_relay_only() {
 
     // Both peers heartbeat with public observed addrs — alice is fully
     // dialable, bob would be too if it weren't relay-only.
-    c.heartbeat(alice.peer_id, "203.0.113.80:11111".into(), Some(51820), vec![], None, false)
-        .await
-        .expect("a hb");
-    c.heartbeat(bob.peer_id, "198.51.100.81:22222".into(), Some(51820), vec![], None, true)
-        .await
-        .expect("b hb");
+    c.heartbeat(
+        alice.peer_id,
+        "203.0.113.80:11111".into(),
+        Some(51820),
+        vec![],
+        None,
+        false,
+    )
+    .await
+    .expect("a hb");
+    c.heartbeat(
+        bob.peer_id,
+        "198.51.100.81:22222".into(),
+        Some(51820),
+        vec![],
+        None,
+        true,
+    )
+    .await
+    .expect("b hb");
 
     assert_eq!(
         pub_.count_by_type("holepunch_initiate"),
@@ -494,12 +522,26 @@ async fn heartbeat_emits_holepunch_for_two_non_relay_only_peers() {
         e.listen_endpoint = Some("198.51.100.83:51820".into());
     }
 
-    c.heartbeat(alice.peer_id, "203.0.113.82:11111".into(), Some(51820), vec![], None, false)
-        .await
-        .expect("a hb");
-    c.heartbeat(bob.peer_id, "198.51.100.83:22222".into(), Some(51820), vec![], None, false)
-        .await
-        .expect("b hb");
+    c.heartbeat(
+        alice.peer_id,
+        "203.0.113.82:11111".into(),
+        Some(51820),
+        vec![],
+        None,
+        false,
+    )
+    .await
+    .expect("a hb");
+    c.heartbeat(
+        bob.peer_id,
+        "198.51.100.83:22222".into(),
+        Some(51820),
+        vec![],
+        None,
+        false,
+    )
+    .await
+    .expect("b hb");
 
     assert_eq!(
         pub_.count_by_type("holepunch_initiate"),
@@ -533,11 +575,11 @@ async fn relay_only_register_advertises_no_listen_endpoint() {
         entry.listen_endpoint, None,
         "a relay-only peer must advertise no direct listen endpoint"
     );
-    assert!(entry.relay_only, "relay_only flag must round-trip onto the entry");
     assert!(
-        !entry.endpoint_is_reflexive,
-        "no endpoint → not reflexive"
+        entry.relay_only,
+        "relay_only flag must round-trip onto the entry"
     );
+    assert!(!entry.endpoint_is_reflexive, "no endpoint → not reflexive");
 }
 
 // -----------------------------------------------------------------
@@ -1252,7 +1294,14 @@ async fn software_version_is_stored_and_broadcast() {
 
     // A heartbeat that omits the version (None) must NOT wipe it.
     let kept = c
-        .heartbeat(entry.peer_id, String::new(), Some(51820), vec![], None, false)
+        .heartbeat(
+            entry.peer_id,
+            String::new(),
+            Some(51820),
+            vec![],
+            None,
+            false,
+        )
         .await
         .expect("heartbeat none");
     assert_eq!(

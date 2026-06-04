@@ -327,7 +327,15 @@ pub(crate) async fn register_with_409_fallback(
     software_version: Option<String>,
     requested_ula: Option<String>,
 ) -> crate::error::Result<RegisterResponse> {
-    match register_attempt(client, inputs, wg_listen_port, software_version, requested_ula).await {
+    match register_attempt(
+        client,
+        inputs,
+        wg_listen_port,
+        software_version,
+        requested_ula,
+    )
+    .await
+    {
         Ok(resp) => Ok(resp),
         Err(JoinerError::HttpStatus { status: 409, body }) => {
             tracing::warn!(
@@ -393,19 +401,24 @@ async fn reregister_after_roster_loss(
     // Sticky-then-free 409 self-heal shared with the cold-start path. The
     // control plane re-derives `software_version` from heartbeats, so the
     // re-register carries identity + roster only (`software_version = None`).
-    let resp =
-        match register_with_409_fallback(client, inputs, wg_listen_port, None, inputs.requested_ula.clone())
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "heartbeat: re-register after roster loss failed — will retry next tick"
-                );
-                return;
-            }
-        };
+    let resp = match register_with_409_fallback(
+        client,
+        inputs,
+        wg_listen_port,
+        None,
+        inputs.requested_ula.clone(),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "heartbeat: re-register after roster loss failed — will retry next tick"
+            );
+            return;
+        }
+    };
 
     // Adopt the freshly-assigned peer_id so subsequent heartbeats AND the
     // SSE consumer (on its next reconnect) use the LIVE id, not the dead
@@ -881,15 +894,10 @@ mod tests {
         };
 
         // The shared cold-start helper: sticky 409 → retry free → 200.
-        let resp = register_with_409_fallback(
-            &client,
-            &inputs,
-            51820,
-            None,
-            inputs.requested_ula.clone(),
-        )
-        .await
-        .expect("cold-start register must self-heal past a sticky 409");
+        let resp =
+            register_with_409_fallback(&client, &inputs, 51820, None, inputs.requested_ula.clone())
+                .await
+                .expect("cold-start register must self-heal past a sticky 409");
 
         assert_eq!(
             resp.peer_id,

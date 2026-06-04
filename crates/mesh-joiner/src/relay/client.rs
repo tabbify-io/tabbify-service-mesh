@@ -52,7 +52,10 @@ impl RelayHandle {
     /// Best-effort: a send to a closed channel (relay task gone) is
     /// silently dropped.
     pub fn try_relay(&self, dst_pubkey: [u8; 32], payload: Vec<u8>) {
-        let _ = self.tx.send(RelayOutbound { dst_pubkey, payload });
+        let _ = self.tx.send(RelayOutbound {
+            dst_pubkey,
+            payload,
+        });
     }
 }
 
@@ -98,15 +101,13 @@ pub fn derive_relay_url(coordinator_url: &str, relay_url: Option<&str>) -> Strin
         return url.to_owned();
     }
     let trimmed = coordinator_url.trim_end_matches('/');
-    let (scheme, rest) = trimmed
-        .split_once("://")
-        .map_or(("ws", trimmed), |(s, r)| {
-            let ws_scheme = match s {
-                "https" | "wss" => "wss",
-                _ => "ws",
-            };
-            (ws_scheme, r)
-        });
+    let (scheme, rest) = trimmed.split_once("://").map_or(("ws", trimmed), |(s, r)| {
+        let ws_scheme = match s {
+            "https" | "wss" => "wss",
+            _ => "ws",
+        };
+        (ws_scheme, r)
+    });
     format!("{scheme}://{rest}/v1/mesh/relay")
 }
 
@@ -143,7 +144,11 @@ pub async fn run(mut task: RelayTask) {
             ConnOutcome::ShutdownRequested => return,
             ConnOutcome::Disconnected(reason) => {
                 let delay = backoff[attempt.min(backoff.len() - 1)];
-                tracing::warn!(reason, delay_secs = delay, "relay: disconnected; reconnecting");
+                tracing::warn!(
+                    reason,
+                    delay_secs = delay,
+                    "relay: disconnected; reconnecting"
+                );
                 if sleep_or_shutdown(Duration::from_secs(delay), &mut task.shutdown).await {
                     return;
                 }

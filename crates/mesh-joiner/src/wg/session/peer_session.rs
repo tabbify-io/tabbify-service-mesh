@@ -97,7 +97,8 @@ impl PeerSession {
     /// false-downgrades. Does NOT confirm the path — only
     /// `confirm_direct` does.
     pub fn note_direct_rx(&self, now_micros: i64) {
-        self.last_direct_rx_micros.store(now_micros, Ordering::Relaxed);
+        self.last_direct_rx_micros
+            .store(now_micros, Ordering::Relaxed);
     }
 
     /// THE upgrade signal: a decrypted DATA packet arrived over UDP,
@@ -106,7 +107,8 @@ impl PeerSession {
     /// `DeliverToTun` path on a direct (non-relayed) datagram.
     pub fn confirm_direct(&self, now_micros: i64) {
         self.direct_confirmed.store(true, Ordering::Relaxed);
-        self.last_direct_rx_micros.store(now_micros, Ordering::Relaxed);
+        self.last_direct_rx_micros
+            .store(now_micros, Ordering::Relaxed);
     }
 
     /// Downgrade a confirmed path back to the relay floor if it has gone
@@ -248,7 +250,10 @@ mod tests {
         assert!(s.direct_confirmed(), "must stay confirmed within the TTL");
         // Stale: past the TTL window → fall back to relay.
         s.downgrade_direct_if_stale(1_000 + DIRECT_PATH_TTL_MICROS + 1, DIRECT_PATH_TTL_MICROS);
-        assert!(!s.direct_confirmed(), "must downgrade once the TTL is exceeded");
+        assert!(
+            !s.direct_confirmed(),
+            "must downgrade once the TTL is exceeded"
+        );
     }
 
     /// A keepalive refresh (`note_direct_rx`) keeps a confirmed-but-idle
@@ -263,6 +268,9 @@ mod tests {
         // "Now" is past the original confirm + TTL, but the refresh moved
         // the window forward, so the path is still live.
         s.downgrade_direct_if_stale(DIRECT_PATH_TTL_MICROS + 10, DIRECT_PATH_TTL_MICROS);
-        assert!(s.direct_confirmed(), "keepalive refresh prevents a false downgrade");
+        assert!(
+            s.direct_confirmed(),
+            "keepalive refresh prevents a false downgrade"
+        );
     }
 }

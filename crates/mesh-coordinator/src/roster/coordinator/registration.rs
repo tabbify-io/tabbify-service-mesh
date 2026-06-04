@@ -7,7 +7,7 @@
 //! (`resolve_ula`).
 
 use super::{
-    Coordinator, CoordinatorError, PeerEntry, PEER_SEGMENT, RegisterOutcome, decode_pubkey,
+    Coordinator, CoordinatorError, PEER_SEGMENT, PeerEntry, RegisterOutcome, decode_pubkey,
     now_unix_micros,
 };
 use crate::auth::{ValidatedClaims, ValidationError};

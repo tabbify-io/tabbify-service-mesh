@@ -453,7 +453,11 @@ impl Coordinator {
         let cutoff = now_unix_micros() - crate::nat::holepunch::PUNCH_PAIR_TTL_MICROS;
         let punch_reaped = self.inner.punch_tracker.reap_older_than(cutoff);
         if relay_reaped > 0 || punch_reaped > 0 {
-            tracing::info!(relay_reaped, punch_reaped, "reaped stale ephemeral mesh state");
+            tracing::info!(
+                relay_reaped,
+                punch_reaped,
+                "reaped stale ephemeral mesh state"
+            );
         }
         tracing::debug!(
             relay_conns = self.inner.relay.len(),

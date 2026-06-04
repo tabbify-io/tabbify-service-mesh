@@ -83,8 +83,7 @@ async fn openapi_json_is_served_and_lists_every_route() {
 
     // The SSE endpoint declares `text/event-stream` so generated SDKs
     // treat it as a streaming response.
-    let sse_content = body["paths"]["/v1/mesh/peers/stream"]["get"]["responses"]["200"]
-        ["content"]
+    let sse_content = body["paths"]["/v1/mesh/peers/stream"]["get"]["responses"]["200"]["content"]
         .as_object()
         .expect("SSE 200 has content");
     assert!(
@@ -146,9 +145,9 @@ async fn register_declares_bearer_security_in_spec() {
         "POST /v1/mesh/register `security` must not be empty",
     );
     assert!(
-        array.iter().any(|entry| entry
-            .as_object()
-            .is_some_and(|m| m.contains_key("bearer"))),
+        array
+            .iter()
+            .any(|entry| entry.as_object().is_some_and(|m| m.contains_key("bearer"))),
         "POST /v1/mesh/register must include the `bearer` scheme; got {array:?}",
     );
 

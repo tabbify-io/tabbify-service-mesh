@@ -208,7 +208,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FileRosterStore::new(dir.path());
         store.save(&[sample_peer(1, "first")]).await;
-        store.save(&[sample_peer(2, "second"), sample_peer(3, "third")]).await;
+        store
+            .save(&[sample_peer(2, "second"), sample_peer(3, "third")])
+            .await;
         let loaded = store.load().await;
         assert_eq!(loaded.len(), 2, "save replaces, never appends");
         assert_eq!(loaded[0].display_name, "second");

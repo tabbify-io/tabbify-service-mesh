@@ -170,10 +170,7 @@ mod tests {
             .and_then(|item| item.post.as_ref())
             .expect("POST /v1/mesh/register present");
         assert!(
-            register
-                .security
-                .as_ref()
-                .is_some_and(|s| !s.is_empty()),
+            register.security.as_ref().is_some_and(|s| !s.is_empty()),
             "POST /v1/mesh/register must declare bearer security",
         );
 
@@ -186,17 +183,11 @@ mod tests {
         let policy_get = policy_item.get.as_ref().expect("GET /v1/policy present");
         let policy_put = policy_item.put.as_ref().expect("PUT /v1/policy present");
         assert!(
-            policy_get
-                .security
-                .as_ref()
-                .is_some_and(|s| !s.is_empty()),
+            policy_get.security.as_ref().is_some_and(|s| !s.is_empty()),
             "GET /v1/policy must declare bearer security",
         );
         assert!(
-            policy_put
-                .security
-                .as_ref()
-                .is_some_and(|s| !s.is_empty()),
+            policy_put.security.as_ref().is_some_and(|s| !s.is_empty()),
             "PUT /v1/policy must declare bearer security",
         );
     }

@@ -402,7 +402,8 @@ mod tests {
     /// that declines to guess its own address becomes reachable.
     #[test]
     fn passive_peer_with_public_observed_gets_reflexive() {
-        let got = resolve_listen_endpoint(None, Some(sock("203.0.113.7:34812")), Some(51820), false);
+        let got =
+            resolve_listen_endpoint(None, Some(sock("203.0.113.7:34812")), Some(51820), false);
         assert_eq!(got.endpoint.as_deref(), Some("203.0.113.7:51820"));
         assert!(got.reflexive);
     }
@@ -410,7 +411,10 @@ mod tests {
     /// Passive peer, no observed IP, no port → stays passive (`None`).
     #[test]
     fn fully_passive_peer_stays_none() {
-        assert_eq!(resolve_listen_endpoint(None, None, None, false).endpoint, None);
+        assert_eq!(
+            resolve_listen_endpoint(None, None, None, false).endpoint,
+            None
+        );
         assert_eq!(
             resolve_listen_endpoint(Some(""), None, Some(51820), false).endpoint,
             None
@@ -445,7 +449,10 @@ mod tests {
             Some(51820),                     // reported WG port
             true,                            // relay_only
         );
-        assert_eq!(got.endpoint, None, "relay-only peer must advertise no endpoint");
+        assert_eq!(
+            got.endpoint, None,
+            "relay-only peer must advertise no endpoint"
+        );
         assert!(!got.reflexive);
     }
 
@@ -463,12 +470,8 @@ mod tests {
         assert_eq!(got.endpoint, None);
         assert!(!got.reflexive);
 
-        let got_host = resolve_listen_endpoint(
-            Some("host.lima.internal:51820"),
-            None,
-            Some(51820),
-            true,
-        );
+        let got_host =
+            resolve_listen_endpoint(Some("host.lima.internal:51820"), None, Some(51820), true);
         assert_eq!(got_host.endpoint, None);
         assert!(!got_host.reflexive);
     }
@@ -477,12 +480,8 @@ mod tests {
     /// did before the flag existed (the reflexive happy path still fires).
     #[test]
     fn relay_only_false_preserves_reflexive_behaviour() {
-        let got = resolve_listen_endpoint(
-            None,
-            Some(sock("203.0.113.7:34812")),
-            Some(51820),
-            false,
-        );
+        let got =
+            resolve_listen_endpoint(None, Some(sock("203.0.113.7:34812")), Some(51820), false);
         assert_eq!(got.endpoint.as_deref(), Some("203.0.113.7:51820"));
         assert!(got.reflexive);
     }

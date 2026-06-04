@@ -131,7 +131,10 @@ fn upsert_same_ula_new_pubkey_rolls_over_pubkey_index() {
         "stale pubkey A must be dropped on rotation"
     );
     let by_pk = t.by_pubkey(pubkey_b).expect("pubkey B resolves");
-    assert_eq!(by_pk.peer_pubkey, pubkey_b, "session carries the new pubkey");
+    assert_eq!(
+        by_pk.peer_pubkey, pubkey_b,
+        "session carries the new pubkey"
+    );
 }
 
 /// Fix C: a re-upsert with the SAME pubkey and only the endpoint changed
@@ -154,7 +157,9 @@ fn upsert_same_pubkey_endpoint_change_keeps_session() {
     // Re-upsert SAME ULA + SAME pubkey, only the endpoint changed.
     let moved = info(1, "fd5a:1f00:1::5", Some("10.0.0.5:51820"));
     t.upsert(&me, &moved);
-    let after = t.by_ula(ula).expect("session after endpoint-only re-upsert");
+    let after = t
+        .by_ula(ula)
+        .expect("session after endpoint-only re-upsert");
 
     assert!(
         Arc::ptr_eq(&before, &after),
@@ -191,7 +196,11 @@ fn upsert_rotated_pubkey_rebuilds_session() {
         !Arc::ptr_eq(&before, &after),
         "a key rotation MUST rebuild the session (fresh Tunn for the new key)"
     );
-    assert_eq!(after.peer_pubkey, pubkey_bytes_at(2), "session carries the new key");
+    assert_eq!(
+        after.peer_pubkey,
+        pubkey_bytes_at(2),
+        "session carries the new key"
+    );
 }
 
 #[test]
@@ -417,7 +426,10 @@ fn learn_endpoint_repoints_unconfirmed_active_peer() {
     let p = info(1, "fd5a:1f00:1::1", Some(advertised));
     t.upsert(&me, &p);
     let session = t.by_ula(p.ula).expect("session");
-    assert!(!session.direct_confirmed(), "fresh session starts unconfirmed");
+    assert!(
+        !session.direct_confirmed(),
+        "fresh session starts unconfirmed"
+    );
 
     let inbound_src: SocketAddr = "203.0.113.9:40000".parse().unwrap(); // different port
     t.learn_endpoint(&session, inbound_src);

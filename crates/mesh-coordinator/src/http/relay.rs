@@ -23,10 +23,10 @@ use base64::Engine as _;
 // base64url (no padding): the pubkey rides in the URL query, where standard
 // base64's `+`/`/` are unsafe (`+` decodes to a space). The joiner encodes the
 // `?pubkey=` value with the SAME alphabet — keep these two in lockstep.
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use futures::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -51,7 +51,11 @@ pub struct RelayQuery {
 /// (`Some`) — `None` when the frame is too short, the pair is policy-denied,
 /// or the destination has no live connection. `my_pubkey` is the registered
 /// pubkey of the connection that sent `buf`; it becomes the downlink prefix.
-pub fn route_uplink(coordinator: &Coordinator, my_pubkey: &[u8; 32], buf: &[u8]) -> Option<Vec<u8>> {
+pub fn route_uplink(
+    coordinator: &Coordinator,
+    my_pubkey: &[u8; 32],
+    buf: &[u8],
+) -> Option<Vec<u8>> {
     let (dst, payload) = decode_relay_frame(buf)?;
     if !coordinator.can_relay(my_pubkey, &dst) {
         tracing::warn!(
@@ -218,8 +222,14 @@ mod tests {
     #[tokio::test]
     async fn route_uplink_forwards_allowed_pair_with_source_rewrite() {
         let c = coordinator();
-        let _ = c.register(req(1, "a", "a", &["tag:user-a"])).await.expect("a");
-        let _ = c.register(req(2, "b", "svc", &["tag:svc"])).await.expect("b");
+        let _ = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
+        let _ = c
+            .register(req(2, "b", "svc", &["tag:svc"]))
+            .await
+            .expect("b");
         let a_pubkey = [1u8; 32];
         let b_pubkey = [2u8; 32];
 
@@ -239,8 +249,14 @@ mod tests {
     #[tokio::test]
     async fn route_uplink_denies_isolated_pair() {
         let c = coordinator();
-        let _ = c.register(req(1, "a", "a", &["tag:user-a"])).await.expect("a");
-        let _ = c.register(req(3, "b", "b", &["tag:user-b"])).await.expect("b");
+        let _ = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
+        let _ = c
+            .register(req(3, "b", "b", &["tag:user-b"]))
+            .await
+            .expect("b");
         let a_pubkey = [1u8; 32];
         let b_pubkey = [3u8; 32];
 
@@ -249,14 +265,20 @@ mod tests {
 
         let uplink = encode_relay_frame(&b_pubkey, b"ping");
         assert!(route_uplink(&c, &a_pubkey, &uplink).is_none());
-        assert!(b_rx.try_recv().is_err(), "isolated dst must receive nothing");
+        assert!(
+            b_rx.try_recv().is_err(),
+            "isolated dst must receive nothing"
+        );
     }
 
     /// An unknown destination (not a registered peer) forwards nothing.
     #[tokio::test]
     async fn route_uplink_drops_unknown_destination() {
         let c = coordinator();
-        let _ = c.register(req(1, "a", "a", &["tag:user-a"])).await.expect("a");
+        let _ = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
         let a_pubkey = [1u8; 32];
         let unknown = [9u8; 32];
         let uplink = encode_relay_frame(&unknown, b"ping");
@@ -267,7 +289,10 @@ mod tests {
     #[tokio::test]
     async fn route_uplink_ignores_short_frame() {
         let c = coordinator();
-        let _ = c.register(req(1, "a", "a", &["tag:user-a"])).await.expect("a");
+        let _ = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
         let a_pubkey = [1u8; 32];
         assert!(route_uplink(&c, &a_pubkey, &[0u8; 10]).is_none());
     }

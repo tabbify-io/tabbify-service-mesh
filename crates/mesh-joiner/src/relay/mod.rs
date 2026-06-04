@@ -15,8 +15,8 @@
 //! - [`mod@client`] — the [`RelayHandle`] used by the WG TX seams plus
 //!   the persistent WebSocket task.
 
-pub mod frame;
 pub(crate) mod client;
+pub mod frame;
 
 pub use client::RelayHandle;
 pub use frame::{decode_relay_frame, encode_relay_frame};

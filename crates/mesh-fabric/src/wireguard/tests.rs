@@ -37,8 +37,7 @@ fn ipv6_packet_rejects_wrong_version() {
 
 #[test]
 fn ipv6_packet_rejects_length_mismatch() {
-    let mut packet =
-        build_ipv6_packet(Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED, b"x").unwrap();
+    let mut packet = build_ipv6_packet(Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED, b"x").unwrap();
     // Truncate the payload byte.
     packet.truncate(IPV6_HEADER_LEN);
     let err = parse_ipv6_packet(&packet).unwrap_err();
