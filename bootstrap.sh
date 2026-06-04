@@ -61,10 +61,17 @@ log "Tabbify mesh joiner $VER ($ARCH)"
 tmp=$(mktemp)
 curl -fSL -o "$tmp" "$BASE/mesh/$VER/$ARCH/tabbify-mesh" \
   || die "download failed: $BASE/mesh/$VER/$ARCH/tabbify-mesh (no $ARCH build for $VER?)"
-if [ "$ARCH" = x86_64 ]; then
-  want=$(printf '%s' "$MANIFEST" | grep -o '"tabbify-mesh":[[:space:]]*"[a-f0-9]*"' | grep -o '[a-f0-9]\{64\}') || true
+# Per-arch manifest key (`tabbify-mesh_aarch64`); the plain key holds the
+# x86_64 hash. Older manifests carry no aarch64 hash — skip with a warning
+# rather than failing the install (HTTPS + bucket trust still applies).
+KEY="tabbify-mesh"
+[ "$ARCH" = aarch64 ] && KEY="tabbify-mesh_aarch64"
+want=$(printf '%s' "$MANIFEST" | grep -o "\"$KEY\":[[:space:]]*\"[a-f0-9]*\"" | grep -o '[a-f0-9]\{64\}') || true
+if [ -n "$want" ]; then
   got=$(sha256sum "$tmp" | cut -d' ' -f1)
   [ "$want" = "$got" ] || die "tabbify-mesh sha256 mismatch (manifest $want, downloaded $got)"
+else
+  warn "manifest carries no $ARCH sha256 (older release) — skipping verification"
 fi
 chmod +x "$tmp"
 mv "$tmp" "$BIN"

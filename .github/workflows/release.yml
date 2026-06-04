@@ -49,6 +49,15 @@ on:
     tags:
       - "v*"
 
+# Serialize release runs: two concurrent SSM redeploys raced docker
+# compose mid-recreate on the serving box (2026-06-04: containers left
+# Created-but-not-started, public API 504 until manual compose up).
+# One release at a time; a newer queued run supersedes an older queued
+# one (latest wins), the RUNNING one is never cancelled mid-deploy.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -151,30 +160,8 @@ jobs:
               SEMVER="${REF}"   # e.g. v1.4.0
               VDEST="${DEST}/${SEMVER}/${ARCH}"
               echo "Uploading versioned binaries to ${VDEST}..."
-              SHA_MESH=$(sha256sum "${BIN_DIR}/tabbify-mesh"    | cut -d' ' -f1)
-              SHA_CA=$(  sha256sum "${BIN_DIR}/tabbify-mesh-ca" | cut -d' ' -f1)
               aws s3 cp "${BIN_DIR}/tabbify-mesh"    "${VDEST}/tabbify-mesh"
               aws s3 cp "${BIN_DIR}/tabbify-mesh-ca" "${VDEST}/tabbify-mesh-ca"
-
-              # The `latest` manifest is written once, by the x86_64 leader
-              # (single source of truth; hashes are the x86_64 ones — the
-              # installer skips sha verification on other arches).
-              if [ "${ARCH}" = "x86_64" ]; then
-                # TODO(P3+): `versions` currently lists only the current tag.
-                TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-                # -c (compact): the installers grep this manifest with no-whitespace
-                # patterns; pretty-printed jq output would break every install.
-                MANIFEST=$(jq -nc \
-                  --arg latest "${SEMVER}" \
-                  --arg sha_mesh "${SHA_MESH}" \
-                  --arg sha_ca   "${SHA_CA}" \
-                  --arg ts "${TS}" \
-                  '{latest:$latest, versions:[$latest],
-                    sha256:{"tabbify-mesh":$sha_mesh,"tabbify-mesh-ca":$sha_ca},
-                    ts:$ts}')
-                echo "${MANIFEST}" | aws s3 cp - "${DEST}/latest" --content-type application/json
-                echo "Wrote ${DEST}/latest:"; echo "${MANIFEST}"
-              fi
               ;;
             *)
               echo "Not a v* tag (${GITHUB_REF}) — skipping versioned upload."
@@ -275,3 +262,47 @@ jobs:
             esac
           done
           echo "timed out waiting for SSM redeploy"; exit 1
+
+  # `latest` is published ONLY after BOTH arch legs uploaded their versioned
+  # binaries (needs: the whole matrix), closing the release-window 404 for
+  # aarch64 installs. Publishes the plain (x86_64, historical) sha keys plus
+  # `<bin>_aarch64` for the arch-aware installer. Compact JSON (-c): the
+  # installers grep with no-whitespace patterns. TAG-PUSH ONLY.
+  publish-latest:
+    needs: build-and-release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Publish mesh/latest manifest (all arches present)
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME}"
+          BUCKET="${{ vars.RELEASE_S3_BUCKET }}"
+          mkdir -p /tmp/rel
+          for arch in x86_64 aarch64; do
+            for bin in tabbify-mesh tabbify-mesh-ca; do
+              aws s3 cp "s3://${BUCKET}/mesh/${V}/${arch}/${bin}" "/tmp/rel/${bin}.${arch}"
+            done
+          done
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -nc \
+            --arg v "$V" --arg ts "$TS" \
+            --arg mesh_x "$(sha256sum /tmp/rel/tabbify-mesh.x86_64     | cut -d' ' -f1)" \
+            --arg ca_x   "$(sha256sum /tmp/rel/tabbify-mesh-ca.x86_64  | cut -d' ' -f1)" \
+            --arg mesh_a "$(sha256sum /tmp/rel/tabbify-mesh.aarch64    | cut -d' ' -f1)" \
+            --arg ca_a   "$(sha256sum /tmp/rel/tabbify-mesh-ca.aarch64 | cut -d' ' -f1)" \
+            '{latest:$v, versions:[$v],
+              sha256:{"tabbify-mesh":$mesh_x, "tabbify-mesh-ca":$ca_x,
+                      "tabbify-mesh_aarch64":$mesh_a, "tabbify-mesh-ca_aarch64":$ca_a},
+              ts:$ts}' > /tmp/latest.json
+          aws s3 cp /tmp/latest.json "s3://${BUCKET}/mesh/latest" --content-type application/json
+          echo "published:"; cat /tmp/latest.json
