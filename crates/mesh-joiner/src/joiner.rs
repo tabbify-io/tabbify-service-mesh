@@ -413,7 +413,7 @@ impl Joiner {
         // an abrupt Drop/SIGKILL skips this entirely, which is safe
         // BECAUSE every key is stable across respawns: the table id and
         // the iface name are both derived from the ULA (`stable_tun_name`),
-        // so the next start re-adopts the leaked rule (check-then-insert)
+        // so the next start re-adopts the leaked rule (list-then-insert)
         // and re-replaces the leaked routes instead of orphaning them.
         if self.manage_firewall {
             if let Some(iface) = &self.iface_name {

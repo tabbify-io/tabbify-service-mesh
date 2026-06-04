@@ -43,14 +43,18 @@ fn rule_args(iface: &str) -> [String; 4] {
     ]
 }
 
-/// Outcome of one raw firewall-binary invocation. Unlike
-/// [`super::run_command`], `-C` needs the EXIT CODE distinguished from a
-/// spawn failure: exit 1 means "rule absent" (normal!), not an error.
+/// Outcome of one raw firewall-binary invocation, with stdout captured
+/// (the listing parse is the only presence check we trust — see
+/// [`ensure_one`]).
 enum Exec {
     /// Binary missing / not executable.
     SpawnFailed(String),
-    /// Ran to completion with this success flag and captured stderr.
-    Done { ok: bool, stderr: String },
+    /// Ran to completion with this success flag and captured streams.
+    Done {
+        ok: bool,
+        stdout: String,
+        stderr: String,
+    },
 }
 
 async fn exec(bin: &str, args: &[String]) -> Exec {
@@ -58,12 +62,54 @@ async fn exec(bin: &str, args: &[String]) -> Exec {
         Err(e) => Exec::SpawnFailed(e.to_string()),
         Ok(out) => Exec::Done {
             ok: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         },
     }
 }
 
-/// Ensure `INPUT -i <iface> -j ACCEPT` exists (check-then-insert, so
+/// The exact `-S INPUT` listing line of our trust rule. Listing-parse is
+/// the ONLY presence check we trust: iptables-nft `-C` FALSE-POSITIVES
+/// once any `-i <other-iface> -j ACCEPT` rule exists in the chain
+/// (observed live on iptables v1.8.11 `nf_tables` / NixOS 25.11:
+/// `-C INPUT -i tunZZZZZ -j ACCEPT` exits 0 with only a different
+/// iface's rule installed), which silently skipped the second joiner's
+/// insert. The `-S` listing, by contrast, is canonical and truthful.
+fn accept_line(iface: &str) -> String {
+    format!("-A INPUT -i {iface} -j ACCEPT")
+}
+
+/// 1-based position of our rule among the chain's `-A INPUT` lines, for
+/// an index-based delete (`-D INPUT <n>`). Spec-based `-D` shares the
+/// broken `-C` matcher and could delete ANOTHER joiner's trust rule.
+fn find_rule_index(listing: &str, iface: &str) -> Option<usize> {
+    let needle = accept_line(iface);
+    listing
+        .lines()
+        .filter(|l| l.starts_with("-A INPUT"))
+        .position(|l| l.trim() == needle)
+        .map(|i| i + 1)
+}
+
+/// List the INPUT chain (`-S INPUT`). `None` = binary missing or listing
+/// failed (containers, unprivileged) — the best-effort failure path.
+async fn list_input(bin: &str) -> Option<String> {
+    match exec(bin, &["-S".into(), "INPUT".into()]).await {
+        Exec::Done {
+            ok: true, stdout, ..
+        } => Some(stdout),
+        Exec::Done { stderr, .. } => {
+            tracing::debug!(bin, stderr = %stderr.trim(), "firewall: list failed");
+            None
+        }
+        Exec::SpawnFailed(e) => {
+            tracing::debug!(bin, error = %e, "firewall: binary unavailable");
+            None
+        }
+    }
+}
+
+/// Ensure `INPUT -i <iface> -j ACCEPT` exists (list-then-insert, so
 /// re-running never stacks duplicates).
 ///
 /// Returns `true` when the IPv6 rule is in place — the overlay is
@@ -78,34 +124,31 @@ pub async fn ensure_tun_trust(iface: &str) -> bool {
     v6
 }
 
-/// Check-then-insert for one iptables binary. `-C` exit 0 = present;
-/// any other completion = try `-I INPUT 1`.
+/// List-then-insert for one iptables binary (NOT `-C`-then-insert — see
+/// [`accept_line`] for why `-C` cannot be trusted on iptables-nft).
 async fn ensure_one(bin: &str, iface: &str) -> bool {
+    let Some(listing) = list_input(bin).await else {
+        return false;
+    };
+    if find_rule_index(&listing, iface).is_some() {
+        return true;
+    }
+    // Absent — insert at position 1 so the rule precedes any distro
+    // REJECT chain.
     let rule = rule_args(iface);
-    let mut check: Vec<String> = vec!["-C".into(), "INPUT".into()];
-    check.extend(rule.iter().cloned());
-    match exec(bin, &check).await {
+    let mut insert: Vec<String> = vec!["-I".into(), "INPUT".into(), "1".into()];
+    insert.extend(rule.iter().cloned());
+    match exec(bin, &insert).await {
+        Exec::Done { ok: true, .. } => true,
+        Exec::Done {
+            ok: false, stderr, ..
+        } => {
+            tracing::debug!(bin, iface, stderr = %stderr.trim(), "firewall: insert failed");
+            false
+        }
         Exec::SpawnFailed(e) => {
             tracing::debug!(bin, error = %e, "firewall: binary unavailable");
             false
-        }
-        Exec::Done { ok: true, .. } => true,
-        Exec::Done { ok: false, .. } => {
-            // Absent (or unreadable) — insert at position 1 so the rule
-            // precedes any distro REJECT chain.
-            let mut insert: Vec<String> = vec!["-I".into(), "INPUT".into(), "1".into()];
-            insert.extend(rule.iter().cloned());
-            match exec(bin, &insert).await {
-                Exec::Done { ok: true, .. } => true,
-                Exec::Done { ok: false, stderr } => {
-                    tracing::debug!(bin, iface, stderr = %stderr.trim(), "firewall: insert failed");
-                    false
-                }
-                Exec::SpawnFailed(e) => {
-                    tracing::debug!(bin, error = %e, "firewall: binary unavailable");
-                    false
-                }
-            }
         }
     }
 }
@@ -113,18 +156,26 @@ async fn ensure_one(bin: &str, iface: &str) -> bool {
 /// Remove the trust rule for `iface` (both families).
 ///
 /// Idempotent and best-effort — called from `Joiner::leave`; an absent
-/// rule or missing binary is fine.
+/// rule or missing binary is fine. Deletes BY INDEX (resolved from the
+/// `-S` listing) because a spec-based `-D` shares iptables-nft's broken
+/// rule matcher and could remove another joiner's trust rule. The tiny
+/// list→delete race (a concurrent insert shifting indices) is bounded by
+/// every joiner's 60s re-assert loop, which restores any casualty.
 pub async fn remove_tun_trust(iface: &str) {
     for bin in ["ip6tables", "iptables"] {
-        let rule = rule_args(iface);
-        let mut del: Vec<String> = vec!["-D".into(), "INPUT".into()];
-        del.extend(rule.iter().cloned());
+        let Some(listing) = list_input(bin).await else {
+            continue;
+        };
+        let Some(index) = find_rule_index(&listing, iface) else {
+            continue; // never installed / already gone
+        };
+        let del: Vec<String> = vec!["-D".into(), "INPUT".into(), index.to_string()];
         match exec(bin, &del).await {
             Exec::Done { ok: true, .. } => {
                 tracing::debug!(bin, iface, "firewall: tun trust removed");
             }
             Exec::Done { .. } | Exec::SpawnFailed(_) => {
-                // Absent rule / missing binary — nothing to remove.
+                // Already gone / no privileges — nothing to remove.
             }
         }
     }
@@ -178,6 +229,28 @@ mod tests {
     fn rule_is_iface_scoped_accept() {
         let args = rule_args("tun1");
         assert_eq!(args, ["-i", "tun1", "-j", "ACCEPT"]);
+    }
+
+    /// Presence detection must work off the `-S INPUT` listing, finding
+    /// the EXACT rule and its delete index — and must NOT match a
+    /// different iface's rule (that is precisely the iptables-nft `-C`
+    /// bug this parser replaces: with `tun96…`'s rule installed,
+    /// `-C INPUT -i tun8e… -j ACCEPT` falsely reported present and the
+    /// second joiner's insert was silently skipped).
+    #[test]
+    fn listing_parse_finds_exact_rule_and_index() {
+        // Real-shape listing captured from the live NixOS host.
+        let listing = "-P INPUT ACCEPT\n\
+             -A INPUT -i tun96d514b9fa -j ACCEPT\n\
+             -A INPUT -p tcp -m tcp --dport 18080 -j ACCEPT\n\
+             -A INPUT -j nixos-fw\n";
+        assert_eq!(find_rule_index(listing, "tun96d514b9fa"), Some(1));
+        // The OTHER joiner's iface must read as ABSENT, not present.
+        assert_eq!(find_rule_index(listing, "tun8e09734b36"), None);
+        // Policy line (-P) must not shift rule indices.
+        let with_ours = format!("{listing}-A INPUT -i tun8e09734b36 -j ACCEPT\n");
+        assert_eq!(find_rule_index(&with_ours, "tun8e09734b36"), Some(4));
+        assert_eq!(accept_line("tun1"), "-A INPUT -i tun1 -j ACCEPT");
     }
 
     /// A bogus binary name must surface as `SpawnFailed`, the
