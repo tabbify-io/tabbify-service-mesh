@@ -90,7 +90,10 @@ After=network-online.target
 # ACCEPT for the mesh TUN (asserted at bring-up, re-asserted every 60s,
 # removed on exit) so distro firewalls don't drop inbound overlay
 # connections — the tailscaled pattern.
-ExecStart=$BIN join --name $NODE_NAME --manage-firewall
+# --insecure-no-mtls matches the CURRENT production coordinator (it
+# runs the plaintext control plane; the WireGuard data plane is always
+# encrypted). Drop this flag when control-plane mTLS ships.
+ExecStart=$BIN join --name $NODE_NAME --manage-firewall --insecure-no-mtls
 # HOME anchors the persistent identity ($STATE/.tabbify-mesh/keypair):
 # the same WireGuard key on every start means the same stable overlay
 # address (the coordinator's roster is keyed by public key).
