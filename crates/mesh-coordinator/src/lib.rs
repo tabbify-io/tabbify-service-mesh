@@ -31,7 +31,10 @@ pub use http::mtls::{MtlsServerConfig, build_server_config};
 pub use http::policy_api::PolicyApiState;
 pub use http::sse::PeerEvent;
 pub use nat::holepunch::{PunchPair, PunchPeer, PunchTracker, canonical_pair, try_emit_pair};
-pub use policy::{AclRule, Policy, PolicyReplaceError, PolicySnapshot, PolicyStore};
+pub use policy::{
+    AclRule, Policy, PolicyReplaceError, PolicySnapshot, PolicyStore, PolicyValidationError,
+    TAG_NET_WILDCARD, TAG_SYSTEM,
+};
 pub use publisher::{EventPublisher, NoopPublisher};
 pub use relay::RelayRegistry;
 pub use roster::allocator::{DEFAULT_NETWORK_SLOT, ULA_PREFIX_LITERAL, UlaAllocator, network_slot};

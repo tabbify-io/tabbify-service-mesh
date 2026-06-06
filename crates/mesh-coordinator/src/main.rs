@@ -60,8 +60,11 @@ struct Args {
 
     /// Path to the declarative ACL policy file (JSON, `{ "acls": [...] }`).
     /// Loaded into the in-memory store at startup. When omitted, the
-    /// coordinator starts with an empty default-deny policy that can be set
-    /// via `PUT /v1/policy`.
+    /// coordinator starts with the Phase-2 BOOTSTRAP policy — exactly two
+    /// system rules (`tag:system → tag:system` and `tag:system → tag:net-*`)
+    /// so shared infra can serve every tenant runner while distinct tenant
+    /// networks stay isolated (default-deny). Per-network self-rules are
+    /// added at runtime by the auth service via `PUT /v1/policy`.
     #[arg(long, env = "MESH_POLICY_FILE")]
     policy_file: Option<PathBuf>,
 
@@ -114,15 +117,21 @@ async fn main() -> Result<()> {
         "tabbify-mesh-coordinator starting",
     );
 
-    // Load the ACL policy from disk if configured, else start default-deny.
+    // Load the ACL policy from disk if configured, else start with the
+    // Phase-2 bootstrap policy (the two system rules — infra serves tenants,
+    // tenants stay isolated by default-deny; per-network self-rules are
+    // PUT by the auth service at runtime).
     let policy_store = if let Some(path) = &args.policy_file {
         let store =
             PolicyStore::load_from_file(path).map_err(|e| anyhow!("load policy file: {e}"))?;
         info!(path = %path.display(), "loaded ACL policy");
         store
     } else {
-        info!("no --policy-file: starting with empty default-deny policy");
-        PolicyStore::empty()
+        info!(
+            "no --policy-file: starting with the bootstrap policy \
+             (tag:system->tag:system + tag:system->tag:net-*)"
+        );
+        PolicyStore::bootstrap()
     };
 
     // Build the join-token validator from AUTH_URL, if configured. When

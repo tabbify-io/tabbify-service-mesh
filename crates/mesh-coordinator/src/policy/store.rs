@@ -11,7 +11,7 @@
 //! `GET /v1/policy` export is what gets committed to git for versioning.
 //! This module owns only the in-memory side.
 
-use crate::policy::model::Policy;
+use crate::policy::model::{Policy, PolicyValidationError};
 use parking_lot::RwLock;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ pub struct PolicyStore {
     inner: Arc<RwLock<PolicySnapshot>>,
 }
 
-/// Error returned by [`PolicyStore::replace`] on an `If-Match` mismatch.
+/// Error returned by [`PolicyStore::replace`].
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyReplaceError {
     /// The caller's `If-Match` `ETag` did not match the current version.
@@ -43,6 +43,10 @@ pub enum PolicyReplaceError {
         /// The `ETag` the caller supplied.
         provided: String,
     },
+    /// The proposed policy failed validation (e.g. a cross-tenant glob
+    /// source) and was rejected before it could be installed.
+    #[error("policy rejected: {0}")]
+    Invalid(#[from] PolicyValidationError),
 }
 
 impl PolicyStore {
@@ -56,23 +60,42 @@ impl PolicyStore {
         }
     }
 
-    /// Build a store with an empty (default-deny) policy.
+    /// Build a store with an empty (default-deny) policy. Used by tests that
+    /// focus on the roster state machine in isolation.
     #[must_use]
     pub fn empty() -> Self {
         Self::new(Policy::default())
     }
 
+    /// Build a store seeded with the Phase-2 [`Policy::bootstrap`] policy —
+    /// the coordinator's default when no `--policy-file` is supplied. It
+    /// carries exactly the two system rules (`tag:system → tag:system` and
+    /// `tag:system → tag:net-*`) so shared infra can serve every tenant
+    /// runner while distinct tenant networks stay isolated by default-deny.
+    #[must_use]
+    pub fn bootstrap() -> Self {
+        Self::new(Policy::bootstrap())
+    }
+
     /// Load a policy from a JSON file on disk. Used at startup when a
     /// policy path is configured.
     ///
+    /// The loaded policy is [`Policy::validate`]d before it is installed, so a
+    /// hand-written file that would break cross-tenant isolation (e.g. a
+    /// `tag:net-*` source) is rejected at startup instead of silently
+    /// enforced.
+    ///
     /// # Errors
-    /// Returns a human-readable error string if the file can't be read or
-    /// parsed.
+    /// Returns a human-readable error string if the file can't be read,
+    /// parsed, or fails policy validation.
     pub fn load_from_file(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("read policy file {}: {e}", path.display()))?;
         let policy: Policy = serde_json::from_str(&raw)
             .map_err(|e| format!("parse policy file {}: {e}", path.display()))?;
+        policy
+            .validate()
+            .map_err(|e| format!("invalid policy file {}: {e}", path.display()))?;
         Ok(Self::new(policy))
     }
 
@@ -99,13 +122,23 @@ impl PolicyStore {
     /// the current one. On success the version counter advances and a new
     /// `ETag` is minted; the new snapshot is returned.
     ///
+    /// The proposed policy is [`Policy::validate`]d *before* the `ETag` check,
+    /// so a policy that would break cross-tenant isolation (e.g. a `tag:net-*`
+    /// source) is rejected outright over `PUT /v1/policy` and never installed.
+    ///
     /// # Errors
-    /// [`PolicyReplaceError::EtagMismatch`] when `if_match` is stale.
+    /// - [`PolicyReplaceError::Invalid`] when the proposed policy fails
+    ///   validation.
+    /// - [`PolicyReplaceError::EtagMismatch`] when `if_match` is stale.
     pub fn replace(
         &self,
         if_match: &str,
         new_policy: Policy,
     ) -> Result<PolicySnapshot, PolicyReplaceError> {
+        // Reject an isolation-breaking policy up front, before touching the
+        // lock or the ETag — a bad payload never gets installed regardless of
+        // whether its If-Match was fresh.
+        new_policy.validate()?;
         // Derive the next `ETag` from the new content + a fresh nonce so two
         // different policies never collide, and replacing back to a prior
         // policy still advances the tag (avoids ABA confusion for clients
@@ -206,6 +239,9 @@ mod tests {
             PolicyReplaceError::EtagMismatch { provided, .. } => {
                 assert_eq!(provided, stale);
             }
+            other @ PolicyReplaceError::Invalid(_) => {
+                panic!("expected EtagMismatch, got {other:?}")
+            }
         }
         // Policy is unchanged after a rejected replace.
         assert_eq!(store.current().acls.len(), 1);
@@ -248,6 +284,93 @@ mod tests {
     fn empty_store_is_default_deny() {
         let store = PolicyStore::empty();
         assert!(store.current().acls.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_store_carries_the_two_system_rules() {
+        let store = PolicyStore::bootstrap();
+        let policy = store.current();
+        assert_eq!(policy.acls.len(), 2, "bootstrap store must have two rules");
+        // Infra serves a tenant runner; distinct tenants stay isolated.
+        let system = vec!["tag:system".to_owned()];
+        let net_x = vec!["tag:net-n_x".to_owned()];
+        let net_y = vec!["tag:net-n_y".to_owned()];
+        assert!(policy.can_see(&system, &net_x), "system serves tenant net");
+        assert!(!policy.can_see(&net_x, &net_y), "tenant nets isolated");
+    }
+
+    #[test]
+    fn load_from_file_rejects_cross_tenant_glob_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bad-policy.json");
+        std::fs::write(
+            &path,
+            r#"{ "acls": [ { "action": "accept", "src": ["tag:net-*"], "dst": ["tag:system"] } ] }"#,
+        )
+        .unwrap();
+        let err = PolicyStore::load_from_file(&path)
+            .expect_err("a tag:net-* source must be rejected at load");
+        assert!(err.contains("invalid policy file"), "got: {err}");
+        assert!(err.contains("tag:net-*"), "got: {err}");
+    }
+
+    #[test]
+    fn load_from_file_accepts_concrete_tenant_self_rule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("good-policy.json");
+        std::fs::write(
+            &path,
+            r#"{ "acls": [ { "src": ["tag:net-n_slug"], "dst": ["tag:net-n_slug"] } ] }"#,
+        )
+        .unwrap();
+        let store = PolicyStore::load_from_file(&path).expect("concrete tenant self-rule is valid");
+        assert_eq!(store.current().acls.len(), 1);
+    }
+
+    #[test]
+    fn replace_rejects_cross_tenant_glob_source() {
+        let store = PolicyStore::bootstrap();
+        let etag = store.etag();
+        let bad = Policy::new(vec![AclRule::accept(&["tag:net-*"], &["tag:system"])]);
+        let err = store
+            .replace(&etag, bad)
+            .expect_err("replace must reject a tag:net-* source");
+        assert!(
+            matches!(err, PolicyReplaceError::Invalid(_)),
+            "expected Invalid, got {err:?}"
+        );
+        // The store is unchanged: still the bootstrap two rules, same ETag.
+        assert_eq!(store.current().acls.len(), 2);
+        assert_eq!(
+            store.etag(),
+            etag,
+            "a rejected replace must not bump the ETag"
+        );
+    }
+
+    #[test]
+    fn replace_rejects_invalid_policy_even_with_fresh_etag() {
+        // Validation runs before the ETag check, so a fresh If-Match doesn't
+        // let an isolation-breaking policy through.
+        let store = PolicyStore::bootstrap();
+        let fresh = store.etag();
+        let bad = Policy::new(vec![AclRule::accept(&["*"], &["tag:system"])]);
+        assert!(matches!(
+            store.replace(&fresh, bad),
+            Err(PolicyReplaceError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn replace_still_accepts_a_valid_per_network_self_rule() {
+        let store = PolicyStore::bootstrap();
+        let etag = store.etag();
+        let mut acls = store.current().acls;
+        acls.push(AclRule::accept(&["tag:net-n_slug"], &["tag:net-n_slug"]));
+        let snap = store
+            .replace(&etag, Policy::new(acls))
+            .expect("a concrete per-network self-rule is valid");
+        assert_eq!(snap.policy.acls.len(), 3);
     }
 
     #[test]

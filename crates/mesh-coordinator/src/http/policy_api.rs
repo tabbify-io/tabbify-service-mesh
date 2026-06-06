@@ -137,6 +137,7 @@ pub async fn get_policy_handler(
         (status = 200, description = "Replaced; body carries the new policy + ETag (also in header)", body = PolicyResponse),
         (status = 401, description = "Missing / invalid admin token (or admin API disabled)", body = ApiError),
         (status = 412, description = "If-Match ETag stale; current ETag returned in header", body = ApiError),
+        (status = 422, description = "Policy rejected by validation (e.g. a cross-tenant tag:net-* source)", body = ApiError),
         (status = 428, description = "Missing If-Match header", body = ApiError),
     ),
     security(("bearer" = []))
@@ -181,5 +182,10 @@ pub async fn put_policy_handler(
             }),
         )
             .into_response(),
+        Err(e @ PolicyReplaceError::Invalid(_)) => {
+            // The payload would break tenant isolation (e.g. a tag:net-*
+            // source). Reject it as a client error; nothing was installed.
+            err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+        }
     }
 }

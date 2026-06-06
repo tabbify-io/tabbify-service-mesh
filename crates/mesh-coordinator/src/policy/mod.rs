@@ -16,5 +16,5 @@
 pub mod model;
 pub mod store;
 
-pub use model::{AclRule, Policy};
+pub use model::{AclRule, Policy, PolicyValidationError, TAG_NET_WILDCARD, TAG_SYSTEM};
 pub use store::{PolicyReplaceError, PolicySnapshot, PolicyStore};

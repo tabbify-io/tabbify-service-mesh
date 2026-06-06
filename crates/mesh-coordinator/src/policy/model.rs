@@ -34,6 +34,13 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// The `tag:net-` namespace prefix shared by every per-tenant network tag.
+///
+/// A concrete tenant tag is `tag:net-<slug>` (e.g. `tag:net-n_jpegxik72nng`).
+/// A *source* pattern that wildcards over this whole namespace
+/// (`tag:net-*`, `tag:net-n*`, …) is forbidden — see [`Policy::validate`].
+const TAG_NET_PREFIX: &str = "tag:net-";
+
 /// A single `accept` rule: every source tag may reach every destination
 /// tag. Tags support trailing-`*` prefix wildcards (and a bare `*`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -52,6 +59,21 @@ pub struct AclRule {
 fn default_action() -> String {
     "accept".to_owned()
 }
+
+/// The tag worn by shared infrastructure peers.
+///
+/// Supervisor, node, registry, auth and the coordinator all carry
+/// `tag:system`. Phase-2: infra is *never* in a tenant network — `tag:system`
+/// lets it both talk among itself and serve every tenant's runners.
+pub const TAG_SYSTEM: &str = "tag:system";
+
+/// Prefix wildcard matching every per-tenant network tag.
+///
+/// E.g. `tag:net-n_jpegxik72nng`. Used only as a *destination* in the
+/// bootstrap policy so `tag:system` can reach any tenant runner; it is
+/// deliberately **never** used as a source paired with this same destination,
+/// which would (under symmetric `can_see`) collapse cross-tenant isolation.
+pub const TAG_NET_WILDCARD: &str = "tag:net-*";
 
 impl AclRule {
     /// Convenience constructor for an `accept` rule.
@@ -88,6 +110,32 @@ impl Policy {
         Self { acls }
     }
 
+    /// The Phase-2 mesh **bootstrap** policy — the default a coordinator
+    /// starts with when no `--policy-file` is supplied. EXACTLY two rules
+    /// and nothing else:
+    ///
+    /// 1. `tag:system → tag:system` — shared infra peers (supervisor, node,
+    ///    registry, auth, coordinator) talk among themselves.
+    /// 2. `tag:system → tag:net-*` — infra can reach *any* tenant runner so
+    ///    it can serve it; being symmetric, the runner can also reach infra.
+    ///
+    /// Crucially there is **no** `tag:net-* → tag:net-*` (or `tag:net-* ↔
+    /// tag:net-*`) edge: that glob would, under the symmetric
+    /// [`Self::can_see`], let `net-A` reach `net-B` and break tenant
+    /// isolation. Per-tenant intra-network visibility comes from per-network
+    /// self-rules (`tag:net-<slug> ↔ tag:net-<slug>`) that the auth service
+    /// PUTs on network-create — NOT from the bootstrap policy.
+    ///
+    /// Default-deny + these two system rules + per-network self-rules =
+    /// isolation, while infra can still serve every tenant's FC runner.
+    #[must_use]
+    pub fn bootstrap() -> Self {
+        Self::new(vec![
+            AclRule::accept(&[TAG_SYSTEM], &[TAG_SYSTEM]),
+            AclRule::accept(&[TAG_SYSTEM], &[TAG_NET_WILDCARD]),
+        ])
+    }
+
     /// Does some `accept` rule have a source matching any of `src_tags`
     /// **and** a destination matching any of `dst_tags`? This is the raw
     /// directional check; [`Self::can_see`] symmetrises it.
@@ -109,6 +157,83 @@ impl Policy {
     pub fn can_see(&self, a_tags: &[String], b_tags: &[String]) -> bool {
         self.allows_directed(a_tags, b_tags) || self.allows_directed(b_tags, a_tags)
     }
+
+    /// Reject policies that would collapse cross-tenant isolation.
+    ///
+    /// [`Self::can_see`] is **symmetric**, so a single rule whose *source*
+    /// wildcards over the whole `tag:net-` namespace (e.g. `tag:net-*`) would
+    /// let any tenant network reach any other — the exact failure mode the
+    /// Phase-2 bootstrap policy is built to avoid. The wildcard is legal as a
+    /// *destination* (the bootstrap `tag:system → tag:net-*` rule lets shared
+    /// infra serve every tenant), but never as a *source*.
+    ///
+    /// A concrete single-tenant source such as `tag:net-n_jpegxik72nng` (no
+    /// trailing `*`) is fine — that is exactly the per-network self-rule the
+    /// auth service PUTs on network-create.
+    ///
+    /// Called at every boundary that admits an externally-authored policy
+    /// (file load + runtime `PUT /v1/policy`), so a misconfiguration that
+    /// would break tenant isolation is rejected up front rather than silently
+    /// enforced.
+    ///
+    /// # Errors
+    /// [`PolicyValidationError::CrossTenantGlobSource`] if any `accept` rule
+    /// carries a source pattern that wildcards over the `tag:net-` namespace.
+    pub fn validate(&self) -> Result<(), PolicyValidationError> {
+        for rule in &self.acls {
+            if let Some(pattern) = rule.src.iter().find(|s| is_cross_tenant_glob_source(s)) {
+                return Err(PolicyValidationError::CrossTenantGlobSource {
+                    pattern: pattern.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A source pattern is a forbidden cross-tenant glob when it would match
+/// **more than one** tenant network. That is any prefix wildcard whose prefix
+/// is at or above the `tag:net-` namespace boundary:
+///
+/// - a bare `*` (matches every tenant — and everything else),
+/// - `tag:net-*` / `tag:net-n*` / any `tag:net-…*` (matches a slice of the
+///   namespace spanning multiple tenants),
+/// - any wildcard whose prefix is itself a prefix of `tag:net-`
+///   (e.g. `tag:ne*`, `tag:*`), which would also sweep the whole namespace.
+///
+/// A non-wildcard tag (`tag:net-n_slug`) matches exactly one tenant and is
+/// allowed; so is any wildcard that cannot reach into the `tag:net-`
+/// namespace (e.g. `tag:user-*`).
+fn is_cross_tenant_glob_source(pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let Some(prefix) = pattern.strip_suffix('*') else {
+        // Not a wildcard: an exact tag matches a single tenant at most.
+        return false;
+    };
+    // The wildcard sweeps multiple tenants iff its prefix sits at or above the
+    // `tag:net-` boundary, i.e. `tag:net-` starts with the prefix
+    // (`tag:ne*`, `tag:net-*`) OR the prefix reaches into the namespace
+    // (`tag:net-n*` has prefix `tag:net-n`, which starts with `tag:net-`).
+    TAG_NET_PREFIX.starts_with(prefix) || prefix.starts_with(TAG_NET_PREFIX)
+}
+
+/// Error returned by [`Policy::validate`] when a policy would break
+/// cross-tenant isolation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PolicyValidationError {
+    /// An `accept` rule carries a source pattern that wildcards over the
+    /// `tag:net-` namespace, which — under the symmetric [`Policy::can_see`] —
+    /// would let distinct tenant networks reach each other.
+    #[error(
+        "cross-tenant glob '{pattern}' as a policy source is forbidden: it would let \
+         distinct tenant networks see each other (tag:net-* is allowed only as a destination)"
+    )]
+    CrossTenantGlobSource {
+        /// The offending source pattern.
+        pattern: String,
+    },
 }
 
 /// Does any pattern in `patterns` match the node carrying `tags`?
@@ -144,126 +269,5 @@ fn tag_matches(pattern: &str, tag: &str) -> bool {
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
-mod tests {
-    use super::*;
-
-    fn tags(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    /// An explicit same-tag rule lets two nodes carrying that tag see each
-    /// other.
-    #[test]
-    fn same_tag_allow() {
-        let policy = Policy::new(vec![AclRule::accept(
-            &["tag:user-alice"],
-            &["tag:user-alice"],
-        )]);
-        assert!(policy.can_see(&tags(&["tag:user-alice"]), &tags(&["tag:user-alice"])));
-    }
-
-    /// Default-deny: an empty policy denies every pair.
-    #[test]
-    fn default_deny_empty_policy() {
-        let policy = Policy::default();
-        assert!(!policy.can_see(&tags(&["tag:user-alice"]), &tags(&["tag:user-alice"])));
-        assert!(!policy.can_see(&tags(&["tag:user-alice"]), &tags(&["tag:svc"])));
-    }
-
-    /// Two distinct user groups with no connecting edge cannot see each
-    /// other (implicit deny = private networks).
-    #[test]
-    fn distinct_user_groups_denied() {
-        let policy = Policy::new(vec![
-            AclRule::accept(&["tag:user-alice"], &["tag:user-alice"]),
-            AclRule::accept(&["tag:user-bob"], &["tag:user-bob"]),
-        ]);
-        assert!(!policy.can_see(&tags(&["tag:user-alice"]), &tags(&["tag:user-bob"])));
-        // ...but each can still see its own group.
-        assert!(policy.can_see(&tags(&["tag:user-alice"]), &tags(&["tag:user-alice"])));
-        assert!(policy.can_see(&tags(&["tag:user-bob"]), &tags(&["tag:user-bob"])));
-    }
-
-    /// A `user-* → svc` rule grants visibility from any user to the shared
-    /// service pool — and, being symmetric, from svc back to the user.
-    #[test]
-    fn wildcard_src_to_service() {
-        let policy = Policy::new(vec![AclRule::accept(&["tag:user-*"], &["tag:svc"])]);
-        assert!(policy.can_see(&tags(&["tag:user-alice"]), &tags(&["tag:svc"])));
-        assert!(policy.can_see(&tags(&["tag:user-bob"]), &tags(&["tag:svc"])));
-        // Symmetric: the edge is user→svc, but svc→user is also visible.
-        assert!(policy.can_see(&tags(&["tag:svc"]), &tags(&["tag:user-alice"])));
-    }
-
-    /// The symmetric check fires even when the matching edge is the
-    /// reverse of the queried direction.
-    #[test]
-    fn symmetric_reverse_direction() {
-        // Only a user→svc rule exists.
-        let policy = Policy::new(vec![AclRule::accept(&["tag:user-*"], &["tag:svc"])]);
-        // Query svc-first (b→a is the edge direction).
-        assert!(policy.can_see(&tags(&["tag:svc"]), &tags(&["tag:user-carol"])));
-    }
-
-    /// A bare `*` destination matches any tag.
-    #[test]
-    fn bare_star_matches_anything() {
-        let policy = Policy::new(vec![AclRule::accept(&["tag:admin"], &["*"])]);
-        assert!(policy.can_see(&tags(&["tag:admin"]), &tags(&["tag:whatever"])));
-        assert!(policy.can_see(&tags(&["tag:literally-anything"]), &tags(&["tag:admin"])));
-    }
-
-    /// Wildcard does NOT over-match: `tag:user-*` must not match
-    /// `tag:userspace` style false-prefix only when it genuinely shares the
-    /// prefix. (Prefix semantics are intentional; this documents them.)
-    #[test]
-    fn wildcard_is_prefix_not_substring() {
-        let policy = Policy::new(vec![AclRule::accept(&["tag:user-*"], &["tag:svc"])]);
-        // `tag:admin-user` does NOT start with `tag:user-`.
-        assert!(!policy.can_see(&tags(&["tag:admin-user"]), &tags(&["tag:svc"])));
-    }
-
-    /// A node with no tags at all is denied under any non-wildcard policy.
-    #[test]
-    fn untagged_node_denied() {
-        let policy = Policy::new(vec![AclRule::accept(&["tag:user-*"], &["tag:svc"])]);
-        assert!(!policy.can_see(&tags(&[]), &tags(&["tag:svc"])));
-    }
-
-    /// A non-`accept` action does not grant visibility.
-    #[test]
-    fn non_accept_action_denied() {
-        let policy = Policy::new(vec![AclRule {
-            action: "deny".to_owned(),
-            src: tags(&["tag:user-alice"]),
-            dst: tags(&["tag:user-alice"]),
-        }]);
-        assert!(!policy.can_see(&tags(&["tag:user-alice"]), &tags(&["tag:user-alice"])));
-    }
-
-    /// JSON round-trips through the HuJSON-style `{ "acls": [...] }` shape.
-    #[test]
-    fn json_round_trip() {
-        let json = r#"{
-            "acls": [
-                { "action": "accept", "src": ["tag:user-*"], "dst": ["tag:svc"] }
-            ]
-        }"#;
-        let policy: Policy = serde_json::from_str(json).expect("parse");
-        assert_eq!(policy.acls.len(), 1);
-        assert!(policy.can_see(&tags(&["tag:user-z"]), &tags(&["tag:svc"])));
-        // Re-serialize and re-parse for fidelity.
-        let s = serde_json::to_string(&policy).expect("serialize");
-        let again: Policy = serde_json::from_str(&s).expect("reparse");
-        assert_eq!(policy, again);
-    }
-
-    /// `action` defaults to `accept` when omitted in the JSON.
-    #[test]
-    fn action_defaults_to_accept() {
-        let json = r#"{ "acls": [ { "src": ["tag:a"], "dst": ["tag:a"] } ] }"#;
-        let policy: Policy = serde_json::from_str(json).expect("parse");
-        assert_eq!(policy.acls[0].action, "accept");
-        assert!(policy.can_see(&tags(&["tag:a"]), &tags(&["tag:a"])));
-    }
-}
+#[path = "model_tests.rs"]
+mod tests;

@@ -371,6 +371,76 @@ async fn put_policy_enforces_etag_concurrency() {
 }
 
 #[tokio::test]
+async fn put_policy_rejects_cross_tenant_glob_source() {
+    // A wire-level PUT carrying a `tag:net-*` SOURCE would collapse tenant
+    // isolation under the symmetric can_see; the coordinator must reject it
+    // (422) and leave the installed policy untouched.
+    let (addr, _s) = spawn(Policy::default(), Some(ADMIN_TOKEN.to_owned())).await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let get = client
+        .get(format!("{base}/v1/policy"))
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .send()
+        .await
+        .expect("get");
+    let etag = get
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = client
+        .put(format!("{base}/v1/policy"))
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("if-match", &etag)
+        .json(&serde_json::json!({
+            "acls": [
+                { "action": "accept", "src": ["tag:net-*"], "dst": ["tag:system"] }
+            ]
+        }))
+        .send()
+        .await
+        .expect("put net-* source");
+    assert_eq!(
+        resp.status(),
+        422,
+        "a tag:net-* source must be rejected with 422"
+    );
+    let body: Value = resp.json().await.expect("json");
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error string")
+            .contains("tag:net-*"),
+        "error must name the offending pattern: {body}"
+    );
+
+    // The stored policy is unchanged: the ETag still matches the original, so
+    // nothing was installed.
+    let again = client
+        .get(format!("{base}/v1/policy"))
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .send()
+        .await
+        .expect("get again");
+    let etag_after = again
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        etag_after, etag,
+        "a rejected PUT must not change the policy"
+    );
+}
+
+#[tokio::test]
 async fn put_policy_requires_admin_token() {
     let (addr, _s) = spawn(Policy::default(), Some(ADMIN_TOKEN.to_owned())).await;
     let base = format!("http://{addr}");
