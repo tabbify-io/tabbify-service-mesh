@@ -41,6 +41,22 @@ fn req(seed: u8, name: &str) -> RegisterRequest {
     }
 }
 
+/// A passive registration: NO self-reported `listen_endpoint`. This is what
+/// a real NAT-bound joiner sends — it omits `listen_endpoint` entirely and
+/// relies on the coordinator to synthesize a reflexive endpoint from the
+/// observed public source IP + the reported `wg_listen_port` (see
+/// `mesh-joiner::joiner`, which only sends a `listen_endpoint` when the
+/// operator passes an explicit `--advertise-endpoint`). Tests that exercise
+/// the reflexive-discovery / hole-punch path MUST use this, not `req()` —
+/// a self-reported address (even loopback) is now treated as an explicit
+/// operator advertise and is honored verbatim + sticky.
+fn passive_req(seed: u8, name: &str) -> RegisterRequest {
+    RegisterRequest {
+        listen_endpoint: None,
+        ..req(seed, name)
+    }
+}
+
 #[tokio::test]
 async fn register_assigns_sequential_ulas() {
     let c = coordinator();
@@ -430,8 +446,11 @@ fn coordinator_with(publisher: StdArc<CapturingPublisher>) -> Coordinator {
 async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
     let pub_ = StdArc::new(CapturingPublisher::new());
     let c = coordinator_with(pub_.clone());
-    let (alice, _) = c.register(req(40, "alice")).await.expect("a");
-    let (bob, _) = c.register(req(41, "bob")).await.expect("b");
+    // Passive registrations (no self-report) so the stored endpoint is
+    // synthesized reflexively from the heartbeat source — the real NAT-peer
+    // path the hole-punch logic targets.
+    let (alice, _) = c.register(passive_req(40, "alice")).await.expect("a");
+    let (bob, _) = c.register(passive_req(41, "bob")).await.expect("b");
 
     // First heartbeats — neither peer has been seen yet, so each
     // populates its own observed_external. After the first heartbeat
@@ -521,8 +540,10 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
 async fn heartbeat_broadcasts_holepunch_pair_to_sse_subscribers() {
     let pub_ = StdArc::new(CapturingPublisher::new());
     let c = coordinator_with(pub_.clone());
-    let (alice, _) = c.register(req(70, "alice")).await.expect("a");
-    let (bob, _) = c.register(req(71, "bob")).await.expect("b");
+    // Passive registrations (no self-report) so each peer's stored endpoint
+    // is the reflexive value synthesized from its heartbeat source IP.
+    let (alice, _) = c.register(passive_req(70, "alice")).await.expect("a");
+    let (bob, _) = c.register(passive_req(71, "bob")).await.expect("b");
 
     // Subscribe AFTER register so the channel only carries the
     // heartbeat-time frames we care about.
@@ -782,26 +803,27 @@ async fn relay_only_register_advertises_no_listen_endpoint() {
 // These drive `register_authenticated` / `heartbeat` with a synthetic
 // PUBLIC observed `SocketAddr` (what the HTTP handler reads off
 // `ConnectInfo` in production) and assert the coordinator STORES the
-// reflexive `<observed-public-ip>:<wg-port>` endpoint, not the
-// joiner's loopback self-report. The pure decision table is covered in
-// `crate::nat::reflexive::tests`; this is the roster-integration wiring.
+// reflexive `<observed-public-ip>:<wg-port>` endpoint for a PASSIVE peer
+// (one that sent NO self-report — the real NAT-peer path). The pure
+// decision table is covered in `crate::nat::reflexive::tests`; this is the
+// roster-integration wiring.
 // -----------------------------------------------------------------
 
-/// A joiner behind NAT self-reports `127.0.0.1:<port>` but the
-/// coordinator observes a PUBLIC source IP. The stored
-/// `listen_endpoint` must be the reflexive `<public-ip>:<wg-port>`.
+/// A passive joiner behind NAT sends NO `listen_endpoint`, but the
+/// coordinator observes a PUBLIC source IP. The stored `listen_endpoint`
+/// must be the reflexive `<public-ip>:<wg-port>`.
 #[tokio::test]
 async fn register_stores_reflexive_endpoint_for_natted_peer() {
     let c = coordinator();
-    // req() self-reports 127.0.0.1:51820 with wg_listen_port 51820.
+    // passive_req() sends no self-report; wg_listen_port is 51820.
     let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
     let (entry, outcome) = c
-        .register_authenticated(req(1, "natted"), None, Some(observed))
+        .register_authenticated(passive_req(1, "natted"), None, Some(observed))
         .await
         .expect("register");
     assert_eq!(outcome, RegisterOutcome::Created);
     // Reflexive: observed public IP + REPORTED wg port (51820), NOT the
-    // HTTP source port 34812 and NOT the loopback self-report.
+    // HTTP source port 34812.
     assert_eq!(entry.listen_endpoint.as_deref(), Some("203.0.113.7:51820"));
     // The observed external (full sockaddr) is seeded for hole-punch.
     assert_eq!(entry.observed_external, "203.0.113.7:34812");
@@ -845,10 +867,13 @@ async fn register_preserves_public_self_report_over_reflexive() {
     );
 }
 
-/// Same-host smoke test: coordinator observes a loopback / private
-/// source (it's on the same machine), so there's nothing public to
-/// advertise — the loopback self-report is kept verbatim. This is the
-/// back-compat path that keeps local two-peer runs working.
+/// Same-host smoke test: a peer explicitly advertises a loopback endpoint
+/// (`req()` self-reports `127.0.0.1:51820`) and the coordinator observes a
+/// loopback source. The explicit self-report is honored verbatim — this is
+/// the local two-peer back-compat path. (An explicit self-report is now
+/// authoritative regardless of being private; a passive peer with a private
+/// observed IP would instead stay endpoint-less — see
+/// `crate::nat::reflexive::tests::private_observed_ip_no_self_report_stays_passive`.)
 #[tokio::test]
 async fn register_keeps_loopback_when_observed_is_private() {
     let c = coordinator();
@@ -866,8 +891,9 @@ async fn register_keeps_loopback_when_observed_is_private() {
 async fn heartbeat_rolls_reflexive_endpoint_over_on_ip_change() {
     let c = coordinator();
     let observed1: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
+    // Passive peer: its endpoint is reflexive, hence eligible to roam.
     let (entry, _) = c
-        .register_authenticated(req(4, "roamer"), None, Some(observed1))
+        .register_authenticated(passive_req(4, "roamer"), None, Some(observed1))
         .await
         .expect("register");
     assert_eq!(entry.listen_endpoint.as_deref(), Some("203.0.113.7:51820"));
@@ -936,20 +962,20 @@ async fn heartbeat_preserves_public_advertised_endpoint() {
     );
 }
 
-/// A peer whose stored endpoint is a non-reflexive LOOPBACK fallback
-/// (e.g. registered before connect-info was available) must still be
-/// able to roll over to a reflexive public endpoint on a heartbeat
-/// that reveals a public source IP — loopback is a fallback, not a
-/// sticky operator advertisement.
+/// A PASSIVE peer (no self-report) that registered before its public
+/// source was observed has NO stored endpoint yet; its first heartbeat
+/// from a public source IP must synthesize the reflexive endpoint. This is
+/// the real NAT-peer bring-up path — a peer with no explicit advertise
+/// relies entirely on reflexive discovery.
 #[tokio::test]
-async fn heartbeat_promotes_loopback_fallback_to_reflexive() {
+async fn heartbeat_synthesizes_reflexive_for_passive_peer() {
     let c = coordinator();
-    // Register with NO observed addr → loopback self-report kept,
+    // Passive register with NO observed addr → no endpoint stored yet,
     // endpoint_is_reflexive == false.
-    let (entry, _) = c.register(req(8, "late")).await.expect("register");
-    assert_eq!(entry.listen_endpoint.as_deref(), Some("127.0.0.1:51820"));
+    let (entry, _) = c.register(passive_req(8, "late")).await.expect("register");
+    assert_eq!(entry.listen_endpoint.as_deref(), None);
     assert!(!entry.endpoint_is_reflexive);
-    // Heartbeat from a public IP → must promote to reflexive.
+    // Heartbeat from a public IP → must synthesize the reflexive endpoint.
     let updated = c
         .heartbeat(
             entry.peer_id,
@@ -968,19 +994,20 @@ async fn heartbeat_promotes_loopback_fallback_to_reflexive() {
     assert!(updated.endpoint_is_reflexive);
 }
 
-/// Re-register from behind NAT must refresh (not regress) the reflexive
-/// endpoint: the idempotent re-register path stores the reflexive
-/// endpoint, not the loopback self-report.
+/// Re-register of a PASSIVE peer from behind NAT must refresh (not regress)
+/// the reflexive endpoint: the idempotent re-register path, once it sees a
+/// public observed addr, stores the reflexive endpoint.
 #[tokio::test]
 async fn re_register_refreshes_reflexive_endpoint() {
     let c = coordinator();
-    // First register with NO observed (e.g. early bring-up) → loopback.
-    let (first, _) = c.register(req(6, "peer")).await.expect("first");
-    assert_eq!(first.listen_endpoint.as_deref(), Some("127.0.0.1:51820"));
+    // First passive register with NO observed (e.g. early bring-up) → no
+    // endpoint stored yet.
+    let (first, _) = c.register(passive_req(6, "peer")).await.expect("first");
+    assert_eq!(first.listen_endpoint.as_deref(), None);
     // Re-register (same pubkey) WITH a public observed addr → reflexive.
     let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
     let (second, outcome) = c
-        .register_authenticated(req(6, "peer"), None, Some(observed))
+        .register_authenticated(passive_req(6, "peer"), None, Some(observed))
         .await
         .expect("re-register");
     assert_eq!(outcome, RegisterOutcome::Existed);

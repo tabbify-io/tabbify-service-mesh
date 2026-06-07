@@ -130,10 +130,14 @@ pub struct ResolvedEndpoint {
 ///
 /// Decision table (first match wins):
 ///
-/// 1. The self-reported endpoint already parses to a **public** routable
-///    address, OR is a non-IP-literal hostname → keep it (NOT reflexive).
-///    The operator (or a public host) knows best; we must not clobber an
-///    explicit `--advertise-endpoint`.
+/// 1. ANY non-empty self-reported endpoint → keep it verbatim (NOT
+///    reflexive). The joiner only sends a `listen_endpoint` when the
+///    operator passed `--advertise-endpoint` (otherwise it sends none and
+///    relies on reflexive discovery), so any value here is authoritative —
+///    a **public** port-forward, a **private/LAN** literal for same-LAN
+///    direct dialing, or a **hostname** resolved by the consuming peer. We
+///    must not clobber an explicit `--advertise-endpoint`. A private
+///    advertise unreachable by a cross-network peer just falls back to relay.
 /// 2. We have a **public** observed IP **and** a reported WG port →
 ///    return the reflexive `<observed-public-ip>:<wg_port>` (reflexive).
 ///    This is the NAT-traversal happy path for cone / port-preserving NAT.
@@ -167,26 +171,31 @@ pub fn resolve_listen_endpoint(
 
     let self_reported = self_reported.filter(|s| !s.is_empty());
 
-    // (1) A self-reported PUBLIC endpoint (or hostname) is authoritative.
+    // (1) An EXPLICIT self-reported endpoint is authoritative — public OR
+    // private. The joiner only ever sends a `listen_endpoint` when the
+    // operator passed `--advertise-endpoint` (it sends NONE otherwise and
+    // relies on reflexive discovery; see `mesh-joiner::joiner`). So any value
+    // arriving here is a deliberate "dial me here" and we honor it verbatim:
+    //
+    //   * A PRIVATE / LAN literal (e.g. `10.17.21.183:51820`) lets two peers
+    //     on the same LAN dial each other's LAN address directly instead of
+    //     hairpinning through the shared public reflexive IP. A cross-network
+    //     peer that can't reach it simply falls back to relay (the joiner
+    //     relays until a direct path is data-confirmed), so honoring a private
+    //     advertise never causes an outage.
+    //   * A PUBLIC literal is the operator's port-forward — also authoritative.
+    //   * A hostname (not a socket literal, e.g. `host.lima.internal:51820`)
+    //     we can't classify — trust it verbatim; the consuming peer resolves
+    //     the name in its own environment (see
+    //     `mesh-joiner::coordinator::client::remote_to_info`).
+    //
+    // In every case it is NOT reflexive (it must stay sticky across
+    // heartbeats — see `is_sticky_explicit_endpoint`).
     if let Some(reported) = self_reported {
-        if let Ok(addr) = reported.parse::<SocketAddr>() {
-            if is_public(addr.ip()) {
-                return ResolvedEndpoint {
-                    endpoint: Some(reported.to_owned()),
-                    reflexive: false,
-                };
-            }
-        } else {
-            // A non-socket-literal (e.g. `host.lima.internal:51820`) is an
-            // explicit operator advertisement we can't classify as
-            // public/private — trust it verbatim. The consuming peer
-            // resolves the name in its own environment (see
-            // `mesh-joiner::coordinator::client::remote_to_info`).
-            return ResolvedEndpoint {
-                endpoint: Some(reported.to_owned()),
-                reflexive: false,
-            };
-        }
+        return ResolvedEndpoint {
+            endpoint: Some(reported.to_owned()),
+            reflexive: false,
+        };
     }
 
     // (2) Reflexive happy path: public observed IP + reported WG port.
@@ -215,23 +224,31 @@ pub fn reflexive_endpoint(ip: IpAddr, wg_port: u16) -> String {
 
 /// `true` when `endpoint` must be STICKY across heartbeats.
 ///
-/// An operator-chosen advertisement — a public IP literal, or a hostname
-/// (anything not parseable as a socket addr, resolved by the consuming
-/// peer) — must never be auto-rolled to a reflexive value, so it is
-/// sticky.
+/// ANY explicit operator advertisement is sticky and must never be
+/// auto-rolled to a reflexive value:
 ///
-/// A loopback / private IP literal returns `false`: it is a same-host
-/// fallback, not a real advertisement, so it stays eligible for reflexive
-/// rollover. This lets the heartbeat decision be independent of whether
-/// the first register carried the observed source addr.
+///   * a socket literal — public (`203.0.113.50:51820`) OR private
+///     (`10.17.21.183:51820`). A stored socket literal can only originate
+///     from an operator's `--advertise-endpoint`: the joiner never
+///     auto-reports its bind address, and a coordinator-synthesized
+///     reflexive value is tracked separately via
+///     `PeerEntry::endpoint_is_reflexive` (so it never reaches this
+///     function). A private literal is therefore a deliberate same-LAN
+///     advertisement, not a fallback — keeping it sticky lets two peers on
+///     the same LAN go direct without a later reflexive heartbeat clobbering
+///     the LAN address with the shared public reflexive IP.
+///   * a hostname (anything not parseable as a socket addr, resolved by the
+///     consuming peer).
+///
+/// Hence this is unconditionally `true` for any non-empty endpoint string.
+/// It is retained as a named predicate at the call site (the heartbeat
+/// rollover guard) for legibility and to localize the "what counts as a
+/// sticky advertisement" decision.
 #[must_use]
-pub fn is_sticky_explicit_endpoint(endpoint: &str) -> bool {
-    endpoint.parse::<SocketAddr>().map_or(
-        // Not a socket literal → treat as a hostname advertisement: sticky.
-        true,
-        // A socket literal is sticky only if its IP is public.
-        |addr| is_public(addr.ip()),
-    )
+pub const fn is_sticky_explicit_endpoint(_endpoint: &str) -> bool {
+    // Both a socket literal (public or private) and a hostname are explicit
+    // operator advertisements → always sticky.
+    true
 }
 
 #[cfg(test)]
@@ -289,40 +306,70 @@ mod tests {
 
     // ---- resolve_listen_endpoint decision table ----
 
-    /// (2) The headline NAT case: joiner self-reports a loopback endpoint
-    /// (its own bound `0.0.0.0`-derived guess), but the coordinator sees a
-    /// public source IP. We must advertise the reflexive
-    /// `<public-ip>:<wg-port>`, NOT the useless loopback — and flag it
-    /// reflexive so heartbeats roam it.
+    /// (1) An explicit loopback self-report is honored verbatim. The joiner
+    /// only sends a `listen_endpoint` when the operator passed an explicit
+    /// `--advertise-endpoint`; it NEVER auto-advertises its bound loopback
+    /// address (see `mesh-joiner::joiner` — it sends `None` otherwise). So a
+    /// self-reported `127.0.0.1:<port>` here is an operator's deliberate
+    /// same-host advertisement and must be kept, not replaced by a reflexive
+    /// public endpoint. (Passive NAT peers — which DON'T self-report — still
+    /// get the reflexive happy path; see `passive_peer_with_public_observed`.)
     #[test]
-    fn loopback_self_report_becomes_reflexive_public() {
+    fn explicit_loopback_self_report_is_honored_verbatim() {
         let got = resolve_listen_endpoint(
             Some("127.0.0.1:49046"),
             Some(sock("203.0.113.7:34812")), // observed: public IP, unrelated TCP port
             Some(51820),                     // reported WG UDP port
             false,
         );
-        // Reflexive endpoint pairs the OBSERVED IP with the REPORTED WG
-        // port — NOT the HTTP source port 34812.
-        assert_eq!(got.endpoint.as_deref(), Some("203.0.113.7:51820"));
+        assert_eq!(
+            got.endpoint.as_deref(),
+            Some("127.0.0.1:49046"),
+            "explicit self-report (operator-set advertise) is honored verbatim"
+        );
         assert!(
-            got.reflexive,
-            "loopback→reflexive must be flagged reflexive"
+            !got.reflexive,
+            "explicit advertise is sticky, never flagged reflexive"
         );
     }
 
-    /// A LAN self-report (private 192.168) is likewise replaced by the
-    /// reflexive public endpoint.
+    /// (1) An EXPLICIT private/LAN self-report is an operator-set
+    /// `--advertise-endpoint` (the joiner only ever sends a `listen_endpoint`
+    /// when the operator passes one — see `mesh-joiner::joiner` and
+    /// `ReregisterInputs::advertise_endpoint`). It must be honored verbatim,
+    /// even though it's private, so two peers on the same LAN can dial each
+    /// other's LAN address directly (no hairpin through the shared public IP).
+    /// A cross-network peer that can't reach it simply falls back to relay.
     #[test]
-    fn private_lan_self_report_becomes_reflexive_public() {
+    fn private_lan_self_report_is_honored_verbatim() {
+        let got = resolve_listen_endpoint(
+            Some("10.17.21.183:51820"),
+            Some(sock("146.255.233.163:34812")), // shared public reflexive IP
+            Some(51820),
+            false,
+        );
+        assert_eq!(
+            got.endpoint.as_deref(),
+            Some("10.17.21.183:51820"),
+            "explicit private advertise must be honored, not replaced by reflexive"
+        );
+        assert!(
+            !got.reflexive,
+            "explicit private advertise is sticky, not reflexive"
+        );
+    }
+
+    /// A 192.168 explicit advertise is likewise honored verbatim.
+    #[test]
+    fn private_192_self_report_is_honored_verbatim() {
         let got = resolve_listen_endpoint(
             Some("192.168.1.42:51820"),
             Some(sock("198.51.100.9:5555")),
             Some(51820),
             false,
         );
-        assert_eq!(got.endpoint.as_deref(), Some("198.51.100.9:51820"));
-        assert!(got.reflexive);
+        assert_eq!(got.endpoint.as_deref(), Some("192.168.1.42:51820"));
+        assert!(!got.reflexive);
     }
 
     /// (1) A self-reported PUBLIC endpoint must be preserved (and NOT
@@ -356,44 +403,36 @@ mod tests {
         assert!(!got.reflexive);
     }
 
-    /// No WG port reported (older joiner) → we can't synthesize a
-    /// reflexive endpoint, so the loopback self-report is kept as-is. This
-    /// is the back-compat path: an old joiner behaves exactly as before.
+    /// No WG port reported (older joiner) + no self-report → we can't
+    /// synthesize a reflexive endpoint, so a passive peer stays passive
+    /// (`None`). Back-compat: an old joiner that doesn't report a port and
+    /// doesn't advertise gets no direct endpoint. (When the peer DOES
+    /// self-report, branch (1) honors it verbatim — covered separately.)
     #[test]
-    fn no_wg_port_keeps_self_report() {
-        let got = resolve_listen_endpoint(
-            Some("127.0.0.1:49046"),
-            Some(sock("203.0.113.7:34812")),
-            None,
-            false,
-        );
-        assert_eq!(got.endpoint.as_deref(), Some("127.0.0.1:49046"));
+    fn no_wg_port_no_self_report_stays_passive() {
+        let got = resolve_listen_endpoint(None, Some(sock("203.0.113.7:34812")), None, false);
+        assert_eq!(got.endpoint, None);
         assert!(!got.reflexive);
     }
 
-    /// No observed addr (test router without connect-info) → keep the
-    /// self-report. Mirrors the production fallback when the source addr
-    /// is somehow unavailable.
+    /// No observed addr (test router without connect-info) + no self-report →
+    /// nothing to synthesize, so the passive peer stays `None`. Mirrors the
+    /// production fallback when the source addr is somehow unavailable.
     #[test]
-    fn no_observed_addr_keeps_self_report() {
-        let got = resolve_listen_endpoint(Some("127.0.0.1:49046"), None, Some(51820), false);
-        assert_eq!(got.endpoint.as_deref(), Some("127.0.0.1:49046"));
+    fn no_observed_addr_no_self_report_stays_passive() {
+        let got = resolve_listen_endpoint(None, None, Some(51820), false);
+        assert_eq!(got.endpoint, None);
         assert!(!got.reflexive);
     }
 
-    /// Observed IP is itself private (coordinator + joiner on the same LAN,
-    /// e.g. local smoke test) → we have nothing public to offer, so keep
-    /// the self-report rather than advertising a private observed IP that
-    /// might still be unreachable for a third peer.
+    /// Observed IP is itself private (coordinator + passive joiner on the
+    /// same LAN, e.g. local smoke test) → we have nothing PUBLIC to offer
+    /// and the peer didn't self-report, so the reflexive happy path (which
+    /// requires a public observed IP) does not fire → stays passive.
     #[test]
-    fn private_observed_ip_keeps_self_report() {
-        let got = resolve_listen_endpoint(
-            Some("127.0.0.1:49046"),
-            Some(sock("10.0.0.5:5555")),
-            Some(51820),
-            false,
-        );
-        assert_eq!(got.endpoint.as_deref(), Some("127.0.0.1:49046"));
+    fn private_observed_ip_no_self_report_stays_passive() {
+        let got = resolve_listen_endpoint(None, Some(sock("10.0.0.5:5555")), Some(51820), false);
+        assert_eq!(got.endpoint, None);
         assert!(!got.reflexive);
     }
 
@@ -421,16 +460,22 @@ mod tests {
         );
     }
 
-    /// Stickiness classification: public IP + hostname are sticky;
-    /// loopback / private literals are not (eligible for reflexive roam).
+    /// Stickiness classification: ANY explicit advertise is sticky — public
+    /// IP, hostname, OR a private/loopback literal. A stored socket literal
+    /// can only originate from an operator's `--advertise-endpoint` (the
+    /// joiner never auto-reports a bind address, and a reflexive value is
+    /// tracked separately via `endpoint_is_reflexive`), so a private literal
+    /// is a deliberate same-LAN advertisement and must not be clobbered by a
+    /// later reflexive heartbeat.
     #[test]
     fn sticky_explicit_classification() {
         assert!(is_sticky_explicit_endpoint("203.0.113.50:51820")); // public IP
         assert!(is_sticky_explicit_endpoint("host.lima.internal:51820")); // hostname
         assert!(is_sticky_explicit_endpoint("[2001:db8::1]:51820")); // public v6
-        assert!(!is_sticky_explicit_endpoint("127.0.0.1:51820")); // loopback fallback
-        assert!(!is_sticky_explicit_endpoint("192.168.1.5:51820")); // LAN fallback
-        assert!(!is_sticky_explicit_endpoint("10.0.0.1:51820")); // private fallback
+        assert!(is_sticky_explicit_endpoint("127.0.0.1:51820")); // loopback advertise
+        assert!(is_sticky_explicit_endpoint("192.168.1.5:51820")); // LAN advertise
+        assert!(is_sticky_explicit_endpoint("10.0.0.1:51820")); // private advertise
+        assert!(is_sticky_explicit_endpoint("10.0.0.5:51820")); // private advertise
     }
 
     // ---- relay-only suppression (Fix D) ----
