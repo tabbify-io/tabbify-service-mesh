@@ -91,6 +91,20 @@ impl PeerSession {
         self.direct_confirmed.load(Ordering::Relaxed)
     }
 
+    /// Live path snapshot for diagnostics / heartbeat reporting:
+    /// `(direct_confirmed, age_micros)` where `age_micros = now_micros -
+    /// last_direct_rx_micros`. The connectivity-visibility feature reports
+    /// this per peer so the coordinator can stamp a "direct vs relay" path
+    /// from a requested vantage. A relaxed load is fine — a one-tick-stale
+    /// read only ages out a path slightly later. The age is signed and may
+    /// be negative for a clock skew between the confirm and this read;
+    /// callers clamp it to a non-negative wire value.
+    pub fn path_status(&self, now_micros: i64) -> (bool, i64) {
+        let direct = self.direct_confirmed.load(Ordering::Relaxed);
+        let age = now_micros - self.last_direct_rx_micros.load(Ordering::Relaxed);
+        (direct, age)
+    }
+
     /// Refresh the last-valid-RX timestamp. Called on ANY valid inbound UDP
     /// datagram (incl. `WireGuard` keepalives), so a confirmed-but-idle
     /// direct path keeps its staleness clock fresh and never
@@ -254,6 +268,23 @@ mod tests {
             !s.direct_confirmed(),
             "must downgrade once the TTL is exceeded"
         );
+    }
+
+    /// `path_status` reports the live `(direct_confirmed, age_micros)` pair
+    /// the heartbeat surfaces to the coordinator: after a confirm at `t0`,
+    /// `path_status(t0 + 5)` is `(true, 5)`; an unconfirmed session reports
+    /// `direct = false`.
+    #[test]
+    fn path_status_reports_confirmed_and_age() {
+        let s = bare_session();
+        // Unconfirmed: direct is false (age is whatever — `0` baseline here).
+        let (direct, _age) = s.path_status(1_000);
+        assert!(!direct, "fresh session must report not-direct");
+        // Confirm at t0, then read at t0 + 5 micros.
+        s.confirm_direct(1_000);
+        let (direct, age) = s.path_status(1_005);
+        assert!(direct, "confirmed session must report direct");
+        assert_eq!(age, 5, "age = now - last_direct_rx_micros");
     }
 
     /// A keepalive refresh (`note_direct_rx`) keeps a confirmed-but-idle
