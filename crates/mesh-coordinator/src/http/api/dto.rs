@@ -168,6 +168,29 @@ pub struct RegisterResponse {
     pub observed_endpoint: Option<String>,
 }
 
+/// One reported connectivity edge in a heartbeat (connectivity
+/// visibility).
+///
+/// Mirrors the joiner's `PeerPath`: THIS reporter's live data path to peer
+/// `peer_id` is direct (p2p) when `direct == true`, else via the DERP relay
+/// floor. `last_rx_age_ms` is how stale that observation is. The coordinator
+/// stores these per reporter and stamps `PeerInfo.connectivity` from a
+/// requested vantage. `#[serde(default)]` on the carrier
+/// ([`HeartbeatRequest::peer_paths`]) keeps an older joiner (no edges)
+/// interoperable.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct PeerPathDto {
+    /// The peer whose live path this reporter is describing (string UUID).
+    pub peer_id: String,
+    /// `true` = reporter's current data path to that peer is direct (p2p);
+    /// `false` = relay.
+    pub direct: bool,
+    /// Milliseconds since the reporter last received a valid datagram from
+    /// that peer.
+    #[serde(default)]
+    pub last_rx_age_ms: u64,
+}
+
 /// Body of `POST /v1/mesh/heartbeat`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct HeartbeatRequest {
@@ -201,6 +224,16 @@ pub struct HeartbeatRequest {
     /// `#[serde(default)]` → `false` for older joiners.
     #[serde(default)]
     pub relay_only: bool,
+    /// This reporter's live per-peer data paths (connectivity visibility).
+    /// One [`PeerPathDto`] per session: direct (p2p) vs relay + staleness.
+    /// The coordinator REPLACES the reporter's stored edges with this set on
+    /// every heartbeat, so it tracks exactly what the reporter sees right
+    /// now (same wholesale-replace semantics as `hosted_app_ulas`). The
+    /// edges live with the reporter's roster entry and age out with its
+    /// presence — no separate TTL. `#[serde(default)]` → empty for older
+    /// joiners, which the coordinator reads as "no edges → unknown".
+    #[serde(default)]
+    pub peer_paths: Vec<PeerPathDto>,
 }
 
 /// Body of `POST /v1/mesh/heartbeat` response.

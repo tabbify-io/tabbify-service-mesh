@@ -15,8 +15,8 @@ use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::http::api::{
-    ApiError, DeregisterRequest, HeartbeatRequest, HeartbeatResponse, PeerInfo, RegisterRequest,
-    RegisterResponse, RosterResponse, StreamQuery,
+    ApiError, DeregisterRequest, HeartbeatRequest, HeartbeatResponse, PeerInfo, PeerPathDto,
+    RegisterRequest, RegisterResponse, RosterResponse, StreamQuery,
 };
 use crate::http::policy_api::PolicyResponse;
 use crate::http::sse::PeerEvent;
@@ -58,6 +58,7 @@ use crate::roster::events::HolePunchInitiate;
         PeerInfo,
         RegisterRequest, RegisterResponse,
         HeartbeatRequest, HeartbeatResponse,
+        PeerPathDto,
         DeregisterRequest,
         RosterResponse,
         StreamQuery,

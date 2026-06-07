@@ -68,6 +68,10 @@ impl Coordinator {
             app_uuid: event.app_uuid.clone(),
             software_version: event.software_version.clone(),
             relay_only: event.relay_only,
+            // Connectivity edges are ephemeral live-state, not carried in the
+            // durable `PeerJoined` event: a freshly-joined (or restored) peer
+            // starts with none and populates them on its first heartbeat.
+            paths: std::collections::HashMap::new(),
         };
         self.inner.roster.insert(peer_id, entry.clone());
         self.inner

@@ -161,6 +161,32 @@ fn heartbeat_request_relay_only_back_compat_and_present() {
     assert!(modern.relay_only);
 }
 
+/// Heartbeat carries per-peer connectivity edges (connectivity visibility);
+/// an older joiner omits `peer_paths` → empty (back-compat).
+#[test]
+fn heartbeat_request_peer_paths_back_compat_and_present() {
+    let legacy: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+        "peer_id": "01910f10-0000-7000-8000-000000000001",
+    }))
+    .expect("legacy heartbeat body must parse");
+    assert!(legacy.peer_paths.is_empty(), "no peer_paths → empty edges");
+
+    let modern: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+        "peer_id": "01910f10-0000-7000-8000-000000000001",
+        "peer_paths": [
+            { "peer_id": "01910f10-0000-7000-8000-000000000002", "direct": true, "last_rx_age_ms": 7 },
+            { "peer_id": "01910f10-0000-7000-8000-000000000003", "direct": false }
+        ]
+    }))
+    .expect("modern heartbeat body parses");
+    assert_eq!(modern.peer_paths.len(), 2);
+    assert!(modern.peer_paths[0].direct);
+    assert_eq!(modern.peer_paths[0].last_rx_age_ms, 7);
+    assert!(!modern.peer_paths[1].direct);
+    // `last_rx_age_ms` defaults when omitted.
+    assert_eq!(modern.peer_paths[1].last_rx_age_ms, 0);
+}
+
 /// A `PeerInfo` roster entry from an older coordinator omits `relay_only`;
 /// a consumer reads it back as `false` (visible + round-trips).
 #[test]

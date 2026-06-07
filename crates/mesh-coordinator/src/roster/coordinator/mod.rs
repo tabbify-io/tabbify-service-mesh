@@ -117,6 +117,19 @@ pub struct PeerEntry {
     /// handshake at an unreachable endpoint — the session completes over the
     /// relay instead). Defaults to `false` for peers that predate the field.
     pub relay_only: bool,
+    /// Per-peer live data-path edges THIS peer reported in its last heartbeat
+    /// (connectivity visibility): `target_peer_id → (direct, last_rx_age_ms)`.
+    /// `direct == true` means this reporter's current data path to that
+    /// target is direct (p2p); `false` means relay. REPLACED wholesale on
+    /// every heartbeat (a reporter re-sends its full edge set each tick), so
+    /// the map tracks exactly what the reporter sees right now. The edges
+    /// live with this entry, so they age out with the reporter's presence —
+    /// a deregister / timeout drops them with the entry, no separate TTL.
+    /// Ephemeral live-state: NOT carried in the durable `PeerJoined` event,
+    /// so a coordinator restart starts each reporter with no edges until its
+    /// next heartbeat (correct — stale "direct" must never survive a
+    /// restart). Empty for a freshly-joined or older (no-`peer_paths`) peer.
+    pub paths: std::collections::HashMap<Uuid, (bool, u64)>,
 }
 
 impl PeerEntry {
@@ -465,6 +478,40 @@ impl Coordinator {
             roster = self.inner.roster.len(),
             "ephemeral mesh-state sizes",
         );
+    }
+
+    /// Replace `reporter`'s connectivity edges from a heartbeat
+    /// (connectivity visibility). Each [`crate::http::api::PeerPathDto`] is
+    /// the reporter's live path to a target peer: direct (p2p) vs relay +
+    /// staleness. The reporter re-sends its FULL edge set every heartbeat, so
+    /// the stored map is REPLACED wholesale (adds + removals both fall out of
+    /// the replace — same semantics as `hosted_app_ulas`). Malformed target
+    /// UUIDs are skipped. A no-op when `reporter` is not (or no longer) in the
+    /// roster — a heartbeat can race a deregister. The edges live with the
+    /// reporter's entry, so they age out with its presence (no separate TTL).
+    pub fn record_peer_paths(&self, reporter: Uuid, paths: &[crate::http::api::PeerPathDto]) {
+        if let Some(mut entry) = self.inner.roster.get_mut(&reporter) {
+            let mut edges = std::collections::HashMap::with_capacity(paths.len());
+            for p in paths {
+                if let Ok(target) = Uuid::parse_str(&p.peer_id) {
+                    edges.insert(target, (p.direct, p.last_rx_age_ms));
+                }
+            }
+            entry.paths = edges;
+        }
+    }
+
+    /// Read `vantage`'s reported live path to `target` (connectivity
+    /// visibility): `Some((direct, last_rx_age_ms))` when the vantage peer
+    /// reported an edge to that target on its last heartbeat, else `None`
+    /// (no vantage edge → "unknown"). Used to stamp
+    /// [`crate::http::api::PeerInfo::connectivity`] from a requested vantage.
+    #[must_use]
+    pub fn edge(&self, vantage: Uuid, target: Uuid) -> Option<(bool, u64)> {
+        self.inner
+            .roster
+            .get(&vantage)
+            .and_then(|e| e.paths.get(&target).copied())
     }
 
     /// Iterate over peer ids whose `last_heartbeat` is older than

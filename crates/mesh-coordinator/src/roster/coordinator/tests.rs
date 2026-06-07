@@ -100,6 +100,51 @@ async fn heartbeat_updates_only_known_peers() {
 }
 
 #[tokio::test]
+async fn record_peer_paths_replaces_reporter_edges() {
+    use crate::http::api::PeerPathDto;
+    let c = coordinator();
+    let (reporter, _) = c.register(req(20, "reporter")).await.expect("register R");
+    let (target, _) = c.register(req(21, "target")).await.expect("register P");
+
+    // No edges reported yet → unknown.
+    assert_eq!(c.edge(reporter.peer_id, target.peer_id), None);
+
+    // Reporter reports a DIRECT edge to the target.
+    c.record_peer_paths(
+        reporter.peer_id,
+        &[PeerPathDto {
+            peer_id: target.peer_id.to_string(),
+            direct: true,
+            last_rx_age_ms: 42,
+        }],
+    );
+    assert_eq!(
+        c.edge(reporter.peer_id, target.peer_id),
+        Some((true, 42)),
+        "stored edge reflects the reported direct path + age"
+    );
+
+    // A later heartbeat with an EMPTY set replaces (clears) the edges —
+    // wholesale-replace, same as hosted_app_ulas.
+    c.record_peer_paths(reporter.peer_id, &[]);
+    assert_eq!(
+        c.edge(reporter.peer_id, target.peer_id),
+        None,
+        "wholesale replace clears a dropped edge"
+    );
+
+    // Recording for an unknown reporter is a no-op (no panic).
+    c.record_peer_paths(
+        Uuid::now_v7(),
+        &[PeerPathDto {
+            peer_id: target.peer_id.to_string(),
+            direct: false,
+            last_rx_age_ms: 0,
+        }],
+    );
+}
+
+#[tokio::test]
 async fn deregister_is_idempotent() {
     let c = coordinator();
     let (entry, _) = c.register(req(4, "dave")).await.expect("register");

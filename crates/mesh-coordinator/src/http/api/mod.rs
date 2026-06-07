@@ -21,7 +21,7 @@ mod tests;
 
 pub(crate) use dto::ApiError;
 pub use dto::{
-    DeregisterRequest, HeartbeatRequest, HeartbeatResponse, PeerInfo, RegisterRequest,
+    DeregisterRequest, HeartbeatRequest, HeartbeatResponse, PeerInfo, PeerPathDto, RegisterRequest,
     RegisterResponse, RosterResponse, StreamQuery,
 };
 pub(crate) use handlers::{deregister_handler, heartbeat_handler, peers_handler, register_handler};

@@ -165,6 +165,10 @@ pub async fn heartbeat_handler(
     // forcing test plumbing to fake a SocketAddr.
     let observed_addr = connect_info.as_ref().map(|c| c.0);
     let observed = observed_addr.map(|a| a.to_string()).unwrap_or_default();
+    // Capture the reported connectivity edges before `req` is consumed by
+    // the heartbeat call below — they are stored separately (connectivity
+    // visibility), not threaded through the heartbeat event.
+    let peer_paths = req.peer_paths;
     match coordinator
         .heartbeat(
             peer_id,
@@ -177,6 +181,10 @@ pub async fn heartbeat_handler(
         .await
     {
         Ok(entry) => {
+            // Replace this reporter's stored edges from the heartbeat. Done
+            // only on a successful heartbeat (the entry exists), mirroring the
+            // wholesale-replace the heartbeat does for hosted_app_ulas.
+            coordinator.record_peer_paths(entry.peer_id, &peer_paths);
             // Filter the self-heal roster the same way as register: a peer
             // only re-learns the peers it is policy-permitted to reach.
             let body = HeartbeatResponse {
