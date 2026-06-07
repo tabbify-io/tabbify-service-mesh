@@ -356,3 +356,114 @@ async fn sse_stream_bootstraps_existing_peers() {
         "expected display_name in SSE payload: {buf:?}",
     );
 }
+
+/// Connectivity visibility E2E: a reporter R heartbeats with `peer_paths`
+/// describing its live path to peer M, then `GET /v1/mesh/peers?vantage=R`
+/// stamps M's `connectivity` from R's reported edge. No `vantage` → no
+/// `connectivity` field (back-compat / unknown).
+#[tokio::test]
+async fn http_peers_stamps_connectivity_from_vantage() {
+    let (addr, _server) = spawn_server().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Register reporter R and target M.
+    let body = json_body(
+        post_json(
+            &client,
+            &format!("{base}/v1/mesh/register"),
+            serde_json::json!({ "wg_public_key": pubkey(1), "display_name": "R", "tags": [] }),
+        )
+        .await,
+    )
+    .await;
+    let reporter = body["peer_id"].as_str().expect("R id").to_owned();
+
+    let body = json_body(
+        post_json(
+            &client,
+            &format!("{base}/v1/mesh/register"),
+            serde_json::json!({ "wg_public_key": pubkey(2), "display_name": "M", "tags": [] }),
+        )
+        .await,
+    )
+    .await;
+    let target = body["peer_id"].as_str().expect("M id").to_owned();
+
+    // R heartbeats with a DIRECT edge to M.
+    let resp = post_json(
+        &client,
+        &format!("{base}/v1/mesh/heartbeat"),
+        serde_json::json!({
+            "peer_id": reporter,
+            "peer_paths": [ { "peer_id": target, "direct": true, "last_rx_age_ms": 12 } ]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    // GET with vantage=R → M is stamped "direct".
+    let body = json_body(
+        client
+            .get(format!("{base}/v1/mesh/peers?vantage={reporter}"))
+            .send()
+            .await
+            .expect("get peers vantage"),
+    )
+    .await;
+    let peers = body["peers"].as_array().expect("peers");
+    let m = peers
+        .iter()
+        .find(|p| p["peer_id"].as_str() == Some(target.as_str()))
+        .expect("M present");
+    assert_eq!(
+        m["connectivity"].as_str(),
+        Some("direct"),
+        "vantage R reported a direct path to M: {body}"
+    );
+
+    // GET without vantage → no connectivity field (unknown).
+    let body = json_body(
+        client
+            .get(format!("{base}/v1/mesh/peers"))
+            .send()
+            .await
+            .expect("get peers no vantage"),
+    )
+    .await;
+    let peers = body["peers"].as_array().expect("peers");
+    let m = peers
+        .iter()
+        .find(|p| p["peer_id"].as_str() == Some(target.as_str()))
+        .expect("M present");
+    assert!(
+        m.get("connectivity").is_none() || m["connectivity"].is_null(),
+        "no vantage → connectivity omitted: {body}"
+    );
+
+    // R reports M as RELAY now → vantage view downgrades to "relay".
+    let resp = post_json(
+        &client,
+        &format!("{base}/v1/mesh/heartbeat"),
+        serde_json::json!({
+            "peer_id": reporter,
+            "peer_paths": [ { "peer_id": target, "direct": false, "last_rx_age_ms": 0 } ]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body = json_body(
+        client
+            .get(format!("{base}/v1/mesh/peers?vantage={reporter}"))
+            .send()
+            .await
+            .expect("get peers vantage 2"),
+    )
+    .await;
+    let peers = body["peers"].as_array().expect("peers");
+    let m = peers
+        .iter()
+        .find(|p| p["peer_id"].as_str() == Some(target.as_str()))
+        .expect("M present");
+    assert_eq!(m["connectivity"].as_str(), Some("relay"));
+}

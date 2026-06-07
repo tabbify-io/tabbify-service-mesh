@@ -16,7 +16,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::http::api::{
     ApiError, DeregisterRequest, HeartbeatRequest, HeartbeatResponse, PeerInfo, PeerPathDto,
-    RegisterRequest, RegisterResponse, RosterResponse, StreamQuery,
+    RegisterRequest, RegisterResponse, RosterQuery, RosterResponse, StreamQuery,
 };
 use crate::http::policy_api::PolicyResponse;
 use crate::http::sse::PeerEvent;
@@ -61,6 +61,7 @@ use crate::roster::events::HolePunchInitiate;
         PeerPathDto,
         DeregisterRequest,
         RosterResponse,
+        RosterQuery,
         StreamQuery,
         // SSE per-event payload (the streaming body itself isn't a
         // single OpenAPI body type; this documents what a subscriber

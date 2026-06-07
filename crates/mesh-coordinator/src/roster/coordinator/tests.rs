@@ -145,6 +145,52 @@ async fn record_peer_paths_replaces_reporter_edges() {
 }
 
 #[tokio::test]
+async fn snapshot_stamps_connectivity_from_vantage() {
+    use crate::http::api::PeerPathDto;
+    let c = coordinator();
+    let (reporter, _) = c.register(req(30, "R")).await.expect("register R");
+    let (direct_m, _) = c.register(req(31, "Mdirect")).await.expect("register Md");
+    let (relay_m, _) = c.register(req(32, "Mrelay")).await.expect("register Mr");
+    let (no_edge_m, _) = c.register(req(33, "Munknown")).await.expect("register Mu");
+
+    // R reports a direct path to Md, a relayed path to Mr, nothing for Mu.
+    c.record_peer_paths(
+        reporter.peer_id,
+        &[
+            PeerPathDto {
+                peer_id: direct_m.peer_id.to_string(),
+                direct: true,
+                last_rx_age_ms: 5,
+            },
+            PeerPathDto {
+                peer_id: relay_m.peer_id.to_string(),
+                direct: false,
+                last_rx_age_ms: 200,
+            },
+        ],
+    );
+
+    // With vantage = R: Md→"direct", Mr→"relay", Mu→None (no edge).
+    let stamped = c.snapshot_with_vantage(Some(reporter.peer_id));
+    let conn = |id: Uuid| {
+        stamped
+            .iter()
+            .find(|p| p.peer_id == id.to_string())
+            .and_then(|p| p.connectivity.clone())
+    };
+    assert_eq!(conn(direct_m.peer_id).as_deref(), Some("direct"));
+    assert_eq!(conn(relay_m.peer_id).as_deref(), Some("relay"));
+    assert_eq!(conn(no_edge_m.peer_id), None, "no edge → unknown");
+
+    // No vantage: every connectivity is None.
+    let plain = c.snapshot_with_vantage(None);
+    assert!(
+        plain.iter().all(|p| p.connectivity.is_none()),
+        "no vantage → no connectivity stamped"
+    );
+}
+
+#[tokio::test]
 async fn deregister_is_idempotent() {
     let c = coordinator();
     let (entry, _) = c.register(req(4, "dave")).await.expect("register");

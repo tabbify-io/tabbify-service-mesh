@@ -4,12 +4,12 @@
 
 use super::dto::{
     ApiError, DeregisterRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest,
-    RegisterResponse, RosterResponse,
+    RegisterResponse, RosterQuery, RosterResponse,
 };
 use crate::roster::coordinator::{Coordinator, CoordinatorError};
 use axum::{
     Json,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -234,18 +234,32 @@ pub async fn deregister_handler(
 /// admin / debug / observability tooling; joiners use the per-viewer
 /// ACL-filtered stream at `/v1/mesh/peers/stream` instead. Auth:
 /// transport-level mTLS only — no application bearer.
+///
+/// Optional `?vantage=<peer-id>` stamps each peer's live `connectivity`
+/// (`"direct"` / `"relay"` / omitted) from that peer's last-reported paths
+/// (connectivity visibility). A malformed `vantage` is ignored (treated as
+/// no vantage → every `connectivity` omitted).
 #[utoipa::path(
     get,
     path = "/v1/mesh/peers",
     tag = "mesh",
+    params(
+        ("vantage" = Option<String>, Query, description = "Stamp each peer's connectivity from this peer's reported live paths"),
+    ),
     responses(
         (status = 200, description = "Full roster snapshot (admin / debug view)", body = RosterResponse),
     ),
 )]
 #[tracing::instrument(skip_all)]
-pub async fn peers_handler(State(coordinator): State<Coordinator>) -> Response {
+pub async fn peers_handler(
+    State(coordinator): State<Coordinator>,
+    Query(query): Query<RosterQuery>,
+) -> Response {
+    // A malformed vantage UUID degrades to "no vantage" rather than 400 —
+    // the field is purely advisory (connectivity stamping).
+    let vantage = query.vantage.as_deref().and_then(|v| Uuid::from_str(v).ok());
     Json(RosterResponse {
-        peers: coordinator.snapshot(),
+        peers: coordinator.snapshot_with_vantage(vantage),
     })
     .into_response()
 }

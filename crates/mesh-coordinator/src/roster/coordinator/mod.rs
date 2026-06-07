@@ -135,9 +135,20 @@ pub struct PeerEntry {
 impl PeerEntry {
     /// Snapshot for SSE / GET handlers. Strings are clones — that's fine
     /// since this fires on register / heartbeat / SSE bootstrap, not the
-    /// hot path.
+    /// hot path. `connectivity` is left `None` (no vantage); use
+    /// [`Self::to_info_with_connectivity`] for a vantage-stamped view.
     #[must_use]
     pub fn to_info(&self) -> PeerInfo {
+        self.to_info_with_connectivity(None)
+    }
+
+    /// Like [`Self::to_info`] but stamps the live-path `connectivity` field
+    /// (connectivity visibility) from a requested vantage. The caller
+    /// resolves the vantage→this-peer edge (via [`Coordinator::edge`]) into
+    /// `Some("direct")` / `Some("relay")` / `None` (no vantage or no edge →
+    /// unknown) and passes it here.
+    #[must_use]
+    pub fn to_info_with_connectivity(&self, connectivity: Option<String>) -> PeerInfo {
         PeerInfo {
             peer_id: self.peer_id.to_string(),
             wg_public_key: base64::Engine::encode(
@@ -156,6 +167,7 @@ impl PeerEntry {
             app_uuid: self.app_uuid.clone(),
             software_version: self.software_version.clone(),
             relay_only: self.relay_only,
+            connectivity,
         }
     }
 
@@ -446,6 +458,17 @@ impl Coordinator {
     /// Snapshot the entire roster, ordered by `peer_index` for stable output.
     #[must_use]
     pub fn snapshot(&self) -> Vec<PeerInfo> {
+        self.snapshot_with_vantage(None)
+    }
+
+    /// Snapshot the entire roster, ordered by `peer_index`, stamping each
+    /// peer's live `connectivity` from `vantage` (connectivity visibility).
+    /// For each peer M, `connectivity = edge(vantage, M)` → `Some("direct")`
+    /// / `Some("relay")` / `None` (no vantage requested, or the vantage
+    /// reported no edge to M → "unknown"). `vantage == None` leaves every
+    /// `connectivity` `None` — identical to the plain [`Self::snapshot`].
+    #[must_use]
+    pub fn snapshot_with_vantage(&self, vantage: Option<Uuid>) -> Vec<PeerInfo> {
         let mut entries: Vec<PeerEntry> = self
             .inner
             .roster
@@ -453,7 +476,15 @@ impl Coordinator {
             .map(|kv| kv.value().clone())
             .collect();
         entries.sort_by_key(|p| p.peer_index);
-        entries.iter().map(PeerEntry::to_info).collect()
+        entries
+            .iter()
+            .map(|e| {
+                let connectivity = vantage
+                    .and_then(|v| self.edge(v, e.peer_id))
+                    .map(|(direct, _age)| if direct { "direct" } else { "relay" }.to_owned());
+                e.to_info_with_connectivity(connectivity)
+            })
+            .collect()
     }
 
     /// Reap stale ephemeral (non-event-sourced) state: relay connections whose

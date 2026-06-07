@@ -65,6 +65,18 @@ pub struct PeerInfo {
     /// (→ `false`, the directly-reachable default).
     #[serde(default)]
     pub relay_only: bool,
+    /// LIVE data path to this peer FROM A REQUESTED VANTAGE (connectivity
+    /// visibility) — distinct from the `relay_only` policy flag above.
+    /// `Some("direct")` when the vantage peer reported a direct (p2p) path to
+    /// this peer on its last heartbeat, `Some("relay")` when it reported a
+    /// relayed path, and `None` when no vantage was requested OR the vantage
+    /// reported no edge to this peer ("unknown"). Set only when the roster is
+    /// fetched with `?vantage=<peer-id>` (e.g. the serving node passing its
+    /// own id). `relay_only` explains *why* a path is relay by design; this
+    /// shows the *actual current route*. `#[serde(default)]` keeps the wire
+    /// back-compatible (older coordinators omit it → `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connectivity: Option<String>,
 }
 
 pub(super) fn default_kind() -> String {
@@ -271,6 +283,20 @@ pub struct RosterResponse {
 pub struct ApiError {
     /// Human-readable error description.
     pub error: String,
+}
+
+/// Query parameters for `GET /v1/mesh/peers`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RosterQuery {
+    /// Optional vantage peer id (connectivity visibility). When present, each
+    /// returned `PeerInfo.connectivity` is stamped from THIS peer's reported
+    /// live path to that machine: `"direct"` (p2p), `"relay"`, or `null`
+    /// (the vantage reported no edge → unknown). When absent, every
+    /// `connectivity` is `null`. The serving node passes its own peer id so
+    /// the admin sees "does the platform reach machine M directly or via
+    /// DERP".
+    #[serde(default)]
+    pub vantage: Option<String>,
 }
 
 /// Query parameters for `GET /v1/mesh/peers/stream`.
