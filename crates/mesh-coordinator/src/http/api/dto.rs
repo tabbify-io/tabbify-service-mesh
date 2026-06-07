@@ -65,15 +65,23 @@ pub struct PeerInfo {
     /// (→ `false`, the directly-reachable default).
     #[serde(default)]
     pub relay_only: bool,
-    /// LIVE data path to this peer FROM A REQUESTED VANTAGE (connectivity
-    /// visibility) — distinct from the `relay_only` policy flag above.
-    /// `Some("direct")` when the vantage peer reported a direct (p2p) path to
-    /// this peer on its last heartbeat, `Some("relay")` when it reported a
-    /// relayed path, and `None` when no vantage was requested OR the vantage
-    /// reported no edge to this peer ("unknown"). Set only when the roster is
-    /// fetched with `?vantage=<peer-id>` (e.g. the serving node passing its
-    /// own id). `relay_only` explains *why* a path is relay by design; this
-    /// shows the *actual current route*. `#[serde(default)]` keeps the wire
+    /// LIVE connectivity of this peer (the admin direct/relay pill) — distinct
+    /// from the `relay_only` policy flag above.
+    ///
+    /// By DEFAULT (no `?vantage`) this is a PER-MACHINE self-view: `Some("direct")`
+    /// when THIS peer reported at least one direct (p2p) path of its own on its
+    /// last heartbeat, `Some("relay")` when it reported edges but all relayed,
+    /// and `None` when it reported no edges (a just-joined or older joiner →
+    /// "unknown"). The self-view is what lets the pill show "Direct" for peers
+    /// holding a p2p path in a topology where the serving node is relay-only.
+    ///
+    /// When the roster is fetched with `?vantage=<peer-id>`, this falls back to
+    /// the single-vantage view instead: the live path to this peer AS SEEN BY
+    /// the vantage peer (`Some("direct")` / `Some("relay")` / `None` when the
+    /// vantage reported no edge to this peer).
+    ///
+    /// `relay_only` explains *why* a path is relay by design; this shows the
+    /// *actual current route*. `#[serde(default)]` keeps the wire
     /// back-compatible (older coordinators omit it → `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connectivity: Option<String>,
@@ -288,13 +296,14 @@ pub struct ApiError {
 /// Query parameters for `GET /v1/mesh/peers`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct RosterQuery {
-    /// Optional vantage peer id (connectivity visibility). When present, each
-    /// returned `PeerInfo.connectivity` is stamped from THIS peer's reported
-    /// live path to that machine: `"direct"` (p2p), `"relay"`, or `null`
-    /// (the vantage reported no edge → unknown). When absent, every
-    /// `connectivity` is `null`. The serving node passes its own peer id so
-    /// the admin sees "does the platform reach machine M directly or via
-    /// DERP".
+    /// Optional vantage peer id (connectivity visibility) — an OVERRIDE for the
+    /// default per-machine self-view. When present, each returned
+    /// `PeerInfo.connectivity` is stamped from THIS vantage peer's reported live
+    /// path to that machine: `"direct"` (p2p), `"relay"`, or `null` (the vantage
+    /// reported no edge → unknown). When ABSENT (the default the admin uses),
+    /// each peer is stamped from its OWN reported paths — a per-machine self-view
+    /// ("does machine M hold any direct path of its own?"), which is meaningful
+    /// even when the serving node is relay-only.
     #[serde(default)]
     pub vantage: Option<String>,
 }

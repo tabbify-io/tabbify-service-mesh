@@ -235,16 +235,18 @@ pub async fn deregister_handler(
 /// ACL-filtered stream at `/v1/mesh/peers/stream` instead. Auth:
 /// transport-level mTLS only — no application bearer.
 ///
-/// Optional `?vantage=<peer-id>` stamps each peer's live `connectivity`
-/// (`"direct"` / `"relay"` / omitted) from that peer's last-reported paths
-/// (connectivity visibility). A malformed `vantage` is ignored (treated as
-/// no vantage → every `connectivity` omitted).
+/// Each peer's live `connectivity` (`"direct"` / `"relay"` / omitted) is, by
+/// default, a PER-MACHINE self-view stamped from that peer's OWN last-reported
+/// paths (connectivity visibility) — "does machine M hold any direct path of
+/// its own?". Optional `?vantage=<peer-id>` overrides this with the legacy
+/// single-vantage view (M's connectivity AS SEEN BY the vantage peer). A
+/// malformed `vantage` is ignored (degrades to the default self-view).
 #[utoipa::path(
     get,
     path = "/v1/mesh/peers",
     tag = "mesh",
     params(
-        ("vantage" = Option<String>, Query, description = "Stamp each peer's connectivity from this peer's reported live paths"),
+        ("vantage" = Option<String>, Query, description = "Override the default per-machine self-view: stamp each peer's connectivity from THIS peer's reported live paths"),
     ),
     responses(
         (status = 200, description = "Full roster snapshot (admin / debug view)", body = RosterResponse),
@@ -255,8 +257,9 @@ pub async fn peers_handler(
     State(coordinator): State<Coordinator>,
     Query(query): Query<RosterQuery>,
 ) -> Response {
-    // A malformed vantage UUID degrades to "no vantage" rather than 400 —
-    // the field is purely advisory (connectivity stamping).
+    // A malformed vantage UUID degrades to "no vantage" (the default
+    // per-machine self-view) rather than 400 — the field is purely advisory
+    // (connectivity stamping).
     let vantage = query.vantage.as_deref().and_then(|v| Uuid::from_str(v).ok());
     Json(RosterResponse {
         peers: coordinator.snapshot_with_vantage(vantage),

@@ -145,13 +145,122 @@ async fn record_peer_paths_replaces_reporter_edges() {
 }
 
 #[tokio::test]
-async fn snapshot_stamps_connectivity_from_vantage() {
+async fn self_connectivity_is_per_machine_self_view() {
     use crate::http::api::PeerPathDto;
     let c = coordinator();
-    let (reporter, _) = c.register(req(30, "R")).await.expect("register R");
-    let (direct_m, _) = c.register(req(31, "Mdirect")).await.expect("register Md");
-    let (relay_m, _) = c.register(req(32, "Mrelay")).await.expect("register Mr");
-    let (no_edge_m, _) = c.register(req(33, "Munknown")).await.expect("register Mu");
+    // M_direct reports at least one direct edge → "direct".
+    let (m_direct, _) = c.register(req(40, "Mdirect")).await.expect("register Md");
+    // M_relay reports only relay edges → "relay".
+    let (m_relay, _) = c.register(req(41, "Mrelay")).await.expect("register Mr");
+    // M_none reports nothing → None (unknown).
+    let (m_none, _) = c.register(req(42, "Mnone")).await.expect("register Mn");
+    // A peer to point edges at; its own edges are irrelevant to the others.
+    let (target, _) = c.register(req(43, "target")).await.expect("register T");
+
+    c.record_peer_paths(
+        m_direct.peer_id,
+        &[
+            PeerPathDto {
+                peer_id: target.peer_id.to_string(),
+                direct: false,
+                last_rx_age_ms: 100,
+            },
+            PeerPathDto {
+                // A single direct edge anywhere flips the self-view to "direct".
+                peer_id: m_relay.peer_id.to_string(),
+                direct: true,
+                last_rx_age_ms: 3,
+            },
+        ],
+    );
+    c.record_peer_paths(
+        m_relay.peer_id,
+        &[PeerPathDto {
+            peer_id: target.peer_id.to_string(),
+            direct: false,
+            last_rx_age_ms: 250,
+        }],
+    );
+    // m_none reports no edges at all.
+
+    assert_eq!(
+        c.self_connectivity(m_direct.peer_id).as_deref(),
+        Some("direct"),
+        "a peer with any direct edge sees itself as direct"
+    );
+    assert_eq!(
+        c.self_connectivity(m_relay.peer_id).as_deref(),
+        Some("relay"),
+        "a peer with only relay edges sees itself as relay"
+    );
+    assert_eq!(
+        c.self_connectivity(m_none.peer_id),
+        None,
+        "a peer that reported no edges is unknown"
+    );
+    assert_eq!(
+        c.self_connectivity(Uuid::now_v7()),
+        None,
+        "an unknown peer is unknown"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_stamps_connectivity_from_each_peers_own_paths() {
+    use crate::http::api::PeerPathDto;
+    let c = coordinator();
+    // A reports a direct edge → A's own pill is "direct".
+    let (a, _) = c.register(req(30, "A")).await.expect("register A");
+    // B reports only a relay edge → B's own pill is "relay".
+    let (b, _) = c.register(req(31, "B")).await.expect("register B");
+    // C reports nothing → C's pill is unknown (None).
+    let (cc, _) = c.register(req(32, "C")).await.expect("register C");
+
+    c.record_peer_paths(
+        a.peer_id,
+        &[PeerPathDto {
+            peer_id: b.peer_id.to_string(),
+            direct: true,
+            last_rx_age_ms: 5,
+        }],
+    );
+    c.record_peer_paths(
+        b.peer_id,
+        &[PeerPathDto {
+            peer_id: a.peer_id.to_string(),
+            direct: false,
+            last_rx_age_ms: 200,
+        }],
+    );
+
+    // Default snapshot (no vantage) now stamps each peer from its OWN paths.
+    let snap = c.snapshot();
+    let conn = |id: Uuid| {
+        snap.iter()
+            .find(|p| p.peer_id == id.to_string())
+            .and_then(|p| p.connectivity.clone())
+    };
+    assert_eq!(
+        conn(a.peer_id).as_deref(),
+        Some("direct"),
+        "A reported a direct edge → A's pill is direct"
+    );
+    assert_eq!(
+        conn(b.peer_id).as_deref(),
+        Some("relay"),
+        "B reported only relay → B's pill is relay"
+    );
+    assert_eq!(conn(cc.peer_id), None, "C reported nothing → unknown");
+}
+
+#[tokio::test]
+async fn snapshot_with_vantage_overrides_with_single_vantage_view() {
+    use crate::http::api::PeerPathDto;
+    let c = coordinator();
+    let (reporter, _) = c.register(req(33, "R")).await.expect("register R");
+    let (direct_m, _) = c.register(req(34, "Mdirect")).await.expect("register Md");
+    let (relay_m, _) = c.register(req(35, "Mrelay")).await.expect("register Mr");
+    let (no_edge_m, _) = c.register(req(36, "Munknown")).await.expect("register Mu");
 
     // R reports a direct path to Md, a relayed path to Mr, nothing for Mu.
     c.record_peer_paths(
@@ -170,7 +279,8 @@ async fn snapshot_stamps_connectivity_from_vantage() {
         ],
     );
 
-    // With vantage = R: Md→"direct", Mr→"relay", Mu→None (no edge).
+    // With an explicit vantage = R, the API keeps the legacy single-vantage
+    // view: connectivity = edge(R, M). Md→"direct", Mr→"relay", Mu→None.
     let stamped = c.snapshot_with_vantage(Some(reporter.peer_id));
     let conn = |id: Uuid| {
         stamped
@@ -180,14 +290,7 @@ async fn snapshot_stamps_connectivity_from_vantage() {
     };
     assert_eq!(conn(direct_m.peer_id).as_deref(), Some("direct"));
     assert_eq!(conn(relay_m.peer_id).as_deref(), Some("relay"));
-    assert_eq!(conn(no_edge_m.peer_id), None, "no edge → unknown");
-
-    // No vantage: every connectivity is None.
-    let plain = c.snapshot_with_vantage(None);
-    assert!(
-        plain.iter().all(|p| p.connectivity.is_none()),
-        "no vantage → no connectivity stamped"
-    );
+    assert_eq!(conn(no_edge_m.peer_id), None, "no edge from vantage → unknown");
 }
 
 #[tokio::test]

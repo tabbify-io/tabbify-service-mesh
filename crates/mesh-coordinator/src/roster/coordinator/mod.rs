@@ -456,17 +456,28 @@ impl Coordinator {
     }
 
     /// Snapshot the entire roster, ordered by `peer_index` for stable output.
+    /// Each peer's `connectivity` is its PER-MACHINE self-view
+    /// ([`Self::self_connectivity`]) — the meaningful default the admin pill
+    /// uses (shows "Direct" for any peer that holds a p2p path of its own).
     #[must_use]
     pub fn snapshot(&self) -> Vec<PeerInfo> {
         self.snapshot_with_vantage(None)
     }
 
     /// Snapshot the entire roster, ordered by `peer_index`, stamping each
-    /// peer's live `connectivity` from `vantage` (connectivity visibility).
-    /// For each peer M, `connectivity = edge(vantage, M)` → `Some("direct")`
-    /// / `Some("relay")` / `None` (no vantage requested, or the vantage
-    /// reported no edge to M → "unknown"). `vantage == None` leaves every
-    /// `connectivity` `None` — identical to the plain [`Self::snapshot`].
+    /// peer M's live `connectivity` (connectivity visibility).
+    ///
+    /// - `vantage == None` (the DEFAULT — what the admin GET uses): stamp each
+    ///   peer from its OWN reported edges via [`Self::self_connectivity`] — a
+    ///   per-machine self-view ("does M have any direct path of its own?").
+    ///   This is what makes the pill able to show "Direct" in a topology where
+    ///   the serving node is relay-only (a single external vantage would always
+    ///   read "relay" to every machine).
+    /// - `vantage == Some(v)` (explicit `?vantage` API override): keep the
+    ///   legacy single-vantage view `connectivity = edge(v, M)` →
+    ///   `Some("direct")` / `Some("relay")` / `None` (v reported no edge to M).
+    ///
+    /// Either way a peer with no usable edge resolves to `None` ("unknown").
     #[must_use]
     pub fn snapshot_with_vantage(&self, vantage: Option<Uuid>) -> Vec<PeerInfo> {
         let mut entries: Vec<PeerEntry> = self
@@ -479,9 +490,16 @@ impl Coordinator {
         entries
             .iter()
             .map(|e| {
-                let connectivity = vantage
-                    .and_then(|v| self.edge(v, e.peer_id))
-                    .map(|(direct, _age)| if direct { "direct" } else { "relay" }.to_owned());
+                let connectivity = vantage.map_or_else(
+                    // Default → per-machine self-view from the peer's own paths.
+                    || self.self_connectivity(e.peer_id),
+                    // Explicit vantage → legacy single-vantage edge view.
+                    |v| {
+                        self.edge(v, e.peer_id).map(|(direct, _age)| {
+                            if direct { "direct" } else { "relay" }.to_owned()
+                        })
+                    },
+                );
                 e.to_info_with_connectivity(connectivity)
             })
             .collect()
@@ -543,6 +561,34 @@ impl Coordinator {
             .roster
             .get(&vantage)
             .and_then(|e| e.paths.get(&target).copied())
+    }
+
+    /// Per-machine **self-view** of `peer_id`'s connectivity (the admin
+    /// direct/relay pill). Inspects `peer_id`'s OWN reported edges
+    /// ([`PeerEntry::paths`], `peer_id` as the reporter) and asks "does THIS
+    /// machine have any live direct path of its own?":
+    ///
+    /// - `Some("direct")` — the peer reported at least one `direct == true`
+    ///   edge (it has a live p2p path to some peer right now).
+    /// - `Some("relay")` — the peer reported edges, but all are relay.
+    /// - `None` — the peer reported no edges (unknown: a just-joined peer or an
+    ///   older joiner that does not send `peer_paths`), OR it is not in the
+    ///   roster.
+    ///
+    /// This is meaningful in our topology where the serving node is a
+    /// relay-only docker-bridge peer: a single external `?vantage` always sees
+    /// "relay" to every machine, so a per-machine self-view is what lets the
+    /// pill show "Direct" for peers (e.g. `ThinkPad` ↔ a Mac) that actually
+    /// hold a p2p path. Used as the DEFAULT roster stamping (see
+    /// [`Self::snapshot_with_vantage`]).
+    #[must_use]
+    pub fn self_connectivity(&self, peer_id: Uuid) -> Option<String> {
+        let entry = self.inner.roster.get(&peer_id)?;
+        if entry.paths.is_empty() {
+            return None;
+        }
+        let any_direct = entry.paths.values().any(|(direct, _age)| *direct);
+        Some(if any_direct { "direct" } else { "relay" }.to_owned())
     }
 
     /// Iterate over peer ids whose `last_heartbeat` is older than
