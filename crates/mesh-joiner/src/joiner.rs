@@ -12,14 +12,14 @@
 //! 7. [`crate::wg::loops`] — UDP / TUN / timer background loops.
 
 use crate::config::JoinConfig;
-use crate::coordinator::client::{CoordinatorClient, remote_to_info};
+use crate::coordinator::client::{CoordinatorClient, PeerPath, remote_to_info};
 use crate::coordinator::heartbeat::{ReregisterInputs, SharedPeerId};
 use crate::coordinator::{heartbeat, peer_sync};
 use crate::error::JoinerError;
 use crate::nat::holepunch;
 use crate::peer::PeerInfo;
 use crate::platform;
-use crate::wg::loops::{timer_loop, tun_read_loop, udp_recv_loop};
+use crate::wg::loops::{now_micros, timer_loop, tun_read_loop, udp_recv_loop};
 use crate::wg::persistent_identity;
 use crate::wg::session::{PeerSession, SessionTable};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -378,6 +378,18 @@ impl Joiner {
                     .map_or_else(|| synth_info(&s), |kv| kv.value().clone())
             })
             .collect()
+    }
+
+    /// Snapshot THIS node's live per-peer data paths (connectivity
+    /// visibility). One [`PeerPath`] per session: whether our current data
+    /// path to that peer is direct (p2p) or relay, plus how long since the
+    /// last valid inbound datagram. The heartbeat task reports the same
+    /// snapshot to the coordinator, which aggregates it into per-vantage
+    /// connectivity. Reads the live session table — direct/age reflect the
+    /// data plane's confirm/downgrade state right now.
+    #[must_use]
+    pub fn peer_paths(&self) -> Vec<PeerPath> {
+        peer_paths_from_sessions(&self.sessions, now_micros())
     }
 
     /// Gracefully deregister and shut down background tasks. Best
@@ -1016,6 +1028,29 @@ async fn seed_initial_roster(
     }
 }
 
+/// Map the live session table to the per-peer path snapshot reported in the
+/// heartbeat (connectivity visibility). Shared by [`Joiner::peer_paths`] and
+/// the heartbeat sender so both stamp ages against the SAME clock. For each
+/// session: `direct` comes from `PeerSession::path_status`; `last_rx_age_ms`
+/// is the micros age floored to millis and clamped to non-negative (a
+/// negative age from a confirm/now clock skew becomes `0`).
+pub(crate) fn peer_paths_from_sessions(sessions: &SessionTable, now_micros: i64) -> Vec<PeerPath> {
+    sessions
+        .snapshot()
+        .into_iter()
+        .map(|s| {
+            let (direct, age_micros) = s.path_status(now_micros);
+            #[allow(clippy::cast_sign_loss)] // clamped to >= 0 by `.max(0)`.
+            let last_rx_age_ms = (age_micros / 1_000).max(0) as u64;
+            PeerPath {
+                peer_id: s.peer_id,
+                direct,
+                last_rx_age_ms,
+            }
+        })
+        .collect()
+}
+
 /// Build a placeholder [`PeerInfo`] from a session when we somehow
 /// lost the rich metadata. Keeps the public API non-fallible.
 fn synth_info(s: &PeerSession) -> PeerInfo {
@@ -1062,5 +1097,47 @@ mod tests {
         let synth = synth_info(&session);
         assert_eq!(synth.ula, info.ula);
         assert_eq!(synth.listen_endpoint, info.listen_endpoint);
+    }
+
+    /// `peer_paths_from_sessions` reflects each session's live confirm
+    /// state: a direct-confirmed session reports `direct = true`, an
+    /// unconfirmed one `direct = false`. This is the snapshot the heartbeat
+    /// reports to the coordinator.
+    #[test]
+    fn peer_paths_reflect_direct_confirmed() {
+        let me = x25519_dalek::StaticSecret::from([7u8; 32]);
+        let mk = |ula: &str, peer_id: Uuid| PeerInfo {
+            peer_id,
+            wg_public_key: *x25519_dalek::PublicKey::from(&me).as_bytes(),
+            ula: ula.parse().unwrap(),
+            listen_endpoint: None,
+            display_name: String::new(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            software_version: None,
+            joined_at_micros: 0,
+        };
+        let direct_id = Uuid::from_u128(1);
+        let relay_id = Uuid::from_u128(2);
+        let table = SessionTable::new();
+        table.upsert(&me, &mk("fd5a:1f00:1::a", direct_id));
+        table.upsert(&me, &mk("fd5a:1f00:1::b", relay_id));
+
+        // Confirm the FIRST peer direct at t = 1_000_000 micros (1 s).
+        let direct_session = table.by_ula("fd5a:1f00:1::a".parse().unwrap()).unwrap();
+        direct_session.confirm_direct(1_000_000);
+
+        // Read 5_000 micros later → direct peer: direct=true, age 5ms→0ms
+        // (5_000 micros / 1_000 = 5); relay peer: never confirmed.
+        let paths = peer_paths_from_sessions(&table, 1_005_000);
+        let by_id: std::collections::HashMap<Uuid, &PeerPath> =
+            paths.iter().map(|p| (p.peer_id, p)).collect();
+
+        assert_eq!(paths.len(), 2, "one PeerPath per session");
+        let d = by_id.get(&direct_id).expect("direct peer reported");
+        assert!(d.direct, "confirmed session reports direct");
+        assert_eq!(d.last_rx_age_ms, 5, "age 5_000 micros → 5 ms");
+        let r = by_id.get(&relay_id).expect("relay peer reported");
+        assert!(!r.direct, "unconfirmed session reports relay");
     }
 }

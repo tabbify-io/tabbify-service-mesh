@@ -48,7 +48,12 @@ pub(crate) const MAX_TUN_FRAME: usize = 9_001;
 /// and to drive the staleness downgrade. Saturates to `0` on the
 /// impossible pre-epoch clock and to `i64::MAX` on the (year-294247)
 /// overflow — both are inert for the staleness arithmetic.
-fn now_micros() -> i64 {
+///
+/// `pub(crate)` so the connectivity-visibility path
+/// ([`crate::joiner::Joiner::peer_paths`] + the heartbeat sender) stamps
+/// per-peer ages against the SAME clock the data-plane confirm/downgrade
+/// logic uses, rather than duplicating the helper.
+pub(crate) fn now_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))

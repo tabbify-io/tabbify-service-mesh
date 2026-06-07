@@ -80,6 +80,7 @@ fn relay_only_round_trips_and_defaults_false() {
         hosted_app_ulas: vec![],
         software_version: None,
         relay_only: true,
+        peer_paths: vec![],
     };
     let hv = serde_json::to_value(&hb).unwrap();
     assert_eq!(hv["relay_only"], true);
@@ -88,6 +89,9 @@ fn relay_only_round_trips_and_defaults_false() {
     }))
     .expect("legacy heartbeat body must parse");
     assert!(!legacy_hb.relay_only);
+    // Back-compat: a heartbeat with no `peer_paths` key parses to an empty
+    // edge set (connectivity visibility — old joiner / old coordinator).
+    assert!(legacy_hb.peer_paths.is_empty());
 }
 
 #[tokio::test]
@@ -553,7 +557,7 @@ async fn heartbeat_returns_roster_snapshot() {
         .await;
     let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
     let resp = client
-        .heartbeat(Uuid::nil(), Some(51820), &[], None, false)
+        .heartbeat(Uuid::nil(), Some(51820), &[], None, false, Vec::new())
         .await
         .unwrap();
     assert!(resp.peers.is_empty());
@@ -588,6 +592,7 @@ async fn heartbeat_sends_hosted_app_ulas() {
             &["fd5a:1f02:dead:beef:cafe:0:0:1".to_owned()],
             None,
             false,
+            Vec::new(),
         )
         .await
         .expect("heartbeat with hosted app-ULAs should match the body");
@@ -603,11 +608,18 @@ async fn heartbeat_omits_empty_hosted_app_ulas() {
         hosted_app_ulas: vec![],
         software_version: None,
         relay_only: false,
+        peer_paths: vec![],
     })
     .unwrap();
     assert!(
         body.get("hosted_app_ulas").is_none(),
         "empty hosted_app_ulas must be omitted: {body}"
+    );
+    // An empty edge set is likewise omitted from the wire so older
+    // coordinators see no new key (connectivity visibility back-compat).
+    assert!(
+        body.get("peer_paths").is_none(),
+        "empty peer_paths must be omitted: {body}"
     );
 }
 

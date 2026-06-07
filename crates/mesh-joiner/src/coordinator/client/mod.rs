@@ -126,6 +126,30 @@ pub struct RegisterResponse {
     pub observed_endpoint: Option<String>,
 }
 
+/// One reported edge in the connectivity-visibility feature.
+///
+/// THIS joiner's live data path to peer `peer_id` is currently `direct`
+/// (p2p) or — when `false` — via the DERP relay floor. `last_rx_age_ms` is
+/// how long ago a valid inbound UDP datagram last arrived from that peer
+/// (drives the staleness/"last data Ns ago" surface). Reported per peer on
+/// every heartbeat; the coordinator aggregates these into per-reporter edges
+/// and stamps each roster `PeerInfo.connectivity` from a requested vantage.
+///
+/// Mirrored exactly by the coordinator's `PeerPathDto`. Backward compatible:
+/// the `HeartbeatRequest.peer_paths` carrier is `#[serde(default)]`, so an
+/// older coordinator simply ignores it and an older joiner sends none.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerPath {
+    /// The peer whose live path we are reporting.
+    pub peer_id: Uuid,
+    /// `true` = our current data path to that peer is direct (p2p);
+    /// `false` = relay.
+    pub direct: bool,
+    /// Milliseconds since the last valid inbound datagram from that peer.
+    /// Clamped to non-negative.
+    pub last_rx_age_ms: u64,
+}
+
 /// Body of `POST /v1/mesh/heartbeat`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
@@ -151,6 +175,15 @@ pub struct HeartbeatRequest {
     /// re-register. `#[serde(default)]` matters on the read side.
     #[serde(default)]
     pub relay_only: bool,
+    /// Per-peer live path edges from THIS reporter (connectivity
+    /// visibility). One [`PeerPath`] per session: is our current data path
+    /// to that peer direct (p2p) or relay, and how stale. The coordinator
+    /// stores these per reporter and stamps `PeerInfo.connectivity` from a
+    /// requested vantage. `#[serde(default)]` so an older joiner (no
+    /// `peer_paths`) and an older coordinator (ignores it) both interop —
+    /// the coordinator treats absence as "no edges → unknown".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_paths: Vec<PeerPath>,
 }
 
 /// Body of the heartbeat response. The coordinator returns the current
@@ -359,6 +392,11 @@ impl CoordinatorClient {
     /// re-sent every heartbeat so the control plane can observe `actual`
     /// version drift (spec P0). `None` (host-supplied) is omitted from the
     /// wire and leaves the coordinator's stored value untouched.
+    ///
+    /// `peer_paths` is THIS reporter's per-peer live path snapshot
+    /// (connectivity visibility): for each session, is our data path to that
+    /// peer direct or relay, and how stale. Empty when there are no sessions
+    /// (omitted from the wire) — the coordinator then keeps no edges for us.
     pub async fn heartbeat(
         &self,
         peer_id: Uuid,
@@ -366,6 +404,7 @@ impl CoordinatorClient {
         hosted_app_ulas: &[String],
         software_version: Option<String>,
         relay_only: bool,
+        peer_paths: Vec<PeerPath>,
     ) -> Result<HeartbeatResponse> {
         let url = format!("{}/v1/mesh/heartbeat", self.base_url);
         let body = HeartbeatRequest {
@@ -374,6 +413,7 @@ impl CoordinatorClient {
             hosted_app_ulas: hosted_app_ulas.to_vec(),
             software_version,
             relay_only,
+            peer_paths,
         };
         let resp = self
             .http

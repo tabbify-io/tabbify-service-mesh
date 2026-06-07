@@ -244,6 +244,11 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
     // Advertise our CURRENT hosted app-ULA set so the coordinator replaces
     // its stored set (per-app-ULA routing — supervisor side).
     let hosted = hosted_app_ula_strings(hosted_app_ulas);
+    // Report our live per-peer data paths (connectivity visibility): for
+    // each session, direct (p2p) vs relay + staleness. The coordinator
+    // aggregates these into per-vantage connectivity. Built from the SAME
+    // session table this tick reconciles, stamped with the data-plane clock.
+    let peer_paths = crate::joiner::peer_paths_from_sessions(sessions, crate::wg::loops::now_micros());
     let current_id = *peer_id.read().await;
     match client
         .heartbeat(
@@ -252,6 +257,7 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
             &hosted,
             software_version,
             reregister.relay_only,
+            peer_paths,
         )
         .await
     {
