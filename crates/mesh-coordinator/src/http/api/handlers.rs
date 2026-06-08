@@ -4,7 +4,7 @@
 
 use super::dto::{
     ApiError, DeregisterRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest,
-    RegisterResponse, RosterQuery, RosterResponse,
+    RegisterResponse, RosterQuery, RosterResponse, TopologyResponse,
 };
 use crate::roster::coordinator::{Coordinator, CoordinatorError};
 use axum::{
@@ -265,4 +265,27 @@ pub async fn peers_handler(
         peers: coordinator.snapshot_with_vantage(vantage),
     })
     .into_response()
+}
+
+/// Machine graph — the roster projected into `{ machines, edges }`,
+/// EXCLUDING app-runners and collapsing the directed connectivity paths
+/// into undirected machine↔machine edges. Read-only, intended for the
+/// admin / topology UI. Same auth posture as [`peers_handler`]:
+/// transport-level mTLS only — no application bearer.
+///
+/// See [`Coordinator::topology`] for the exact filtering + edge-collapse
+/// rules.
+///
+/// [`Coordinator::topology`]: crate::roster::coordinator::Coordinator::topology
+#[utoipa::path(
+    get,
+    path = "/v1/mesh/topology",
+    tag = "mesh",
+    responses(
+        (status = 200, description = "Machine graph: machines (runners excluded) + undirected edges", body = TopologyResponse),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn topology_handler(State(coordinator): State<Coordinator>) -> Response {
+    Json(coordinator.topology()).into_response()
 }

@@ -23,7 +23,7 @@ mod jwt_tests;
 mod tests;
 
 use crate::auth::AuthValidator;
-use crate::http::api::PeerInfo;
+use crate::http::api::{PeerInfo, TopologyEdge, TopologyMachine, TopologyResponse};
 use crate::http::sse::PeerBroadcaster;
 use crate::nat::holepunch::PunchTracker;
 use crate::policy::PolicyStore;
@@ -591,6 +591,89 @@ impl Coordinator {
         Some(if any_direct { "direct" } else { "relay" }.to_owned())
     }
 
+    /// Project the roster into the **machine graph** (`GET /v1/mesh/topology`).
+    ///
+    /// Returns [`TopologyResponse`] = `{ machines, edges }`:
+    ///
+    /// - **machines** — every roster peer that is NOT an app-runner
+    ///   (see [`is_machine`]), ordered by `peer_index` for deterministic
+    ///   output. Each carries `name` / `ula` / `tags` / `relay_only` /
+    ///   `software_version` taken from the entry the same way
+    ///   [`PeerEntry::to_info`] does.
+    /// - **edges** — the directed per-reporter [`PeerEntry::paths`] collapsed
+    ///   into UNDIRECTED machine↔machine pairs. For an unordered pair `{A, B}`
+    ///   where at least one direction reported a path: `direct = A→B.direct OR
+    ///   B→A.direct` and `age_ms = min` of the reported ages. The endpoints are
+    ///   ordered `from < to` by UUID string so each pair appears exactly once.
+    ///   Edges touching a filtered-out runner are dropped. Sorted by
+    ///   `(from, to)` for determinism.
+    #[must_use]
+    pub fn topology(&self) -> TopologyResponse {
+        // Machine entries, sorted by peer_index for stable output.
+        let mut entries: Vec<PeerEntry> = self
+            .inner
+            .roster
+            .iter()
+            .map(|kv| kv.value().clone())
+            .filter(is_machine)
+            .collect();
+        entries.sort_by_key(|e| e.peer_index);
+
+        // Set of machine ids — an edge endpoint must be a machine on BOTH
+        // sides (drops any edge to/from a filtered-out runner).
+        let machine_ids: std::collections::HashSet<Uuid> =
+            entries.iter().map(|e| e.peer_id).collect();
+
+        let machines: Vec<TopologyMachine> = entries
+            .iter()
+            .map(|e| TopologyMachine {
+                peer_id: e.peer_id.to_string(),
+                name: e.display_name.clone(),
+                ula: e.ula.to_string(),
+                tags: e.tags.clone(),
+                relay_only: e.relay_only,
+                software_version: e.software_version.clone(),
+            })
+            .collect();
+
+        // Collapse the directed paths into undirected pairs keyed by the
+        // canonical (lo, hi) UUID-string ordering.
+        let mut pairs: std::collections::HashMap<(String, String), (bool, u64)> =
+            std::collections::HashMap::new();
+        for reporter in &entries {
+            for (target, (direct, age)) in &reporter.paths {
+                // Both endpoints must be machines (skip edges to runners /
+                // unknown peers).
+                if !machine_ids.contains(target) {
+                    continue;
+                }
+                let a = reporter.peer_id.to_string();
+                let b = target.to_string();
+                let key = if a < b { (a, b) } else { (b, a) };
+                pairs
+                    .entry(key)
+                    .and_modify(|(d, ag)| {
+                        *d = *d || *direct;
+                        *ag = (*ag).min(*age);
+                    })
+                    .or_insert((*direct, *age));
+            }
+        }
+
+        let mut edges: Vec<TopologyEdge> = pairs
+            .into_iter()
+            .map(|((from, to), (direct, age_ms))| TopologyEdge {
+                from,
+                to,
+                direct,
+                age_ms,
+            })
+            .collect();
+        edges.sort_by(|x, y| (&x.from, &x.to).cmp(&(&y.from, &y.to)));
+
+        TopologyResponse { machines, edges }
+    }
+
     /// Iterate over peer ids whose `last_heartbeat` is older than
     /// `heartbeat_timeout`. Used by the background sweeper.
     #[must_use]
@@ -608,6 +691,30 @@ impl Coordinator {
             })
             .collect()
     }
+}
+
+/// Second hextet of an app/runner ULA. App-ULAs live in `fd5a:1f02::/32`
+/// (`derive_app_ula` in the app layer), whereas plain peers get
+/// `fd5a:1f00:...` from the [`crate::roster::allocator::UlaAllocator`].
+const RUNNER_ULA_HEXTET: u16 = 0x1f02;
+
+/// Whether `entry` is a **machine** (not an app-runner). The topology
+/// graph keeps only machines.
+///
+/// A peer is an app-runner — and therefore NOT a machine — when ANY of:
+/// - its ULA is inside `fd5a:1f02::/32` (the app-ULA block), OR
+/// - it carries the `"runner"` tag, OR
+/// - its [`PeerEntry::kind`] is `"runner"`.
+///
+/// A real runner registers with `kind == "runner"` paired with a `1f02`
+/// ULA, so the ULA check catches every runner today; the `kind` / tag
+/// checks are defense-in-depth so a runner that somehow lacks the `1f02`
+/// ULA still cannot slip in as a machine.
+fn is_machine(entry: &PeerEntry) -> bool {
+    let runner_ula = entry.ula.segments()[1] == RUNNER_ULA_HEXTET;
+    let runner_tag = entry.tags.iter().any(|t| t == "runner");
+    let runner_kind = entry.kind == "runner";
+    !(runner_ula || runner_tag || runner_kind)
 }
 
 pub(crate) fn decode_pubkey(s: &str) -> Result<Vec<u8>, CoordinatorError> {

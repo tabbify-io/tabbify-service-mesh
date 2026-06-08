@@ -1674,3 +1674,241 @@ async fn restored_peer_is_not_immediately_stale() {
         "restored peers get a full heartbeat-timeout grace, not instant eviction",
     );
 }
+
+// -----------------------------------------------------------------
+// Topology: the machine graph. `topology()` projects the roster into
+// `{ machines, edges }`, EXCLUDING app-runners (ULA in `fd5a:1f02::/32`
+// OR tag `"runner"`) and collapsing the directed `paths` into undirected
+// machine↔machine pairs.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn topology_collapses_edges_and_filters_runners() {
+    use crate::http::api::PeerPathDto;
+
+    let c = coordinator();
+    // Three machine peers (plain `fd5a:1f00:...` ULAs).
+    let (a, _) = c
+        .register(RegisterRequest {
+            tags: vec!["supervisor".into(), "firecracker".into()],
+            software_version: Some("1.4.35".into()),
+            relay_only: false,
+            ..req(60, "A")
+        })
+        .await
+        .expect("register A");
+    let (b, _) = c.register(req(61, "B")).await.expect("register B");
+    let (cc, _) = c.register(req(62, "C")).await.expect("register C");
+    // A runner peer — detected by its `fd5a:1f02::/32` ULA.
+    let (runner, _) = c
+        .register(req_with_requested_ula(63, "runner-1", "fd5a:1f02:aaaa::1"))
+        .await
+        .expect("register runner");
+
+    // Directed paths: A→B direct, B→A relay, A→C relay, runner→A direct.
+    c.record_peer_paths(
+        a.peer_id,
+        &[
+            PeerPathDto {
+                peer_id: b.peer_id.to_string(),
+                direct: true,
+                last_rx_age_ms: 50,
+            },
+            PeerPathDto {
+                peer_id: cc.peer_id.to_string(),
+                direct: false,
+                last_rx_age_ms: 900,
+            },
+        ],
+    );
+    c.record_peer_paths(
+        b.peer_id,
+        &[PeerPathDto {
+            peer_id: a.peer_id.to_string(),
+            direct: false,
+            last_rx_age_ms: 30,
+        }],
+    );
+    c.record_peer_paths(
+        runner.peer_id,
+        &[PeerPathDto {
+            peer_id: a.peer_id.to_string(),
+            direct: true,
+            last_rx_age_ms: 10,
+        }],
+    );
+
+    let topo = c.topology();
+
+    // Machines = {A, B, C}; runner excluded.
+    let machine_ids: std::collections::HashSet<String> =
+        topo.machines.iter().map(|m| m.peer_id.clone()).collect();
+    assert_eq!(machine_ids.len(), 3, "exactly three machines (runner excluded)");
+    assert!(machine_ids.contains(&a.peer_id.to_string()));
+    assert!(machine_ids.contains(&b.peer_id.to_string()));
+    assert!(machine_ids.contains(&cc.peer_id.to_string()));
+    assert!(
+        !machine_ids.contains(&runner.peer_id.to_string()),
+        "the runner must not appear as a machine"
+    );
+
+    // The machine carrying the metadata round-trips tags / relay_only /
+    // software_version the same way `to_info()` does.
+    let machine_a = topo
+        .machines
+        .iter()
+        .find(|m| m.peer_id == a.peer_id.to_string())
+        .expect("machine A present");
+    assert_eq!(machine_a.name, "A");
+    assert_eq!(machine_a.ula, a.ula.to_string());
+    assert_eq!(machine_a.tags, vec!["supervisor", "firecracker"]);
+    assert!(!machine_a.relay_only);
+    assert_eq!(machine_a.software_version.as_deref(), Some("1.4.35"));
+
+    // NO edge touches the runner.
+    for e in &topo.edges {
+        assert_ne!(e.from, runner.peer_id.to_string());
+        assert_ne!(e.to, runner.peer_id.to_string());
+    }
+
+    // Helper: find the undirected edge for an unordered machine pair.
+    let find_edge = |x: &Uuid, y: &Uuid| {
+        let (lo, hi) = if x.to_string() < y.to_string() {
+            (x.to_string(), y.to_string())
+        } else {
+            (y.to_string(), x.to_string())
+        };
+        topo.edges
+            .iter()
+            .find(|e| e.from == lo && e.to == hi)
+            .cloned()
+    };
+
+    // Edge {A,B}: A→B direct OR B→A relay → direct; age = min(50, 30) = 30.
+    let ab = find_edge(&a.peer_id, &b.peer_id).expect("edge A-B present");
+    assert!(ab.direct, "A↔B is direct (one direction reported direct)");
+    assert_eq!(ab.age_ms, 30, "age_ms is the min of reported ages");
+    // It appears EXACTLY once.
+    let ab_count = topo
+        .edges
+        .iter()
+        .filter(|e| {
+            (e.from == a.peer_id.to_string() && e.to == b.peer_id.to_string())
+                || (e.from == b.peer_id.to_string() && e.to == a.peer_id.to_string())
+        })
+        .count();
+    assert_eq!(ab_count, 1, "the {{A,B}} pair appears exactly once");
+
+    // Edge {A,C}: only A→C relay → relay; age = 900.
+    let ac = find_edge(&a.peer_id, &cc.peer_id).expect("edge A-C present");
+    assert!(!ac.direct, "A↔C is relay (no direction reported direct)");
+    assert_eq!(ac.age_ms, 900);
+
+    // No spurious B↔C edge (neither reported a path to the other).
+    assert!(find_edge(&b.peer_id, &cc.peer_id).is_none());
+}
+
+/// Defense-in-depth: a runner that does NOT have a `fd5a:1f02::/32` ULA
+/// must still be excluded from the machine graph when it is identified as a
+/// runner by `kind == "runner"` and/or the `"runner"` tag. Exercises the
+/// branch of `is_machine` that the ULA-based test above does not.
+#[tokio::test]
+async fn topology_excludes_runner_by_kind_and_tag_without_1f02_ula() {
+    use crate::http::api::PeerPathDto;
+
+    let c = coordinator();
+    // A plain machine.
+    let (a, _) = c.register(req(70, "A")).await.expect("register A");
+    // A runner identified ONLY by `kind == "runner"` — NO `"runner"` tag and
+    // a PLAIN (`fd5a:1f00:...`) idx-derived ULA — so neither the ULA branch
+    // nor the tag branch of `is_machine` catches it; only the kind branch.
+    let (kind_runner, _) = c
+        .register(RegisterRequest {
+            kind: "runner".into(),
+            tags: vec!["dev-machine".into()],
+            parent: Some("fd5a:1f00:0:1::1".into()),
+            app_uuid: Some("01910f10-0000-7000-8000-000000000001".into()),
+            ..req(71, "runner-kind-only")
+        })
+        .await
+        .expect("register kind-only runner");
+    // A runner identified ONLY by the `"runner"` tag — kind="peer", plain ULA.
+    let (tag_runner, _) = c
+        .register(RegisterRequest {
+            tags: vec!["runner".into()],
+            ..req(72, "runner-tag-only")
+        })
+        .await
+        .expect("register tag-only runner");
+
+    // Sanity: neither runner got a 1f02 ULA, so the ULA branch can't be the
+    // thing excluding them — kind / tag must.
+    assert_ne!(
+        kind_runner.ula.segments()[1],
+        0x1f02,
+        "kind-only runner must use a NON-1f02 ULA to exercise the kind branch"
+    );
+    assert_ne!(
+        tag_runner.ula.segments()[1],
+        0x1f02,
+        "tag-only runner must use a NON-1f02 ULA to exercise the tag branch"
+    );
+
+    // Edges in both directions so a missed exclusion would surface as an edge.
+    c.record_peer_paths(
+        a.peer_id,
+        &[
+            PeerPathDto {
+                peer_id: kind_runner.peer_id.to_string(),
+                direct: true,
+                last_rx_age_ms: 5,
+            },
+            PeerPathDto {
+                peer_id: tag_runner.peer_id.to_string(),
+                direct: true,
+                last_rx_age_ms: 5,
+            },
+        ],
+    );
+    c.record_peer_paths(
+        kind_runner.peer_id,
+        &[PeerPathDto {
+            peer_id: a.peer_id.to_string(),
+            direct: true,
+            last_rx_age_ms: 5,
+        }],
+    );
+    c.record_peer_paths(
+        tag_runner.peer_id,
+        &[PeerPathDto {
+            peer_id: a.peer_id.to_string(),
+            direct: true,
+            last_rx_age_ms: 5,
+        }],
+    );
+
+    let topo = c.topology();
+
+    // Only the plain machine appears; both runners are filtered out.
+    let machine_ids: std::collections::HashSet<String> =
+        topo.machines.iter().map(|m| m.peer_id.clone()).collect();
+    assert_eq!(machine_ids.len(), 1, "only the plain machine is a machine");
+    assert!(machine_ids.contains(&a.peer_id.to_string()));
+    assert!(
+        !machine_ids.contains(&kind_runner.peer_id.to_string()),
+        "a kind=runner peer must be excluded even without a 1f02 ULA or tag"
+    );
+    assert!(
+        !machine_ids.contains(&tag_runner.peer_id.to_string()),
+        "a tag=runner peer must be excluded even without a 1f02 ULA"
+    );
+
+    // And NO edge touches either runner (neither is a machine).
+    for e in &topo.edges {
+        assert_ne!(e.from, kind_runner.peer_id.to_string());
+        assert_ne!(e.to, kind_runner.peer_id.to_string());
+        assert_ne!(e.from, tag_runner.peer_id.to_string());
+        assert_ne!(e.to, tag_runner.peer_id.to_string());
+    }
+    assert!(topo.edges.is_empty(), "the only edges were runner↔machine");
+}

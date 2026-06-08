@@ -285,6 +285,66 @@ pub struct RosterResponse {
     pub peers: Vec<PeerInfo>,
 }
 
+/// Body of `GET /v1/mesh/topology` response: the **machine graph**.
+///
+/// A read-only projection of the roster, EXCLUDING app-runners (a runner
+/// is a peer whose ULA is inside `fd5a:1f02::/32` or that carries the
+/// `"runner"` tag). The directed per-reporter [`PeerInfo::connectivity`]
+/// edges are collapsed into undirected machine↔machine pairs (see
+/// [`TopologyEdge`]). The node + frontend mirror this shape byte-for-byte.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TopologyResponse {
+    /// Roster peers that are machines (runners excluded), ordered by the
+    /// coordinator's peer index for deterministic output.
+    pub machines: Vec<TopologyMachine>,
+    /// Undirected machine↔machine edges, ordered by `(from, to)` UUID
+    /// string for deterministic output. Each unordered pair appears once.
+    pub edges: Vec<TopologyEdge>,
+}
+
+/// One machine node in the [`TopologyResponse`] graph. A trimmed
+/// [`PeerInfo`] carrying only the display-facing fields the topology view
+/// needs.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TopologyMachine {
+    /// Coordinator-assigned UUID v7 (string form).
+    pub peer_id: String,
+    /// Human-readable peer name (the peer's `display_name`).
+    pub name: String,
+    /// Assigned IPv6 ULA, textual form.
+    pub ula: String,
+    /// Role hint labels.
+    pub tags: Vec<String>,
+    /// Whether this peer declared itself relay-only (no reachable direct
+    /// endpoint). Same flag as [`PeerInfo::relay_only`].
+    pub relay_only: bool,
+    /// Reported software version this peer is running (e.g. `"1.4.35"`).
+    /// `None` = unknown. Unlike [`PeerInfo::software_version`] (which OMITS
+    /// the key when `None` via `skip_serializing_if`), this field is ALWAYS
+    /// present in the wire JSON and serializes as `null` when unknown — the
+    /// topology contract requires it to be nullable/always-present so the
+    /// node + frontend can rely on the key existing.
+    pub software_version: Option<String>,
+}
+
+/// One undirected edge in the [`TopologyResponse`] graph.
+///
+/// Collapsed from the directed per-reporter paths: for an unordered
+/// machine pair `{A, B}` where at least one direction reported a path,
+/// `direct = A→B.direct OR B→A.direct` and `age_ms = min` of the reported
+/// ages. `from < to` by UUID string so the pair appears exactly once.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TopologyEdge {
+    /// The lexicographically-smaller endpoint UUID (string form).
+    pub from: String,
+    /// The lexicographically-larger endpoint UUID (string form).
+    pub to: String,
+    /// `true` when EITHER direction reported a direct (p2p) path.
+    pub direct: bool,
+    /// Minimum `last_rx_age_ms` across the reported directions of the pair.
+    pub age_ms: u64,
+}
+
 /// JSON error envelope. Kept dead simple — there's no public-facing
 /// error code taxonomy yet.
 #[derive(Debug, Clone, Serialize, ToSchema)]

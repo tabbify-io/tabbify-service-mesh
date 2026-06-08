@@ -72,6 +72,7 @@ async fn openapi_json_is_served_and_lists_every_route() {
         "/v1/mesh/deregister",
         "/v1/mesh/peers",
         "/v1/mesh/peers/stream",
+        "/v1/mesh/topology",
         "/v1/policy",
     ] {
         assert!(

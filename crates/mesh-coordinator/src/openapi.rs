@@ -16,7 +16,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::http::api::{
     ApiError, DeregisterRequest, HeartbeatRequest, HeartbeatResponse, PeerInfo, PeerPathDto,
-    RegisterRequest, RegisterResponse, RosterQuery, RosterResponse, StreamQuery,
+    RegisterRequest, RegisterResponse, RosterQuery, RosterResponse, StreamQuery, TopologyEdge,
+    TopologyMachine, TopologyResponse,
 };
 use crate::http::policy_api::PolicyResponse;
 use crate::http::sse::PeerEvent;
@@ -48,6 +49,7 @@ use crate::roster::events::HolePunchInitiate;
         crate::http::api::handlers::heartbeat_handler,
         crate::http::api::handlers::deregister_handler,
         crate::http::api::handlers::peers_handler,
+        crate::http::api::handlers::topology_handler,
         crate::http::api::stream::stream_handler,
         crate::http::relay::relay_ws_handler,
         crate::http::policy_api::get_policy_handler,
@@ -63,6 +65,10 @@ use crate::roster::events::HolePunchInitiate;
         RosterResponse,
         RosterQuery,
         StreamQuery,
+        // Machine-graph (topology) DTOs.
+        TopologyResponse,
+        TopologyMachine,
+        TopologyEdge,
         // SSE per-event payload (the streaming body itself isn't a
         // single OpenAPI body type; this documents what a subscriber
         // decodes from each `data:` frame).
@@ -148,6 +154,7 @@ mod tests {
                 "/v1/mesh/peers/stream",
                 "/v1/mesh/register",
                 "/v1/mesh/relay",
+                "/v1/mesh/topology",
                 "/v1/policy",
             ],
         );

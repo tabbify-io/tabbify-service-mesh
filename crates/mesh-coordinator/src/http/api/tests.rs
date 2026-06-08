@@ -2,13 +2,16 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use super::dto::{HeartbeatRequest, RegisterRequest};
+use super::dto::{HeartbeatRequest, PeerPathDto, RegisterRequest};
+use super::handlers::topology_handler;
 use super::stream::ViewerFilter;
 use crate::http::sse::PeerEvent;
 use crate::publisher::EventPublisher;
 use crate::roster::coordinator::Coordinator;
 use crate::roster::events::HolePunchInitiate;
 use async_trait::async_trait;
+use axum::extract::State;
+use base64::Engine as _;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -213,4 +216,61 @@ fn peer_info_relay_only_back_compat_and_round_trips() {
     }))
     .expect("modern roster entry parses");
     assert!(modern.relay_only);
+}
+
+/// A minimal register request for a plain machine peer (seed → pubkey).
+fn machine_req(seed: u8, name: &str) -> RegisterRequest {
+    RegisterRequest {
+        wg_public_key: base64::engine::general_purpose::STANDARD.encode([seed; 32]),
+        listen_endpoint: Some("127.0.0.1:51820".into()),
+        wg_listen_port: Some(51820),
+        display_name: name.into(),
+        network: String::new(),
+        tags: vec![],
+        hosted_app_ulas: vec![],
+        kind: "peer".into(),
+        parent: None,
+        app_uuid: None,
+        requested_ula: None,
+        software_version: None,
+        relay_only: false,
+    }
+}
+
+/// `GET /v1/mesh/topology` (driven through [`topology_handler`]) returns
+/// `200` with both registered machines and the single undirected edge
+/// between them, marked `direct`.
+#[tokio::test]
+async fn topology_handler_returns_machines_and_edges() {
+    let c = test_coordinator();
+    let (a, _) = c.register(machine_req(1, "A")).await.expect("register A");
+    let (b, _) = c.register(machine_req(2, "B")).await.expect("register B");
+
+    // A reports a DIRECT path to B (one direction is enough for the
+    // collapsed undirected edge to be direct).
+    c.record_peer_paths(
+        a.peer_id,
+        &[PeerPathDto {
+            peer_id: b.peer_id.to_string(),
+            direct: true,
+            last_rx_age_ms: 12,
+        }],
+    );
+
+    let resp = topology_handler(State(c)).await;
+    assert_eq!(resp.status(), 200, "topology must be 200");
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    // The response DTO is Serialize-only (it is a wire response, like
+    // RosterResponse), so the test parses the JSON shape directly.
+    let topo: serde_json::Value = serde_json::from_slice(&bytes).expect("parse topology body");
+
+    let machines = topo["machines"].as_array().expect("machines array");
+    let edges = topo["edges"].as_array().expect("edges array");
+    assert_eq!(machines.len(), 2, "both machines present");
+    assert_eq!(edges.len(), 1, "exactly one collapsed edge");
+    assert_eq!(edges[0]["direct"], serde_json::json!(true), "A↔B is direct");
+    assert_eq!(edges[0]["age_ms"], serde_json::json!(12));
 }
