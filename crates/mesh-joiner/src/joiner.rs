@@ -227,7 +227,7 @@ impl Joiner {
         // handle is wired into the SessionTable so the loops can reach it;
         // the receiver is handed to the relay task in `spawn_background_tasks`.
         let (relay_handle, relay_outbound_rx) =
-            build_relay_channel(config.relay_enabled, config.insecure_no_mtls);
+            build_relay_channel(config.relay_enabled, config.insecure_no_mtls, config.relay_only);
 
         let route_sink = Arc::new(source_scope.map_or_else(
             || platform::TunRouteSink::new(iface_name.clone()),
@@ -982,12 +982,13 @@ async fn open_tun_device(
 fn build_relay_channel(
     relay_enabled: bool,
     insecure_no_mtls: bool,
+    relay_only: bool,
 ) -> (
     Option<crate::relay::RelayHandle>,
     Option<mpsc::UnboundedReceiver<crate::relay::client::RelayOutbound>>,
 ) {
     if relay_enabled && insecure_no_mtls {
-        let (h, rx) = crate::relay::RelayHandle::new();
+        let (h, rx) = crate::relay::RelayHandle::new(relay_only);
         (Some(h), Some(rx))
     } else if relay_enabled {
         // Enabled but secure: the relay client can't connect yet (wss/mTLS

@@ -39,13 +39,31 @@ pub struct RelayOutbound {
 #[derive(Clone)]
 pub struct RelayHandle {
     tx: mpsc::UnboundedSender<RelayOutbound>,
+    /// `true` when the LOCAL node joined `relay_only` — it declared it has no
+    /// usable direct path, so its TX must NEVER attempt a direct probe in
+    /// `send_wire`; every frame rides the relay. Direct-dialing from a
+    /// `relay_only` node re-creates the class of the 2026-06-07 outage
+    /// (dialing peers the `relay_only` contract deliberately keeps off the
+    /// direct plane). Carried on the handle because it IS the relay-vs-direct policy
+    /// context the single TX chokepoint already holds — no extra plumbing
+    /// through every send site.
+    relay_only: bool,
 }
 
 impl RelayHandle {
     /// Create a handle paired with the receiver the relay task drains.
-    pub(crate) fn new() -> (Self, mpsc::UnboundedReceiver<RelayOutbound>) {
+    /// `relay_only` is the LOCAL node's policy (see the field doc).
+    pub(crate) fn new(relay_only: bool) -> (Self, mpsc::UnboundedReceiver<RelayOutbound>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx }, rx)
+        (Self { tx, relay_only }, rx)
+    }
+
+    /// `true` when the local node is `relay_only` (see the field doc). The TX
+    /// chokepoint (`send_wire`) consults this to suppress the unconfirmed
+    /// direct probe.
+    #[must_use]
+    pub(crate) const fn relay_only(&self) -> bool {
+        self.relay_only
     }
 
     /// Queue an already-encrypted WG datagram for relay to `dst_pubkey`.
@@ -291,7 +309,7 @@ mod tests {
     /// the relay task drains carries the destination pubkey + payload.
     #[tokio::test]
     async fn try_relay_queues_outbound() {
-        let (handle, mut rx) = RelayHandle::new();
+        let (handle, mut rx) = RelayHandle::new(false);
         handle.try_relay([9u8; 32], vec![1, 2, 3]);
         let got = rx.recv().await.expect("queued outbound");
         assert_eq!(got.dst_pubkey, [9u8; 32]);
@@ -302,7 +320,7 @@ mod tests {
     /// packet is silently dropped (relay task gone == pre-relay drop).
     #[tokio::test]
     async fn try_relay_after_rx_dropped_is_silent() {
-        let (handle, rx) = RelayHandle::new();
+        let (handle, rx) = RelayHandle::new(false);
         drop(rx);
         handle.try_relay([1u8; 32], vec![0]); // must not panic
     }
@@ -393,7 +411,7 @@ mod tests {
         let tun: Arc<dyn TunDevice> = Arc::new(RecordingTun {
             written: parking_lot::Mutex::new(Vec::new()),
         });
-        let (handle, outbound_rx) = RelayHandle::new();
+        let (handle, outbound_rx) = RelayHandle::new(false);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let task = tokio::spawn(run(RelayTask {
@@ -436,7 +454,7 @@ mod tests {
         let tun: Arc<dyn TunDevice> = Arc::new(RecordingTun {
             written: parking_lot::Mutex::new(Vec::new()),
         });
-        let (_handle, outbound_rx) = RelayHandle::new();
+        let (_handle, outbound_rx) = RelayHandle::new(false);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let res = tokio::time::timeout(
             Duration::from_secs(2),

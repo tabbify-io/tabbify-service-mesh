@@ -396,6 +396,7 @@ impl SessionTable {
             // only a candidate until a decrypted data packet confirms it.
             direct_confirmed: AtomicBool::new(false),
             last_direct_rx_micros: AtomicI64::new(0),
+            last_probe_micros: AtomicI64::new(0),
             tunn: Mutex::new(tunn),
         });
         // Re-apply any app-ULAs this peer already hosts onto the FRESH

@@ -44,6 +44,13 @@ pub(crate) const MAX_UDP_FRAME: usize = 9_001;
 /// the receive buffer.
 pub(crate) const MAX_TUN_FRAME: usize = 9_001;
 
+/// Minimum spacing between unconfirmed direct PROBES to a single peer (see
+/// `send_wire`). One probe per second is ample to win the direct-vs-relay
+/// race on a genuinely reachable path (confirmation needs just one direct
+/// DATA delivery), while capping the cost of a permanent black-hole
+/// candidate at ~1 packet/s instead of a full-rate duplicate stream.
+const DIRECT_PROBE_INTERVAL_MICROS: i64 = 1_000_000;
+
 /// Current time as unix-micros. Used to stamp direct-path RX timestamps
 /// and to drive the staleness downgrade. Saturates to `0` on the
 /// impossible pre-epoch clock and to `i64::MAX` on the (year-294247)
@@ -60,17 +67,23 @@ pub(crate) fn now_micros() -> i64 {
 }
 
 /// Send already-encapsulated `WireGuard` bytes to `session` over the best
-/// path: a CONFIRMED-direct UDP endpoint, else the relay (the connectivity
-/// floor), else — when no relay is configured — a best-effort send to the
-/// unconfirmed candidate endpoint (pre-relay behaviour), else drop.
+/// path:
+///   * a CONFIRMED-direct UDP endpoint; else
+///   * the relay floor (the delivery guarantee) — AND, while the path is
+///     unconfirmed, ALSO a rate-limited direct PROBE at the candidate
+///     endpoint so a genuinely reachable path can carry DATA and bootstrap
+///     `confirm_direct` (see the relay branch); else
+///   * when no relay is configured, a best-effort send to the unconfirmed
+///     candidate endpoint (pre-relay behaviour); else drop.
 ///
 /// This is the single TX chokepoint every WG send site routes through, so
 /// the direct-vs-relay decision lives in exactly one place. A `Some`
-/// endpoint on an UNCONFIRMED session is only a CANDIDATE: until a
-/// decrypted data packet proves the direct path bidirectionally
-/// (`PeerSession::confirm_direct`), traffic rides the relay so a
-/// firewalled/NAT'd peer whose reflexive endpoint the coordinator
-/// advertised is reachable rather than black-holed.
+/// endpoint on an UNCONFIRMED session is only a CANDIDATE: the relay floor
+/// guarantees delivery even to a firewalled/NAT'd peer whose advertised
+/// reflexive endpoint may be a black hole, while the parallel probe lets a
+/// genuinely reachable candidate prove itself — a decrypted DATA packet over
+/// the direct path flips `PeerSession::confirm_direct` and graduates the
+/// session off the floor (the confirmed branch above then owns the path).
 async fn send_wire(
     socket: &UdpSocket,
     relay: Option<&RelayHandle>,
@@ -87,7 +100,43 @@ async fn send_wire(
         }
     }
     if let Some(relay) = relay {
-        tracing::debug!(peer = %session.peer_id, len = bytes.len(), "send_wire: relay");
+        // Direct-path PROBE before the relay floor: while the path is
+        // UNCONFIRMED we still hold a CANDIDATE endpoint (roster-advertised or
+        // learned). Send the SAME bytes direct too, so a real direct path
+        // carries DATA and triggers `confirm_direct` on the peer (an inbound
+        // direct `DeliverToTun`) — the only thing that lifts a pair off the
+        // relay floor. The relay copy below guarantees delivery, so a
+        // black-hole candidate never drops the frame; WG anti-replay dedups so
+        // the inner packet reaches the app exactly once — whichever copy wins
+        // the race (direct wins on a working LAN/punched path). Reaching here
+        // with `Some(endpoint)` implies the path is NOT confirmed (the
+        // confirmed branch returned above), so this never doubles a
+        // steady-state confirmed flow.
+        //
+        // TWO guards keep the probe safe and cheap:
+        //   * NOT relay_only — a relay_only local node declared no direct
+        //     plane; probing would direct-dial peers the relay_only contract
+        //     keeps off direct (the 2026-06-07 outage class). Suppressing it
+        //     here also breaks the chain by construction: a relay_only node
+        //     never probes, so its peers never `learn_endpoint` for it and
+        //     never probe it back (the coordinator already advertises no
+        //     endpoint for relay_only peers).
+        //   * rate-limited per session — at most one probe per
+        //     `DIRECT_PROBE_INTERVAL_MICROS`, so a permanent black-hole
+        //     candidate costs ~1 pkt/s, not a full-rate duplicate stream.
+        // Probe FIRST (borrow) so the relay enqueue below can MOVE `bytes`
+        // without a clone.
+        if !relay.relay_only()
+            && let Some(endpoint) = session.endpoint()
+            && session.should_probe_direct(now_micros(), DIRECT_PROBE_INTERVAL_MICROS)
+        {
+            tracing::debug!(peer = %session.peer_id, %endpoint, len = bytes.len(), "send_wire: direct probe (unconfirmed) + relay");
+            if let Err(e) = socket.send_to(&bytes, endpoint).await {
+                tracing::debug!(error = %e, %endpoint, "udp direct-probe send failed");
+            }
+        } else {
+            tracing::debug!(peer = %session.peer_id, len = bytes.len(), "send_wire: relay");
+        }
         relay.try_relay(session.peer_pubkey, bytes);
         return;
     }
@@ -641,6 +690,7 @@ mod tests {
             endpoint: parking_lot::RwLock::new(None),
             direct_confirmed: std::sync::atomic::AtomicBool::new(false),
             last_direct_rx_micros: std::sync::atomic::AtomicI64::new(0),
+            last_probe_micros: std::sync::atomic::AtomicI64::new(0),
             tunn: tokio::sync::Mutex::new(boringtun::noise::Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
@@ -693,7 +743,7 @@ mod tests {
     /// pubkey and is non-empty (a WG handshake-init).
     #[tokio::test]
     async fn encapsulate_relays_when_no_endpoint() {
-        let (relay, mut rx) = crate::relay::RelayHandle::new();
+        let (relay, mut rx) = crate::relay::RelayHandle::new(false);
         let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
         let session = upsert_peer(&table, "fd5a:1f00:1::1", None); // passive: no endpoint
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -713,18 +763,29 @@ mod tests {
         );
     }
 
-    /// REGRESSION (this fix): a `Some` endpoint is only a CANDIDATE, not a
-    /// confirmed direct path. With a relay handle present and the session
-    /// NOT yet `direct_confirmed`, TX must go over the RELAY — the
-    /// connectivity floor — NOT to the unconfirmed candidate endpoint. The
-    /// old code sent straight to the candidate endpoint (a black hole for a
-    /// firewalled/NAT'd peer whose reflexive endpoint the coordinator
-    /// advertised) and never relayed. This test FAILS on the old code.
+    /// THE direct-path bootstrap (this fix): a `Some` endpoint on an
+    /// UNCONFIRMED session is a CANDIDATE. To let a real direct path carry
+    /// DATA — the only signal that flips `confirm_direct` (an inbound direct
+    /// `DeliverToTun`) — TX must send the frame over the candidate endpoint
+    /// AS WELL AS the relay floor. The relay copy guarantees delivery (no
+    /// black-hole for a firewalled/NAT'd peer); the direct copy probes the
+    /// candidate. `WireGuard` anti-replay dedups so the inner packet reaches
+    /// the app exactly once (whichever copy wins the race); on a working
+    /// direct path (LAN / punched) the direct copy wins and a later DATA
+    /// delivery confirms, on a black-hole candidate it is simply lost and the
+    /// relay still delivers.
+    ///
+    /// Before this fix the relay floor sent ONLY to the relay and NEVER to
+    /// the unconfirmed candidate (to avoid black-holing) — but that made
+    /// `confirm_direct` (inbound direct DATA) UNREACHABLE whenever a relay
+    /// was configured, since no DATA ever traversed the direct path: every
+    /// pair stuck on the relay forever. This test FAILS on that code (the
+    /// candidate receives nothing).
     #[tokio::test]
-    async fn tx_relays_when_endpoint_known_but_unconfirmed() {
-        let (relay, mut rx) = crate::relay::RelayHandle::new();
-        // Bind a receiver socket so a (wrongly) direct send WOULD land here —
-        // letting the test distinguish "relayed" from "sent direct".
+    async fn tx_double_sends_relay_and_direct_probe_while_unconfirmed() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new(false);
+        // Bind a receiver socket as the candidate endpoint so the direct
+        // probe lands somewhere observable.
         let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let dst = receiver.local_addr().unwrap();
         let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
@@ -739,13 +800,11 @@ mod tests {
 
         encapsulate_and_send(&sender, table.relay(), &session, &packet).await;
 
-        // The frame went over the RELAY, not the candidate UDP endpoint.
-        // Bounded so the OLD (buggy) behaviour — which sends direct and
-        // never relays — fails as a clean assertion instead of hanging on
-        // an unbounded `recv`.
+        // (1) Floor preserved: the frame still goes over the RELAY so a
+        // black-hole candidate never drops it.
         let out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
             .await
-            .expect("frame must be relayed (not sent direct) while direct is unconfirmed")
+            .expect("frame must still be relayed (the delivery floor)")
             .expect("relay channel delivered the frame");
         assert_eq!(
             out.dst_pubkey, session.peer_pubkey,
@@ -755,12 +814,100 @@ mod tests {
             !out.payload.is_empty(),
             "relayed payload is the WG handshake-init"
         );
+
+        // (2) NEW: the SAME frame is ALSO probed direct at the candidate
+        // endpoint — this is what lets a real direct path carry traffic and
+        // bootstrap `confirm_direct`. Bounded so the OLD (relay-only)
+        // behaviour fails as a clean timeout instead of hanging.
         let mut buf = vec![0u8; MAX_UDP_FRAME];
-        let recv =
+        let (n, _) =
+            tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf))
+                .await
+                .expect("direct probe must reach the candidate endpoint")
+                .expect("candidate socket received the probe");
+        assert_eq!(
+            &buf[..n],
+            &out.payload[..],
+            "direct probe carries the same bytes as the relay copy"
+        );
+    }
+
+    /// The unconfirmed direct probe is RATE-LIMITED per session: two
+    /// back-to-back sends relay BOTH frames but probe the candidate only
+    /// ONCE (the second is within `DIRECT_PROBE_INTERVAL_MICROS`). This caps
+    /// a permanent black-hole candidate at ~1 probe/interval instead of a
+    /// full-rate duplicate stream.
+    #[tokio::test]
+    async fn unconfirmed_direct_probe_is_rate_limited() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new(false);
+        let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst = receiver.local_addr().unwrap();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
+        let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        // Two sends well within the 1s probe interval.
+        send_wire(&sender, table.relay(), &session, b"first".to_vec()).await;
+        send_wire(&sender, table.relay(), &session, b"second".to_vec()).await;
+
+        // The relay floor carried BOTH frames.
+        let a = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("first frame relayed")
+            .expect("relay channel");
+        let b = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("second frame relayed")
+            .expect("relay channel");
+        assert_eq!(a.payload, b"first");
+        assert_eq!(b.payload, b"second");
+
+        // The candidate received exactly ONE probe (the first); the second
+        // send was within the interval and must NOT re-probe.
+        let mut buf = vec![0u8; MAX_UDP_FRAME];
+        let (n, _) = tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf))
+            .await
+            .expect("first probe reaches the candidate")
+            .expect("candidate recv");
+        assert_eq!(&buf[..n], b"first");
+        let second =
             tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf)).await;
         assert!(
-            recv.is_err(),
-            "nothing sent to the unconfirmed candidate endpoint"
+            second.is_err(),
+            "a second send within the probe interval must not re-probe"
+        );
+    }
+
+    /// A `relay_only` LOCAL node NEVER probes direct, even with a candidate
+    /// endpoint: it declared no direct plane, and dialing direct re-creates
+    /// the 2026-06-07 outage class (and would let peers learn its endpoint
+    /// and probe it back). TX rides the relay only.
+    #[tokio::test]
+    async fn relay_only_node_never_probes_direct() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new(true); // relay_only
+        let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst = receiver.local_addr().unwrap();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
+        assert!(!session.direct_confirmed(), "fresh session starts unconfirmed");
+        let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        send_wire(&sender, table.relay(), &session, b"x".to_vec()).await;
+
+        // Relayed (the floor) ...
+        let out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("frame relayed")
+            .expect("relay channel");
+        assert_eq!(out.payload, b"x");
+        // ... but the candidate endpoint got NOTHING — a relay_only node
+        // never dials direct.
+        let mut buf = vec![0u8; MAX_UDP_FRAME];
+        let probe =
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf)).await;
+        assert!(
+            probe.is_err(),
+            "a relay_only node must not probe the candidate endpoint"
         );
     }
 
@@ -770,7 +917,7 @@ mod tests {
     /// after bidirectional direct connectivity is proven.
     #[tokio::test]
     async fn tx_direct_when_confirmed() {
-        let (relay, mut rx) = crate::relay::RelayHandle::new();
+        let (relay, mut rx) = crate::relay::RelayHandle::new(false);
         // Bind a receiver socket so the UDP send has a live destination.
         let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let dst = receiver.local_addr().unwrap();

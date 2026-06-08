@@ -70,6 +70,13 @@ pub struct PeerSession {
     /// longer than `DIRECT_PATH_TTL_MICROS` is downgraded back to the
     /// relay. `0` means "never seen a valid direct datagram".
     pub last_direct_rx_micros: AtomicI64,
+    /// Unix-micros of the last UNCONFIRMED direct PROBE we sent at this
+    /// peer's candidate endpoint (see `send_wire`). Rate-limits the probe so
+    /// a black-hole candidate (a reflexive endpoint that never works) costs
+    /// ~1 packet per probe-interval instead of a full-rate duplicate stream,
+    /// while still letting one probe win the race on a genuinely reachable
+    /// path. `0` = never probed, so the first send probes immediately.
+    pub last_probe_micros: AtomicI64,
     /// Boringtun session state. Wrapped in a tokio Mutex so async
     /// send + receive halves can serialise access without holding a
     /// guard across socket I/O.
@@ -123,6 +130,23 @@ impl PeerSession {
         self.direct_confirmed.store(true, Ordering::Relaxed);
         self.last_direct_rx_micros
             .store(now_micros, Ordering::Relaxed);
+    }
+
+    /// Rate-limit gate for the unconfirmed direct PROBE in `send_wire`:
+    /// returns `true` at most once per `interval_micros`, stamping the clock
+    /// when it does. A relaxed load/store is fine — a racing double-read at
+    /// worst emits one extra probe, which is harmless (the probe is the same
+    /// encapsulated frame the relay also carries; WG anti-replay dedups). The
+    /// first call (clock = `0`) always probes, so a freshly reachable path
+    /// confirms without waiting a full interval.
+    pub fn should_probe_direct(&self, now_micros: i64, interval_micros: i64) -> bool {
+        let last = self.last_probe_micros.load(Ordering::Relaxed);
+        if now_micros.saturating_sub(last) >= interval_micros {
+            self.last_probe_micros.store(now_micros, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// Downgrade a confirmed path back to the relay floor if it has gone
@@ -192,6 +216,10 @@ impl std::fmt::Debug for PeerSession {
                 "last_direct_rx_micros",
                 &self.last_direct_rx_micros.load(Ordering::Relaxed),
             )
+            .field(
+                "last_probe_micros",
+                &self.last_probe_micros.load(Ordering::Relaxed),
+            )
             .field("tunn", &"<Tunn>")
             .finish()
     }
@@ -216,6 +244,7 @@ mod tests {
             endpoint: parking_lot::RwLock::new(None),
             direct_confirmed: AtomicBool::new(false),
             last_direct_rx_micros: AtomicI64::new(0),
+            last_probe_micros: AtomicI64::new(0),
             tunn: Mutex::new(Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
@@ -250,6 +279,33 @@ mod tests {
         let s = bare_session();
         s.note_direct_rx(1_000);
         assert!(!s.direct_confirmed());
+    }
+
+    /// `should_probe_direct` is the per-session rate-limit for the
+    /// unconfirmed direct probe: the first call (clock = 0) probes, a second
+    /// call within the interval is suppressed, and a call past the interval
+    /// probes again — so a black-hole candidate is dialed at most once per
+    /// interval instead of on every packet.
+    #[test]
+    fn should_probe_direct_rate_limits() {
+        let s = bare_session();
+        let interval = 1_000_000; // 1s
+        assert!(
+            s.should_probe_direct(5_000_000, interval),
+            "first probe fires (clock starts at 0)"
+        );
+        assert!(
+            !s.should_probe_direct(5_000_001, interval),
+            "a second probe 1µs later is suppressed"
+        );
+        assert!(
+            !s.should_probe_direct(5_999_999, interval),
+            "still suppressed just under the interval"
+        );
+        assert!(
+            s.should_probe_direct(6_000_000, interval),
+            "probes again once a full interval has elapsed"
+        );
     }
 
     /// `downgrade_direct_if_stale` resets a confirmed path AFTER the TTL

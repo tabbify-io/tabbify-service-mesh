@@ -461,7 +461,7 @@ mod tests {
 
         let me = Uuid::from_u128(1);
         let target = Uuid::from_u128(2);
-        let (relay, mut relay_rx) = crate::relay::RelayHandle::new();
+        let (relay, mut relay_rx) = crate::relay::RelayHandle::new(false);
         // Endpoint advertised but unreachable (a black hole for a
         // no-inbound peer); the session is unconfirmed.
         let sessions = relay_table_with(
@@ -524,7 +524,7 @@ mod tests {
 
         let me = Uuid::from_u128(1);
         let target = Uuid::from_u128(2);
-        let (relay, mut relay_rx) = crate::relay::RelayHandle::new();
+        let (relay, mut relay_rx) = crate::relay::RelayHandle::new(false);
         let sessions = relay_table_with(
             target,
             "fd5a:1f00:1::2",
