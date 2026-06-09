@@ -31,6 +31,12 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+/// This joiner crate's own compile-time version (from its `Cargo.toml` via
+/// `env!("CARGO_PKG_VERSION")`), self-reported on register + every heartbeat as
+/// `mesh_version` so the control plane sees the mesh-stack version each peer
+/// runs — independent of the host binary's caller-supplied `software_version`.
+const MESH_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Default `WireGuard` UDP listen port used when
 /// [`JoinConfig::listen_port`] is `None` — the well-known `WireGuard` port.
 ///
@@ -111,6 +117,7 @@ impl Joiner {
     /// Surfaces `anyhow::Result` because the failure surface is broad —
     /// HTTP, TUN setup, UDP bind, and sudo all share this path. The
     /// underlying error is a [`JoinerError`] variant in every case.
+    #[allow(clippy::too_many_lines)]
     pub async fn join(config: JoinConfig) -> anyhow::Result<Self> {
         let (keypair, sticky_ula, effective_requested_ula) = resolve_identity(&config)?;
 
@@ -178,6 +185,7 @@ impl Joiner {
             &reregister,
             wg_listen_port,
             config.software_version.clone(),
+            Some(MESH_VERSION.to_string()),
             effective_requested_ula.clone(),
         )
         .await?;
@@ -226,8 +234,11 @@ impl Joiner {
         // direct path, plus the receiver the relay client task drains. The
         // handle is wired into the SessionTable so the loops can reach it;
         // the receiver is handed to the relay task in `spawn_background_tasks`.
-        let (relay_handle, relay_outbound_rx) =
-            build_relay_channel(config.relay_enabled, config.insecure_no_mtls, config.relay_only);
+        let (relay_handle, relay_outbound_rx) = build_relay_channel(
+            config.relay_enabled,
+            config.insecure_no_mtls,
+            config.relay_only,
+        );
 
         let route_sink = Arc::new(source_scope.map_or_else(
             || platform::TunRouteSink::new(iface_name.clone()),
@@ -260,6 +271,7 @@ impl Joiner {
             heartbeat_interval: config.heartbeat_interval,
             hosted_app_ulas: hosted_app_ulas.clone(),
             software_version: config.software_version.clone(),
+            mesh_version: Some(MESH_VERSION.to_string()),
             relay_outbound_rx,
             relay_url: config.relay_url.clone(),
             coordinator_url: config.coordinator_url.clone(),
@@ -482,6 +494,9 @@ struct SpawnContext {
     /// Software version advertised on register + every heartbeat (spec P0
     /// OBSERVE). Host-supplied; `None` = unknown, never invented here.
     software_version: Option<String>,
+    /// This joiner's own compile-time version ([`MESH_VERSION`]), self-reported
+    /// on register + every heartbeat alongside `software_version`.
+    mesh_version: Option<String>,
     /// Receiver the relay client task drains for outbound relayed
     /// datagrams. `Some` only when relay is enabled; `None` (`--no-relay`)
     /// skips spawning the relay task entirely.
@@ -516,6 +531,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         heartbeat_interval,
         hosted_app_ulas,
         software_version,
+        mesh_version,
         relay_outbound_rx,
         relay_url,
         coordinator_url,
@@ -631,6 +647,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
             wg_listen_port,
             hosted_app_ulas,
             software_version,
+            mesh_version,
             interval: heartbeat_interval,
             shutdown: shutdown_rx,
         })
@@ -1067,6 +1084,7 @@ fn synth_info(s: &PeerSession) -> PeerInfo {
         // upsert re-applies the real set.
         hosted_app_ulas: Vec::new(),
         software_version: None,
+        mesh_version: None,
         joined_at_micros: 0,
     }
 }
@@ -1090,6 +1108,7 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             joined_at_micros: 0,
         };
         let table = SessionTable::new();
@@ -1116,6 +1135,7 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             joined_at_micros: 0,
         };
         let direct_id = Uuid::from_u128(1);

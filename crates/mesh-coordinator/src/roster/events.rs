@@ -65,6 +65,11 @@ pub struct PeerJoined {
     /// `#[serde(default)]` keeps replay / older events back-compatible.
     #[serde(default)]
     pub software_version: Option<String>,
+    /// Mesh-joiner version the registrant reported (self-reported crate
+    /// version). `#[serde(default)]` keeps replay / older events
+    /// back-compatible.
+    #[serde(default)]
+    pub mesh_version: Option<String>,
     /// Whether the peer declared itself **relay-only** (no reachable direct
     /// endpoint). A relay-only peer is never advertised with a direct listen
     /// endpoint and is never a hole-punch target. `#[serde(default)]` keeps
@@ -104,6 +109,11 @@ pub struct PeerHeartbeat {
     /// untouched. `#[serde(default)]` keeps replay back-compatible.
     #[serde(default)]
     pub software_version: Option<String>,
+    /// Mesh-joiner version reported on this heartbeat. `None` means "no change"
+    /// — the apply layer leaves the stored value untouched. `#[serde(default)]`
+    /// keeps replay back-compatible.
+    #[serde(default)]
+    pub mesh_version: Option<String>,
     /// Heartbeat wall-clock micros.
     pub at_micros: i64,
 }

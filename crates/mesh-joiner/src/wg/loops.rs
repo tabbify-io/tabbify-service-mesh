@@ -625,6 +625,7 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             joined_at_micros: 0,
         };
         let t = SessionTable::new();
@@ -731,6 +732,7 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             joined_at_micros: 0,
         };
         table.upsert(&me, &info);
@@ -820,11 +822,10 @@ mod tests {
         // bootstrap `confirm_direct`. Bounded so the OLD (relay-only)
         // behaviour fails as a clean timeout instead of hanging.
         let mut buf = vec![0u8; MAX_UDP_FRAME];
-        let (n, _) =
-            tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf))
-                .await
-                .expect("direct probe must reach the candidate endpoint")
-                .expect("candidate socket received the probe");
+        let (n, _) = tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf))
+            .await
+            .expect("direct probe must reach the candidate endpoint")
+            .expect("candidate socket received the probe");
         assert_eq!(
             &buf[..n],
             &out.payload[..],
@@ -889,7 +890,10 @@ mod tests {
         let dst = receiver.local_addr().unwrap();
         let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
         let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
-        assert!(!session.direct_confirmed(), "fresh session starts unconfirmed");
+        assert!(
+            !session.direct_confirmed(),
+            "fresh session starts unconfirmed"
+        );
         let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
 
         send_wire(&sender, table.relay(), &session, b"x".to_vec()).await;
@@ -1062,6 +1066,7 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![app],
             software_version: None,
+            mesh_version: None,
             joined_at_micros: 0,
         };
         let t = SessionTable::new();
@@ -1092,6 +1097,7 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             joined_at_micros: 0,
         };
         let t = SessionTable::new();

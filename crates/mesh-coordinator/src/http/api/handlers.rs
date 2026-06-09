@@ -176,6 +176,7 @@ pub async fn heartbeat_handler(
             req.wg_listen_port,
             req.hosted_app_ulas,
             req.software_version,
+            req.mesh_version,
             req.relay_only,
         )
         .await
@@ -260,7 +261,10 @@ pub async fn peers_handler(
     // A malformed vantage UUID degrades to "no vantage" (the default
     // per-machine self-view) rather than 400 — the field is purely advisory
     // (connectivity stamping).
-    let vantage = query.vantage.as_deref().and_then(|v| Uuid::from_str(v).ok());
+    let vantage = query
+        .vantage
+        .as_deref()
+        .and_then(|v| Uuid::from_str(v).ok());
     Json(RosterResponse {
         peers: coordinator.snapshot_with_vantage(vantage),
     })

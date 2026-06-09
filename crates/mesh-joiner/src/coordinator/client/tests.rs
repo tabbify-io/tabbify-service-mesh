@@ -60,6 +60,7 @@ fn relay_only_round_trips_and_defaults_false() {
         parent: None,
         app_uuid: None,
         software_version: None,
+        mesh_version: None,
         relay_only: true,
     };
     let v = serde_json::to_value(&reg).unwrap();
@@ -79,6 +80,7 @@ fn relay_only_round_trips_and_defaults_false() {
         wg_listen_port: Some(51820),
         hosted_app_ulas: vec![],
         software_version: None,
+        mesh_version: None,
         relay_only: true,
         peer_paths: vec![],
     };
@@ -106,6 +108,7 @@ async fn remote_to_info_parses_full_record() {
         tags: vec!["dev".into()],
         hosted_app_ulas: vec![],
         software_version: None,
+        mesh_version: None,
         joined_at_micros: 1_700_000_000_000_000,
     };
     let info = remote_to_info(&remote).await.unwrap();
@@ -135,6 +138,7 @@ async fn remote_to_info_parses_hosted_app_ulas() {
             "fd5a:1f02:dead:beef:cafe:0:0:2".into(),
         ],
         software_version: None,
+        mesh_version: None,
         joined_at_micros: 0,
     };
     let info = remote_to_info(&remote).await.unwrap();
@@ -169,6 +173,7 @@ async fn remote_to_info_skips_malformed_hosted_app_ula() {
             "fd5a:1f02:dead:beef:cafe:0:0:9".into(),
         ],
         software_version: None,
+        mesh_version: None,
         joined_at_micros: 0,
     };
     let info = remote_to_info(&remote).await.unwrap();
@@ -198,6 +203,7 @@ async fn remote_to_info_treats_empty_endpoint_as_none() {
         tags: vec![],
         hosted_app_ulas: vec![],
         software_version: None,
+        mesh_version: None,
         joined_at_micros: 0,
     };
     let info = remote_to_info(&remote).await.unwrap();
@@ -216,6 +222,7 @@ async fn remote_to_info_rejects_bad_ula() {
         tags: vec![],
         hosted_app_ulas: vec![],
         software_version: None,
+        mesh_version: None,
         joined_at_micros: 0,
     };
     let err = remote_to_info(&remote).await.unwrap_err();
@@ -270,6 +277,7 @@ async fn register_round_trip_against_mock_coordinator() {
             None,
             None,
             None,
+            None,
             false,
         )
         .await
@@ -312,6 +320,7 @@ async fn register_sends_bearer_header_when_join_token_present() {
             "alice",
             &[],
             Some("my-join-jwt"),
+            None,
             None,
             None,
             None,
@@ -369,6 +378,7 @@ async fn register_sends_wg_port_and_omits_listen_endpoint() {
         parent: None,
         app_uuid: None,
         software_version: None,
+        mesh_version: None,
         relay_only: false,
     })
     .unwrap();
@@ -385,6 +395,7 @@ async fn register_sends_wg_port_and_omits_listen_endpoint() {
             Some(51820),
             "alice",
             &[],
+            None,
             None,
             None,
             None,
@@ -433,6 +444,7 @@ async fn register_parses_observed_reflexive_fields() {
             None,
             None,
             None,
+            None,
             false,
         )
         .await
@@ -468,6 +480,7 @@ async fn register_tolerates_missing_observed_fields() {
             Some(51820),
             "alice",
             &[],
+            None,
             None,
             None,
             None,
@@ -532,6 +545,7 @@ async fn register_omits_bearer_header_when_no_join_token() {
             None,
             None,
             None,
+            None,
             false,
         )
         .await
@@ -557,7 +571,7 @@ async fn heartbeat_returns_roster_snapshot() {
         .await;
     let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
     let resp = client
-        .heartbeat(Uuid::nil(), Some(51820), &[], None, false, Vec::new())
+        .heartbeat(Uuid::nil(), Some(51820), &[], None, None, false, Vec::new())
         .await
         .unwrap();
     assert!(resp.peers.is_empty());
@@ -591,6 +605,7 @@ async fn heartbeat_sends_hosted_app_ulas() {
             Some(51820),
             &["fd5a:1f02:dead:beef:cafe:0:0:1".to_owned()],
             None,
+            None,
             false,
             Vec::new(),
         )
@@ -607,6 +622,7 @@ async fn heartbeat_omits_empty_hosted_app_ulas() {
         wg_listen_port: Some(51820),
         hosted_app_ulas: vec![],
         software_version: None,
+        mesh_version: None,
         relay_only: false,
         peer_paths: vec![],
     })
@@ -686,6 +702,7 @@ async fn register_surfaces_json_codec_error_on_garbage_body() {
             None,
             None,
             None,
+            None,
             false,
         )
         .await
@@ -741,6 +758,7 @@ async fn register_sends_requested_ula_and_peer_metadata() {
             Some(sup_ula.to_owned()),
             Some(app_uuid_str.to_owned()),
             None,
+            None,
             false,
         )
         .await
@@ -783,6 +801,7 @@ async fn register_sends_software_version_in_body() {
             None,
             None,
             Some("v1.4.0".to_owned()),
+            None,
             false,
         )
         .await
@@ -807,6 +826,7 @@ fn register_request_omits_optional_runner_fields_when_none() {
         parent: None,
         app_uuid: None,
         software_version: None,
+        mesh_version: None,
         relay_only: false,
     })
     .unwrap();

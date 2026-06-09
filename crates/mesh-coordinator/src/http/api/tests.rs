@@ -233,6 +233,7 @@ fn machine_req(seed: u8, name: &str) -> RegisterRequest {
         app_uuid: None,
         requested_ula: None,
         software_version: None,
+        mesh_version: None,
         relay_only: false,
     }
 }

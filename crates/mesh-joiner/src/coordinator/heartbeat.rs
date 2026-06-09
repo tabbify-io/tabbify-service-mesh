@@ -120,6 +120,9 @@ pub struct HeartbeatTask {
     /// Software version advertised on every heartbeat (spec P0 OBSERVE).
     /// Host-supplied; `None` = unknown.
     pub software_version: Option<String>,
+    /// Mesh-joiner's own version, self-reported on every heartbeat alongside
+    /// `software_version`.
+    pub mesh_version: Option<String>,
     /// Heartbeat interval.
     pub interval: Duration,
     /// Cancellation signal.
@@ -147,6 +150,8 @@ pub struct TickCtx<'a> {
     pub hosted_app_ulas: &'a DashMap<Ipv6Addr, ()>,
     /// Software version advertised this tick.
     pub software_version: Option<String>,
+    /// Mesh-joiner version advertised this tick.
+    pub mesh_version: Option<String>,
     /// One-shot guard: set once a 404 has been handled, cleared on the
     /// next successful heartbeat. Stops a thundering herd of re-registers
     /// while the coordinator is still bringing its roster back.
@@ -167,6 +172,7 @@ pub async fn run(task: HeartbeatTask) {
         wg_listen_port,
         hosted_app_ulas,
         software_version,
+        mesh_version,
         interval,
         mut shutdown,
     } = task;
@@ -207,6 +213,7 @@ pub async fn run(task: HeartbeatTask) {
                     wg_listen_port,
                     hosted_app_ulas: &hosted_app_ulas,
                     software_version: software_version.clone(),
+                    mesh_version: mesh_version.clone(),
                     handling_roster_loss: &mut handling_roster_loss,
                 })
                 .await;
@@ -238,6 +245,7 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
         wg_listen_port,
         hosted_app_ulas,
         software_version,
+        mesh_version,
         handling_roster_loss,
     } = ctx;
 
@@ -248,7 +256,8 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
     // each session, direct (p2p) vs relay + staleness. The coordinator
     // aggregates these into per-vantage connectivity. Built from the SAME
     // session table this tick reconciles, stamped with the data-plane clock.
-    let peer_paths = crate::joiner::peer_paths_from_sessions(sessions, crate::wg::loops::now_micros());
+    let peer_paths =
+        crate::joiner::peer_paths_from_sessions(sessions, crate::wg::loops::now_micros());
     let current_id = *peer_id.read().await;
     match client
         .heartbeat(
@@ -256,6 +265,7 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
             Some(wg_listen_port),
             &hosted,
             software_version,
+            mesh_version,
             reregister.relay_only,
             peer_paths,
         )
@@ -331,6 +341,7 @@ pub(crate) async fn register_with_409_fallback(
     inputs: &ReregisterInputs,
     wg_listen_port: u16,
     software_version: Option<String>,
+    mesh_version: Option<String>,
     requested_ula: Option<String>,
 ) -> crate::error::Result<RegisterResponse> {
     match register_attempt(
@@ -338,6 +349,7 @@ pub(crate) async fn register_with_409_fallback(
         inputs,
         wg_listen_port,
         software_version,
+        mesh_version,
         requested_ula,
     )
     .await
@@ -352,7 +364,7 @@ pub(crate) async fn register_with_409_fallback(
             );
             // Fallback carries no version (re-derived from heartbeats) and no
             // requested_ula (free allocation).
-            register_attempt(client, inputs, wg_listen_port, None, None).await
+            register_attempt(client, inputs, wg_listen_port, None, None, None).await
         }
         Err(e) => Err(e),
     }
@@ -369,6 +381,7 @@ async fn register_attempt(
     inputs: &ReregisterInputs,
     wg_listen_port: u16,
     software_version: Option<String>,
+    mesh_version: Option<String>,
     requested_ula: Option<String>,
 ) -> crate::error::Result<RegisterResponse> {
     client
@@ -384,6 +397,7 @@ async fn register_attempt(
             inputs.parent.clone(),
             inputs.app_uuid.clone(),
             software_version,
+            mesh_version,
             inputs.relay_only,
         )
         .await
@@ -411,6 +425,7 @@ async fn reregister_after_roster_loss(
         client,
         inputs,
         wg_listen_port,
+        None,
         None,
         inputs.requested_ula.clone(),
     )
@@ -543,6 +558,7 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             joined_at_micros: 0,
         }
     }
@@ -564,6 +580,7 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             joined_at_micros: 0,
         }
     }
@@ -718,6 +735,7 @@ mod tests {
             wg_listen_port: 51820,
             hosted_app_ulas: &hosted,
             software_version: None,
+            mesh_version: None,
             handling_roster_loss: &mut handling_roster_loss,
         })
         .await;
@@ -791,6 +809,7 @@ mod tests {
             wg_listen_port: 51820,
             hosted_app_ulas: &hosted,
             software_version: None,
+            mesh_version: None,
             handling_roster_loss: &mut handling_roster_loss,
         })
         .await;
@@ -840,6 +859,7 @@ mod tests {
             wg_listen_port: 51820,
             hosted_app_ulas: &hosted,
             software_version: None,
+            mesh_version: None,
             handling_roster_loss: &mut handling_roster_loss,
         })
         .await;
@@ -900,10 +920,16 @@ mod tests {
         };
 
         // The shared cold-start helper: sticky 409 → retry free → 200.
-        let resp =
-            register_with_409_fallback(&client, &inputs, 51820, None, inputs.requested_ula.clone())
-                .await
-                .expect("cold-start register must self-heal past a sticky 409");
+        let resp = register_with_409_fallback(
+            &client,
+            &inputs,
+            51820,
+            None,
+            None,
+            inputs.requested_ula.clone(),
+        )
+        .await
+        .expect("cold-start register must self-heal past a sticky 409");
 
         assert_eq!(
             resp.peer_id,
@@ -978,6 +1004,7 @@ mod tests {
             wg_listen_port: 51820,
             hosted_app_ulas: &hosted,
             software_version: None,
+            mesh_version: None,
             handling_roster_loss: &mut handling_roster_loss,
         })
         .await;

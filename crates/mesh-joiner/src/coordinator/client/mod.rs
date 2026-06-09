@@ -94,6 +94,11 @@ pub struct RegisterRequest {
     /// coordinators are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub software_version: Option<String>,
+    /// Mesh-joiner's own compile-time version, self-reported so the control
+    /// plane can track the mesh-stack version per peer. Omitted from the wire
+    /// when `None` for backward compat with older coordinators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_version: Option<String>,
     /// Declare this peer **relay-only** — it has no reachable direct endpoint
     /// (e.g. a container netns with no inbound mesh port). When `true` the
     /// coordinator advertises no direct endpoint for us and never emits a
@@ -169,6 +174,10 @@ pub struct HeartbeatRequest {
     /// observe `actual` version (spec P0). Omitted from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub software_version: Option<String>,
+    /// Mesh-joiner version re-sent every heartbeat (self-reported). Omitted from
+    /// the wire when `None` for backward compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_version: Option<String>,
     /// Re-assert our relay-only flag on every heartbeat (same semantics as on
     /// [`RegisterRequest`]) so a coordinator that lost + rebuilt our entry, or
     /// a peer that flips reachability, stays consistent without a full
@@ -345,6 +354,7 @@ impl CoordinatorClient {
         parent: Option<String>,
         app_uuid: Option<String>,
         software_version: Option<String>,
+        mesh_version: Option<String>,
         relay_only: bool,
     ) -> Result<RegisterResponse> {
         let body = RegisterRequest {
@@ -363,6 +373,7 @@ impl CoordinatorClient {
             parent,
             app_uuid,
             software_version,
+            mesh_version,
             relay_only,
         };
         let url = format!("{}/v1/mesh/register", self.base_url);
@@ -397,12 +408,14 @@ impl CoordinatorClient {
     /// (connectivity visibility): for each session, is our data path to that
     /// peer direct or relay, and how stale. Empty when there are no sessions
     /// (omitted from the wire) — the coordinator then keeps no edges for us.
+    #[allow(clippy::too_many_arguments)]
     pub async fn heartbeat(
         &self,
         peer_id: Uuid,
         wg_listen_port: Option<u16>,
         hosted_app_ulas: &[String],
         software_version: Option<String>,
+        mesh_version: Option<String>,
         relay_only: bool,
         peer_paths: Vec<PeerPath>,
     ) -> Result<HeartbeatResponse> {
@@ -412,6 +425,7 @@ impl CoordinatorClient {
             wg_listen_port,
             hosted_app_ulas: hosted_app_ulas.to_vec(),
             software_version,
+            mesh_version,
             relay_only,
             peer_paths,
         };

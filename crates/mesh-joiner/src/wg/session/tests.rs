@@ -30,6 +30,7 @@ fn info(n: u8, ula: &str, endpoint: Option<&str>) -> PeerInfo {
         tags: vec![],
         hosted_app_ulas: vec![],
         software_version: None,
+        mesh_version: None,
         joined_at_micros: 0,
     }
 }

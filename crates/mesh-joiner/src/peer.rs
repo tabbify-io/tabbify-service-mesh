@@ -43,6 +43,9 @@ pub struct PeerInfo {
     /// parsed straight through from the coordinator roster. `None` =
     /// unknown (older coordinator omitting the field).
     pub software_version: Option<String>,
+    /// Mesh-joiner version this peer reports running (its own crate version,
+    /// independent of `software_version`). `None` = unknown.
+    pub mesh_version: Option<String>,
     /// Coordinator-stamped microseconds-since-epoch.
     pub joined_at_micros: i64,
 }
@@ -76,6 +79,11 @@ pub struct RemotePeer {
     /// the wire format back-compatible.
     #[serde(default)]
     pub software_version: Option<String>,
+    /// Mesh-joiner version the coordinator advertises for this peer (the peer's
+    /// own crate version). `#[serde(default)]` keeps the wire format
+    /// back-compatible with coordinators that omit it.
+    #[serde(default)]
+    pub mesh_version: Option<String>,
     /// Microseconds-since-epoch as stamped by the coordinator.
     pub joined_at_micros: i64,
 }

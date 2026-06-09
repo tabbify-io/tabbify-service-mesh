@@ -100,6 +100,7 @@ pub async fn remote_to_info(r: &RemotePeer) -> Result<PeerInfo> {
         tags: r.tags.clone(),
         hosted_app_ulas,
         software_version: r.software_version.clone(),
+        mesh_version: r.mesh_version.clone(),
         joined_at_micros: r.joined_at_micros,
     })
 }

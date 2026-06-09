@@ -48,6 +48,7 @@ impl Coordinator {
         wg_listen_port: Option<u16>,
         hosted_app_ulas: Vec<String>,
         software_version: Option<String>,
+        mesh_version: Option<String>,
         relay_only: bool,
     ) -> Result<PeerEntry, CoordinatorError> {
         // Pre-check membership so we can surface UnknownPeer without
@@ -74,6 +75,7 @@ impl Coordinator {
             // layer updates the stored value (when present); `None` leaves
             // it untouched (spec P0: never a downgrade).
             software_version,
+            mesh_version,
             at_micros: now_unix_micros(),
         };
         publish_event(self.inner.publisher.as_ref(), PEER_SEGMENT, &event).await;

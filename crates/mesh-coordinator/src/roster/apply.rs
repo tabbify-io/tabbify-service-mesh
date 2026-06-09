@@ -67,6 +67,7 @@ impl Coordinator {
             parent: event.parent.clone(),
             app_uuid: event.app_uuid.clone(),
             software_version: event.software_version.clone(),
+            mesh_version: event.mesh_version.clone(),
             relay_only: event.relay_only,
             // Connectivity edges are ephemeral live-state, not carried in the
             // durable `PeerJoined` event: a freshly-joined (or restored) peer
@@ -111,6 +112,10 @@ impl Coordinator {
             // `None` is unknown, never a downgrade).
             if event.software_version.is_some() {
                 entry.software_version.clone_from(&event.software_version);
+            }
+            // Same no-clobber rule for the mesh-joiner version.
+            if event.mesh_version.is_some() {
+                entry.mesh_version.clone_from(&event.mesh_version);
             }
         }
     }
@@ -163,6 +168,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             software_version: None,
+            mesh_version: None,
             relay_only: false,
         };
         let entry = coord.apply_peer_joined(&joined).expect("apply joined");
@@ -175,6 +181,7 @@ mod tests {
             observed_external: "203.0.113.1:51820".into(),
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             at_micros: 2,
         };
         coord.apply_peer_heartbeat(&hb);
@@ -184,6 +191,7 @@ mod tests {
             observed_external: String::new(),
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             at_micros: 3,
         };
         coord.apply_peer_heartbeat(&unknown_hb);
@@ -221,6 +229,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             software_version: None,
+            mesh_version: None,
             relay_only: false,
         };
         coord.apply_peer_joined(&joined).expect("apply joined");
@@ -268,6 +277,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             software_version: None,
+            mesh_version: None,
             relay_only: false,
         };
         coord.apply_peer_joined(&joined).expect("apply");
@@ -288,6 +298,7 @@ mod tests {
             app_uuid: None,
             requested_ula: None,
             software_version: None,
+            mesh_version: None,
             relay_only: false,
         };
         let (entry, _) = coord.register(req).await.expect("register");
@@ -311,6 +322,7 @@ mod tests {
             parent: None,
             app_uuid: None,
             software_version: None,
+            mesh_version: None,
             relay_only: false,
         };
         let err = coord.apply_peer_joined(&bad).expect_err("bad uuid");

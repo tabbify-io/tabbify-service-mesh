@@ -57,6 +57,11 @@ pub struct PeerInfo {
     /// keeps the wire format back-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub software_version: Option<String>,
+    /// Mesh-joiner version this peer reports running (its own crate version,
+    /// independent of `software_version`). `None` = unknown. Omitted from the
+    /// wire when `None` to stay back-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_version: Option<String>,
     /// Whether this peer declared itself **relay-only** — it has NO reachable
     /// direct endpoint (e.g. it runs in a container netns with no inbound mesh
     /// port). A relay-only peer is advertised with `listen_endpoint = None`
@@ -153,6 +158,10 @@ pub struct RegisterRequest {
     /// Host-supplied; `#[serde(default)]` → `None` for older joiners.
     #[serde(default)]
     pub software_version: Option<String>,
+    /// Mesh-joiner version the registrant is running (self-reported crate
+    /// version). `#[serde(default)]` → `None` for older joiners.
+    #[serde(default)]
+    pub mesh_version: Option<String>,
     /// The registrant declares it is **relay-only**: no reachable direct
     /// endpoint (e.g. a container netns with no inbound mesh port). When
     /// `true`, the coordinator (a) advertises NO direct listen endpoint for
@@ -238,6 +247,11 @@ pub struct HeartbeatRequest {
     /// joiners; `None` leaves the stored value untouched.
     #[serde(default)]
     pub software_version: Option<String>,
+    /// Mesh-joiner version re-sent every heartbeat (self-reported). `None`
+    /// leaves the stored value untouched. `#[serde(default)]` → `None` for
+    /// older joiners.
+    #[serde(default)]
+    pub mesh_version: Option<String>,
     /// Re-asserted relay-only flag (same semantics as on
     /// [`RegisterRequest`]). Re-sent every heartbeat so a peer that flips
     /// reachability is reflected without a full re-register.
@@ -325,6 +339,11 @@ pub struct TopologyMachine {
     /// topology contract requires it to be nullable/always-present so the
     /// node + frontend can rely on the key existing.
     pub software_version: Option<String>,
+    /// Reported mesh-joiner version this peer is running (e.g. `"1.4.36"`).
+    /// `None` = unknown. Always present in the wire JSON (serializes as `null`
+    /// when unknown), like `software_version` above, so the node + frontend can
+    /// rely on the key existing.
+    pub mesh_version: Option<String>,
 }
 
 /// One undirected edge in the [`TopologyResponse`] graph.

@@ -37,6 +37,7 @@ fn req(seed: u8, name: &str) -> RegisterRequest {
         app_uuid: None,
         requested_ula: None,
         software_version: None,
+        mesh_version: None,
         relay_only: false,
     }
 }
@@ -101,6 +102,7 @@ async fn heartbeat_updates_only_known_peers() {
             Some(51820),
             vec![],
             None,
+            None,
             false,
         )
         .await
@@ -109,7 +111,7 @@ async fn heartbeat_updates_only_known_peers() {
 
     let bogus = Uuid::now_v7();
     let err = c
-        .heartbeat(bogus, "ignored".into(), None, vec![], None, false)
+        .heartbeat(bogus, "ignored".into(), None, vec![], None, None, false)
         .await
         .expect_err("unknown peer");
     assert!(matches!(err, CoordinatorError::UnknownPeer(_)));
@@ -306,7 +308,11 @@ async fn snapshot_with_vantage_overrides_with_single_vantage_view() {
     };
     assert_eq!(conn(direct_m.peer_id).as_deref(), Some("direct"));
     assert_eq!(conn(relay_m.peer_id).as_deref(), Some("relay"));
-    assert_eq!(conn(no_edge_m.peer_id), None, "no edge from vantage → unknown");
+    assert_eq!(
+        conn(no_edge_m.peer_id),
+        None,
+        "no edge from vantage → unknown"
+    );
 }
 
 #[tokio::test]
@@ -355,6 +361,7 @@ async fn invalid_pubkey_length_is_rejected() {
             app_uuid: None,
             requested_ula: None,
             software_version: None,
+            mesh_version: None,
             relay_only: false,
         })
         .await
@@ -461,6 +468,7 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
         Some(51820),
         vec![],
         None,
+        None,
         false,
     )
     .await
@@ -477,6 +485,7 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
         "198.51.100.20:22222".into(),
         Some(51820),
         vec![],
+        None,
         None,
         false,
     )
@@ -522,6 +531,7 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
         Some(51820),
         vec![],
         None,
+        None,
         false,
     )
     .await
@@ -554,6 +564,7 @@ async fn heartbeat_broadcasts_holepunch_pair_to_sse_subscribers() {
         Some(51820),
         vec![],
         None,
+        None,
         false,
     )
     .await
@@ -563,6 +574,7 @@ async fn heartbeat_broadcasts_holepunch_pair_to_sse_subscribers() {
         "198.51.100.71:22222".into(),
         Some(51820),
         vec![],
+        None,
         None,
         false,
     )
@@ -610,6 +622,7 @@ async fn heartbeat_does_not_emit_when_one_peer_lacks_external() {
         None,
         vec![],
         None,
+        None,
         false,
     )
     .await
@@ -637,6 +650,7 @@ async fn heartbeat_with_empty_external_skips_emit() {
         None,
         vec![],
         None,
+        None,
         false,
     )
     .await
@@ -645,7 +659,7 @@ async fn heartbeat_with_empty_external_skips_emit() {
     // Bob heartbeats but ConnectInfo wasn't captured — empty string.
     // This mirrors the test-router path that drives via Router::call
     // without the make_service wrapper.
-    c.heartbeat(bob.peer_id, String::new(), None, vec![], None, false)
+    c.heartbeat(bob.peer_id, String::new(), None, vec![], None, None, false)
         .await
         .expect("b hb empty external");
 
@@ -695,6 +709,7 @@ async fn heartbeat_suppresses_holepunch_when_either_peer_relay_only() {
         Some(51820),
         vec![],
         None,
+        None,
         false,
     )
     .await
@@ -704,6 +719,7 @@ async fn heartbeat_suppresses_holepunch_when_either_peer_relay_only() {
         "198.51.100.81:22222".into(),
         Some(51820),
         vec![],
+        None,
         None,
         true,
     )
@@ -743,6 +759,7 @@ async fn heartbeat_emits_holepunch_for_two_non_relay_only_peers() {
         Some(51820),
         vec![],
         None,
+        None,
         false,
     )
     .await
@@ -752,6 +769,7 @@ async fn heartbeat_emits_holepunch_for_two_non_relay_only_peers() {
         "198.51.100.83:22222".into(),
         Some(51820),
         vec![],
+        None,
         None,
         false,
     )
@@ -853,6 +871,7 @@ async fn register_preserves_public_self_report_over_reflexive() {
         app_uuid: None,
         requested_ula: None,
         software_version: None,
+        mesh_version: None,
         relay_only: false,
     };
     let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
@@ -906,6 +925,7 @@ async fn heartbeat_rolls_reflexive_endpoint_over_on_ip_change() {
             Some(51820),
             vec![],
             None,
+            None,
             false,
         )
         .await
@@ -936,6 +956,7 @@ async fn heartbeat_preserves_public_advertised_endpoint() {
         app_uuid: None,
         requested_ula: None,
         software_version: None,
+        mesh_version: None,
         relay_only: false,
     };
     let observed: SocketAddr = "203.0.113.7:34812".parse().expect("addr");
@@ -950,6 +971,7 @@ async fn heartbeat_preserves_public_advertised_endpoint() {
             "203.0.113.7:34900".into(),
             Some(51820),
             vec![],
+            None,
             None,
             false,
         )
@@ -982,6 +1004,7 @@ async fn heartbeat_synthesizes_reflexive_for_passive_peer() {
             "203.0.113.7:34812".into(),
             Some(51820),
             vec![],
+            None,
             None,
             false,
         )
@@ -1080,6 +1103,7 @@ async fn heartbeat_replaces_hosted_app_ula_set() {
             Some(51820),
             vec![app_b.to_owned()],
             None,
+            None,
             false,
         )
         .await
@@ -1097,6 +1121,7 @@ async fn heartbeat_replaces_hosted_app_ula_set() {
             "203.0.113.1:51820".into(),
             Some(51820),
             vec![],
+            None,
             None,
             false,
         )
@@ -1121,6 +1146,7 @@ async fn heartbeat_broadcasts_updated_with_new_hosted_set() {
         "203.0.113.1:51820".into(),
         Some(51820),
         vec![app_a.to_owned()],
+        None,
         None,
         false,
     )
@@ -1501,6 +1527,7 @@ async fn software_version_is_stored_and_broadcast() {
             Some(51820),
             vec![],
             Some("v1.5.0".to_owned()),
+            None,
             false,
         )
         .await
@@ -1520,6 +1547,7 @@ async fn software_version_is_stored_and_broadcast() {
             String::new(),
             Some(51820),
             vec![],
+            None,
             None,
             false,
         )
@@ -1683,6 +1711,7 @@ async fn restored_peer_is_not_immediately_stale() {
 // -----------------------------------------------------------------
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn topology_collapses_edges_and_filters_runners() {
     use crate::http::api::PeerPathDto;
 
@@ -1692,6 +1721,7 @@ async fn topology_collapses_edges_and_filters_runners() {
         .register(RegisterRequest {
             tags: vec!["supervisor".into(), "firecracker".into()],
             software_version: Some("1.4.35".into()),
+            mesh_version: None,
             relay_only: false,
             ..req(60, "A")
         })
@@ -1743,7 +1773,11 @@ async fn topology_collapses_edges_and_filters_runners() {
     // Machines = {A, B, C}; runner excluded.
     let machine_ids: std::collections::HashSet<String> =
         topo.machines.iter().map(|m| m.peer_id.clone()).collect();
-    assert_eq!(machine_ids.len(), 3, "exactly three machines (runner excluded)");
+    assert_eq!(
+        machine_ids.len(),
+        3,
+        "exactly three machines (runner excluded)"
+    );
     assert!(machine_ids.contains(&a.peer_id.to_string()));
     assert!(machine_ids.contains(&b.peer_id.to_string()));
     assert!(machine_ids.contains(&cc.peer_id.to_string()));

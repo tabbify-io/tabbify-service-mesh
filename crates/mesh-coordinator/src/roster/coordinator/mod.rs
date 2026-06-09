@@ -108,6 +108,11 @@ pub struct PeerEntry {
     /// every heartbeat that carries a value; a heartbeat with `None` leaves
     /// it untouched (never a downgrade trigger — spec P0).
     pub software_version: Option<String>,
+    /// Mesh-joiner version this peer reports running (its own crate version).
+    /// `None` = unknown. Same update semantics as `software_version`: set on
+    /// register, refreshed on re-register + heartbeats that carry a value; a
+    /// `None` heartbeat leaves it untouched.
+    pub mesh_version: Option<String>,
     /// Whether this peer declared itself **relay-only** — it has no reachable
     /// direct endpoint (e.g. a container netns with no inbound mesh port). Set
     /// on register, re-asserted on re-register + heartbeat. Drives two
@@ -166,6 +171,7 @@ impl PeerEntry {
             parent: self.parent.clone(),
             app_uuid: self.app_uuid.clone(),
             software_version: self.software_version.clone(),
+            mesh_version: self.mesh_version.clone(),
             relay_only: self.relay_only,
             connectivity,
         }
@@ -197,6 +203,7 @@ impl PeerEntry {
             parent: self.parent.clone(),
             app_uuid: self.app_uuid.clone(),
             software_version: self.software_version.clone(),
+            mesh_version: self.mesh_version.clone(),
             relay_only: self.relay_only,
         }
     }
@@ -633,6 +640,7 @@ impl Coordinator {
                 tags: e.tags.clone(),
                 relay_only: e.relay_only,
                 software_version: e.software_version.clone(),
+                mesh_version: e.mesh_version.clone(),
             })
             .collect();
 

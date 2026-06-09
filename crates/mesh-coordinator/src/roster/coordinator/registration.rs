@@ -165,6 +165,7 @@ impl Coordinator {
             parent: req.parent.clone(),
             app_uuid: req.app_uuid.clone(),
             software_version: req.software_version.clone(),
+            mesh_version: req.mesh_version.clone(),
             // Carry the relay-only declaration onto the durable event so it
             // round-trips through replay + is visible to viewers. Drives the
             // hole-punch suppression downstream (`punch_peer`).
@@ -290,6 +291,9 @@ impl Coordinator {
             // an omitting re-register leaves the stored value untouched.
             if req.software_version.is_some() {
                 e.software_version.clone_from(&req.software_version);
+            }
+            if req.mesh_version.is_some() {
+                e.mesh_version.clone_from(&req.mesh_version);
             }
             // Re-assert relay-only on every re-register so a peer that flips
             // its reachability is reflected (and the resolved endpoint above

@@ -307,6 +307,7 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             joined_at_micros: 0,
         };
         t.upsert(&me, &info);
@@ -440,6 +441,7 @@ mod tests {
             tags: vec![],
             hosted_app_ulas: vec![],
             software_version: None,
+            mesh_version: None,
             joined_at_micros: 0,
         };
         t.upsert(&me, &info);
