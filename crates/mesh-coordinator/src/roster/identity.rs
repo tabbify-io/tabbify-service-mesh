@@ -15,10 +15,14 @@
 //!
 //! - **Authoritative (E4, default in prod):** when the coordinator has
 //!   validated the join token against the auth service, the
-//!   [`ValidatedClaims`] `network` + `tags` are used and the
-//!   request-supplied values are ignored. This closes the spoofing gap —
-//!   a node's effective identity equals exactly what the validator
-//!   returned, regardless of what it sent.
+//!   [`ValidatedClaims`] `network` + identity/security `tags` are used and the
+//!   request-supplied values for them are ignored. This closes the spoofing gap
+//!   for identity (`tag:user-*`, `tag:net-*`, `tag:system`, network). The ONE
+//!   exception is the self-advertised CAPABILITY tags
+//!   (`firecracker`/`docker`/`builder`, see [`SELF_ADVERTISABLE_CAPABILITY_TAGS`]):
+//!   they are merged on top of the claims, because they describe hardware/role
+//!   the node proves and forging one only breaks the forger — so a per-network
+//!   join token (carrying only `tag:net-<slug>`) still yields a working worker.
 //! - **Escape hatch (dev / E1 only):** when no auth service is configured
 //!   (`AUTH_URL` unset), there are no validated claims, so the
 //!   request-supplied values are used as-is. This is the legacy
@@ -28,6 +32,21 @@
 
 use crate::auth::ValidatedClaims;
 use crate::http::api::RegisterRequest;
+
+/// Capability / role tags a node MAY contribute even on the authoritative path.
+///
+/// Unlike network and identity tags (`tag:user-*`, `tag:net-*`, `tag:system`),
+/// these describe **hardware/role the node proves at boot** — running
+/// `supervisord` ⇒ `supervisor` (the node directory lists a peer as a supervisor
+/// only if it carries this tag), `/dev/kvm` ⇒ `firecracker`, a reachable docker
+/// daemon ⇒ `docker`, operator designation ⇒ `builder`. Forging one is NOT a
+/// privilege escalation: work routed to a node that lied about a capability
+/// simply fails on that node. So the coordinator merges them ON TOP of the
+/// claims, which is what lets a per-network join token — which carries only
+/// `tag:net-<slug>` because the admin minting it cannot know the node's hardware
+/// — still yield a working supervisor/firecracker/builder worker.
+const SELF_ADVERTISABLE_CAPABILITY_TAGS: [&str; 4] =
+    ["supervisor", "firecracker", "docker", "builder"];
 
 /// The authoritative identity attributes of a node, as decided by the
 /// coordinator at register time. Policy evaluation and ULA allocation read
@@ -60,12 +79,24 @@ pub fn stamp_identity(req: &RegisterRequest, claims: Option<&ValidatedClaims>) -
             network: req.network.clone(),
             tags: req.tags.clone(),
         },
-        // Authoritative path: the validator's claims win. A node cannot
-        // influence its own tags/network here — whatever it put in `req`
-        // is deliberately dropped.
-        |c| NodeIdentity {
-            network: c.network.clone(),
-            tags: c.tags.clone(),
+        // Authoritative path: network + identity/security tags come from the
+        // validated claims (a node cannot self-assert `tag:user-*`, `tag:system`,
+        // or another network — the §5.1 spoofing fix). ON TOP of that the node
+        // may contribute its self-advertised CAPABILITY tags (see
+        // [`SELF_ADVERTISABLE_CAPABILITY_TAGS`]) — hardware/role facts whose
+        // forgery only breaks the forger. Claims first (stable order), then any
+        // new capability tag the node advertised.
+        |c| {
+            let mut tags = c.tags.clone();
+            for t in &req.tags {
+                if SELF_ADVERTISABLE_CAPABILITY_TAGS.contains(&t.as_str()) && !tags.contains(t) {
+                    tags.push(t.clone());
+                }
+            }
+            NodeIdentity {
+                network: c.network.clone(),
+                tags,
+            }
         },
     )
 }
@@ -145,6 +176,54 @@ mod tests {
         let validated = claims("alice", &[]);
         let id = stamp_identity(&spoofed, Some(&validated));
         assert_eq!(id.network, "alice");
-        assert!(id.tags.is_empty(), "request tags must not leak through");
+        // A capability tag the node advertises still merges (it proves a role);
+        // an identity tag does not. Here `tag:user-bob` is identity → dropped.
+        assert!(
+            id.tags.is_empty(),
+            "non-capability request tags must not leak through"
+        );
+    }
+
+    /// The fix for self-serve "Add a node": a per-network join token carries only
+    /// `tag:net-<slug>`, yet the node still becomes a usable worker because its
+    /// self-advertised CAPABILITY tags merge on top. Identity tags it tries to
+    /// sneak in are still dropped.
+    #[test]
+    fn capability_tags_merge_over_claims_identity_tags_do_not() {
+        let advertised = req(
+            "bob",
+            &["supervisor", "firecracker", "builder", "docker", "tag:user-bob", "tag:system"],
+        );
+        let validated = claims("alice", &["tag:net-alice"]);
+        let id = stamp_identity(&advertised, Some(&validated));
+        assert_eq!(id.network, "alice", "network still from claims");
+        // Claims first, then the allowlisted capability tags — in request order.
+        assert_eq!(
+            id.tags,
+            vec![
+                "tag:net-alice".to_owned(),
+                "supervisor".to_owned(),
+                "firecracker".to_owned(),
+                "builder".to_owned(),
+                "docker".to_owned(),
+            ],
+            "supervisor/firecracker/builder/docker merge; tag:user-bob + tag:system are dropped"
+        );
+    }
+
+    /// A capability already present in the claims is not duplicated.
+    #[test]
+    fn merged_capability_tag_is_not_duplicated() {
+        let advertised = req("alice", &["firecracker", "supervisor"]);
+        let validated = claims("alice", &["tag:net-alice", "firecracker"]);
+        let id = stamp_identity(&advertised, Some(&validated));
+        assert_eq!(
+            id.tags,
+            vec![
+                "tag:net-alice".to_owned(),
+                "firecracker".to_owned(),
+                "supervisor".to_owned(),
+            ],
+        );
     }
 }
