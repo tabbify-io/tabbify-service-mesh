@@ -75,11 +75,15 @@ pub fn route_uplink(
         );
         Some(downlink)
     } else {
-        // Destination has no live relay connection — nothing forwarded.
-        tracing::warn!(
+        // No live relay connection right now — the frame was SPOOLED (held
+        // briefly) rather than dropped, so it is delivered the instant the
+        // destination's WS (re)registers. This bridges the post-reconnect
+        // registration race that otherwise stranded WireGuard handshakes
+        // (the REKEY_TIMEOUT storm).
+        tracing::debug!(
             src = %B64URL.encode(my_pubkey),
             dst = %B64URL.encode(dst),
-            "relay: destination has no live connection — frame dropped"
+            "relay: destination not yet connected — frame spooled for imminent (re)register"
         );
         None
     }

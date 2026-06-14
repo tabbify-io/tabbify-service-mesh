@@ -519,11 +519,16 @@ impl Coordinator {
     /// the relay registry nor the punch tracker can grow unbounded.
     pub fn reap_stale_resources(&self) {
         let relay_reaped = self.inner.relay.reap_closed();
+        // Drop relay frames spooled for a pubkey that never reconnected within
+        // the TTL — bounds the spool that bridges the post-reconnect
+        // registration race (see RelayRegistry::reap_expired_spool).
+        let spool_reaped = self.inner.relay.reap_expired_spool();
         let cutoff = now_unix_micros() - crate::nat::holepunch::PUNCH_PAIR_TTL_MICROS;
         let punch_reaped = self.inner.punch_tracker.reap_older_than(cutoff);
-        if relay_reaped > 0 || punch_reaped > 0 {
+        if relay_reaped > 0 || spool_reaped > 0 || punch_reaped > 0 {
             tracing::info!(
                 relay_reaped,
+                spool_reaped,
                 punch_reaped,
                 "reaped stale ephemeral mesh state"
             );
