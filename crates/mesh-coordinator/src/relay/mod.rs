@@ -10,4 +10,4 @@ pub mod frame;
 pub mod registry;
 
 pub use frame::{decode_relay_frame, encode_relay_frame};
-pub use registry::RelayRegistry;
+pub use registry::{Lane, RelayRegistry};

@@ -539,7 +539,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         insecure_no_mtls,
         shutdown_rx,
     } = ctx;
-    let mut tasks: Vec<JoinHandle<()>> = Vec::with_capacity(7);
+    let mut tasks: Vec<JoinHandle<()>> = Vec::with_capacity(8);
 
     // UDP receive loop — drains ciphertext, decapsulates, writes
     // plaintext IPv6 packets to the TUN device.
@@ -568,27 +568,23 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         shutdown_rx.clone(),
     )));
 
-    // Relay client task (Stage-3 connectivity floor). Spawned only when
-    // relay is enabled. It keeps a persistent WS to the coordinator,
-    // drains the outbound queue, and injects inbound relayed datagrams into
-    // the SAME session table + TUN the UDP loops use. Spawned BEFORE the
-    // hole-punch block because that block MOVES `socket`; the relay clones
-    // what it needs here.
-    if let Some(relay_outbound_rx) = relay_outbound_rx {
-        tasks.push(tokio::spawn(crate::relay::client::run(
-            crate::relay::client::RelayTask {
-                coordinator_url,
-                relay_url,
-                my_pubkey,
-                insecure_no_mtls,
-                sessions: sessions.clone(),
-                socket: socket.clone(),
-                tun: tun.clone(),
-                outbound_rx: relay_outbound_rx,
-                shutdown: shutdown_rx.clone(),
-            },
-        )));
-    }
+    // Relay client tasks (Stage-3 connectivity floor). Spawned BEFORE the
+    // hole-punch block because that block MOVES `socket`; the relays clone
+    // what they need here.
+    push_relay_tasks(
+        &mut tasks,
+        relay_outbound_rx,
+        RelayTaskShared {
+            coordinator_url,
+            relay_url,
+            my_pubkey,
+            insecure_no_mtls,
+            sessions: sessions.clone(),
+            socket: socket.clone(),
+            tun: tun.clone(),
+            shutdown_rx: shutdown_rx.clone(),
+        },
+    );
 
     // Punch channel: the SSE consumer forwards `HolePunchInitiate` frames
     // to the hole-punch task, which fires the UDP burst (Stage 2).
@@ -655,6 +651,72 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
     }));
 
     tasks
+}
+
+/// Config shared by both relay lane tasks (everything except the lane and its
+/// outbound receiver). `coordinator_url`/`relay_url`/`my_pubkey`/`insecure`
+/// are identical for both sockets; `sessions`/`socket`/`tun`/`shutdown_rx` are
+/// the shared handles each task clones.
+struct RelayTaskShared {
+    coordinator_url: String,
+    relay_url: Option<String>,
+    my_pubkey: [u8; 32],
+    insecure_no_mtls: bool,
+    sessions: SessionTable,
+    socket: Arc<UdpSocket>,
+    tun: Arc<dyn TunDevice>,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+/// Spawn the TWO relay client tasks — a dedicated `hi` socket for WG
+/// handshake/cookie frames and a `lo` socket for bulk data — appending their
+/// join handles to `tasks`. Two physically separate sockets keep a saturated
+/// bulk transfer on `lo` from bufferbloating the near-empty `hi` socket and
+/// stalling a rekey handshake (the `REKEY_TIMEOUT` that killed long
+/// transfers). No-op when relay is disabled (`None`).
+fn push_relay_tasks(
+    tasks: &mut Vec<JoinHandle<()>>,
+    relay_outbound_rx: Option<crate::relay::client::RelayOutboundRx>,
+    shared: RelayTaskShared,
+) {
+    use crate::relay::client::{RelayLane, RelayTask, run};
+    let Some(crate::relay::client::RelayOutboundRx { hi, lo }) = relay_outbound_rx else {
+        return;
+    };
+    let RelayTaskShared {
+        coordinator_url,
+        relay_url,
+        my_pubkey,
+        insecure_no_mtls,
+        sessions,
+        socket,
+        tun,
+        shutdown_rx,
+    } = shared;
+    tasks.push(tokio::spawn(run(RelayTask {
+        coordinator_url: coordinator_url.clone(),
+        relay_url: relay_url.clone(),
+        my_pubkey,
+        insecure_no_mtls,
+        sessions: sessions.clone(),
+        socket: socket.clone(),
+        tun: tun.clone(),
+        lane: RelayLane::Hi,
+        outbound_rx: hi,
+        shutdown: shutdown_rx.clone(),
+    })));
+    tasks.push(tokio::spawn(run(RelayTask {
+        coordinator_url,
+        relay_url,
+        my_pubkey,
+        insecure_no_mtls,
+        sessions,
+        socket,
+        tun,
+        lane: RelayLane::Lo,
+        outbound_rx: lo,
+        shutdown: shutdown_rx,
+    })));
 }
 
 /// Bind the `WireGuard` UDP socket on the v4 wildcard, preferring

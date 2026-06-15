@@ -17,7 +17,7 @@
 //! unauthenticated in insecure mode (matches the current register posture); the
 //! claimed pubkey must still resolve to a registered peer.
 
-use crate::relay::{decode_relay_frame, encode_relay_frame};
+use crate::relay::{Lane, decode_relay_frame, encode_relay_frame};
 use crate::roster::coordinator::Coordinator;
 use base64::Engine as _;
 // base64url (no padding): the pubkey rides in the URL query, where standard
@@ -36,11 +36,40 @@ use tokio::sync::mpsc;
 /// the sink errors and the connection is torn down.
 const RELAY_PING_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Query string for the relay upgrade: the connecting peer's WG public key.
+/// Wire value of `?lane=hi` — the handshake/cookie socket. Any OTHER value
+/// (including `lo`, an unknown string, or absence) is treated as the legacy /
+/// `lo` lane, so this is the ONLY lane string the coordinator must recognise.
+///
+/// MUST stay byte-identical to the joiner's copy (`mesh-joiner` `relay::client`
+/// `LANE_HI`). A mismatch (e.g. `"high"`) silently routes every handshake to
+/// the legacy `lo` fallback, reviving the `REKEY_TIMEOUT` bug with NO error
+/// surfaced. Same independent-copy rule as the relay frame codec.
+pub const LANE_HI: &str = "hi";
+
+/// Query string for the relay upgrade: the connecting peer's WG public key and
+/// the lane this socket serves.
 #[derive(serde::Deserialize)]
 pub struct RelayQuery {
     /// base64url (URL-safe, no padding) of the connecting peer's 32-byte WG public key.
     pubkey: String,
+    /// Which lane this socket carries: [`LANE_HI`] (`"hi"`, handshake/cookie)
+    /// or `"lo"` (bulk data). ABSENT — a legacy single-WS joiner that
+    /// multiplexes everything over one socket — is treated as [`Lane::Lo`],
+    /// and the registry's hi→lo fallback still delivers handshakes to it.
+    /// Any unrecognised value also degrades to `Lo` (never a 400, so a legacy
+    /// joiner is never rejected during a mixed-version rollout).
+    #[serde(default)]
+    lane: Option<String>,
+}
+
+/// Map the `?lane=` query value to a [`Lane`]. `Some("hi")` → `Hi`; absent or
+/// anything else → `Lo` (legacy / data).
+fn parse_lane(lane: Option<&str>) -> Lane {
+    if lane == Some(LANE_HI) {
+        Lane::Hi
+    } else {
+        Lane::Lo
+    }
 }
 
 /// Route one decoded uplink frame: decode → ACL-check → build the
@@ -106,6 +135,8 @@ pub fn route_uplink(
     params(
         ("pubkey" = String, Query,
             description = "base64url (URL-safe, no padding) of the connecting peer's 32-byte WireGuard public key. This is a WebSocket upgrade endpoint (documented as GET; OpenAPI cannot model the WS protocol). The connection relays opaque, already-encrypted WireGuard frames by destination pubkey; every forward is ACL-gated by the same policy as direct sessions."),
+        ("lane" = Option<String>, Query,
+            description = "Which lane this socket carries: 'hi' (WireGuard handshake/cookie, types 1-3) or 'lo' (bulk transport data, type 4). Each joiner opens TWO sockets, one per lane, so a bulk transfer on 'lo' cannot bufferbloat the handshake socket. ABSENT (legacy single-WS joiner) or any unrecognised value is treated as 'lo'; the registry's hi→lo fallback still delivers handshakes to a lo-only peer."),
     ),
     responses(
         (status = 101, description = "Switching Protocols — WebSocket relay established."),
@@ -127,39 +158,33 @@ pub async fn relay_ws_handler(
     if !coordinator.is_registered_pubkey(&my_pubkey) {
         return (axum::http::StatusCode::FORBIDDEN, "unknown pubkey").into_response();
     }
-    ws.on_upgrade(move |socket| relay_conn(coordinator, my_pubkey, socket))
+    let lane = parse_lane(q.lane.as_deref());
+    ws.on_upgrade(move |socket| relay_conn(coordinator, my_pubkey, lane, socket))
 }
 
-/// Per-connection loop: register the sender, then split the socket into a
-/// send-task (drains the registry channel + emits keepalive pings) and a
-/// recv-loop (decodes uplink frames and forwards them). Cleans up on exit.
-async fn relay_conn(coordinator: Coordinator, my_pubkey: [u8; 32], socket: WebSocket) {
-    // Two lanes feeding the SAME socket: `hi` carries WireGuard
-    // handshake/cookie frames, `lo` carries bulk transport data. The send task
-    // drains `hi` BEFORE `lo` (biased select), so a saturated bulk download
-    // can't starve a peer's rekey handshake — the cause of REKEY_TIMEOUT that
-    // killed long transfers (multi-MB OCI pulls) at the ~2-min rekey.
-    let (hi_tx, mut hi_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (lo_tx, mut lo_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let id = coordinator.relay().register(my_pubkey.to_vec(), hi_tx, lo_tx);
-    tracing::info!(pubkey = %B64URL.encode(my_pubkey), conn_id = id, "relay: peer connected");
+/// Per-connection loop for ONE lane's socket: register the sender under
+/// `(pubkey, lane)`, then split the socket into a send-task (drains the
+/// registry channel + emits keepalive pings) and a recv-loop (decodes uplink
+/// frames and forwards them). Cleans up on exit.
+///
+/// Each joiner opens TWO of these (a `hi` socket and a `lo` socket), so this
+/// function carries exactly one lane — there is nothing to prioritise WITHIN a
+/// socket; priority is achieved by the SEPARATE sockets (the near-empty `hi`
+/// socket never bufferbloats under a bulk transfer on `lo`).
+async fn relay_conn(coordinator: Coordinator, my_pubkey: [u8; 32], lane: Lane, socket: WebSocket) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let id = coordinator.relay().register(&my_pubkey, lane, tx);
+    tracing::info!(pubkey = %B64URL.encode(my_pubkey), conn_id = id, ?lane, "relay: peer connected");
     let (mut sink, mut stream) = socket.split();
 
-    // Send task: forward downlink frames + heartbeat pings to the peer.
+    // Send task: forward this lane's downlink frames + heartbeat pings to the
+    // peer. The `hi` socket still needs its own ping so a dead handshake lane
+    // is detected and reaped independently of the `lo` lane.
     let send_task = tokio::spawn(async move {
         let mut ping = tokio::time::interval(RELAY_PING_INTERVAL);
         loop {
             tokio::select! {
-                biased;
-                // Priority: handshake/cookie frames first so the rekey
-                // completes even mid bulk transfer.
-                frame = hi_rx.recv() => {
-                    let Some(frame) = frame else { break };
-                    if sink.send(Message::Binary(frame)).await.is_err() {
-                        break;
-                    }
-                }
-                frame = lo_rx.recv() => {
+                frame = rx.recv() => {
                     let Some(frame) = frame else { break };
                     if sink.send(Message::Binary(frame)).await.is_err() {
                         break;
@@ -174,7 +199,10 @@ async fn relay_conn(coordinator: Coordinator, my_pubkey: [u8; 32], socket: WebSo
         }
     });
 
-    // Recv loop: decode uplink frames and forward them to the destination.
+    // Recv loop: decode uplink frames and forward them to the destination. The
+    // frame's destination LANE is derived from its WireGuard type in
+    // `route_uplink` (NOT from which socket it arrived on), so an uplink may
+    // arrive on either of this peer's sockets and still route correctly.
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
             Message::Binary(buf) => {
@@ -188,10 +216,11 @@ async fn relay_conn(coordinator: Coordinator, my_pubkey: [u8; 32], socket: WebSo
         }
     }
 
-    // Tear down: drop our registry entry (only if still ours) + stop the
-    // send task so its sink half is released.
-    coordinator.relay().unregister(&my_pubkey, id);
-    tracing::info!(pubkey = %B64URL.encode(my_pubkey), conn_id = id, "relay: peer disconnected");
+    // Tear down: drop ONLY this lane's registry slot (id-matched, so a newer
+    // reconnect on this lane is never clobbered, and the peer's OTHER lane is
+    // left intact) + stop the send task so its sink half is released.
+    coordinator.relay().unregister(&my_pubkey, lane, id);
+    tracing::info!(pubkey = %B64URL.encode(my_pubkey), conn_id = id, ?lane, "relay: peer disconnected");
     send_task.abort();
 }
 
@@ -260,9 +289,9 @@ mod tests {
         let a_pubkey = [1u8; 32];
         let b_pubkey = [2u8; 32];
 
-        let (b_hi, _b_hi_rx) = mpsc::unbounded_channel();
+        // `b"ping"` (first byte 'p') is a DATA frame → the lo lane.
         let (b_lo, mut b_rx) = mpsc::unbounded_channel();
-        c.relay().register(b_pubkey.to_vec(), b_hi, b_lo);
+        c.relay().register(&b_pubkey, Lane::Lo, b_lo);
 
         let uplink = encode_relay_frame(&b_pubkey, b"ping");
         let forwarded = route_uplink(&c, &a_pubkey, &uplink).expect("forwarded");
@@ -270,6 +299,34 @@ mod tests {
         assert_eq!(&forwarded[..32], &a_pubkey);
         assert_eq!(&forwarded[32..], b"ping");
         let received = b_rx.try_recv().expect("b received the downlink");
+        assert_eq!(received, forwarded);
+    }
+
+    /// Rollout back-compat at the routing layer: a HANDSHAKE-typed uplink
+    /// (first byte 1) to a destination that registered ONLY a lo lane (a
+    /// legacy single-WS joiner) is delivered via the hi→lo fallback.
+    #[tokio::test]
+    async fn route_uplink_handshake_falls_back_to_legacy_lo_only_peer() {
+        let c = coordinator();
+        let _ = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
+        let _ = c
+            .register(req(2, "b", "svc", &["tag:svc"]))
+            .await
+            .expect("b");
+        let a_pubkey = [1u8; 32];
+        let b_pubkey = [2u8; 32];
+
+        // Legacy peer: only the lo lane (no ?lane=hi socket).
+        let (b_lo, mut b_rx) = mpsc::unbounded_channel();
+        c.relay().register(&b_pubkey, Lane::Lo, b_lo);
+
+        // A WireGuard handshake-init (type 1) must still reach the legacy peer.
+        let uplink = encode_relay_frame(&b_pubkey, &[1u8, 2, 3, 4]);
+        let forwarded = route_uplink(&c, &a_pubkey, &uplink).expect("forwarded via fallback");
+        let received = b_rx.try_recv().expect("legacy peer got the handshake on lo");
         assert_eq!(received, forwarded);
     }
 
@@ -288,9 +345,8 @@ mod tests {
         let a_pubkey = [1u8; 32];
         let b_pubkey = [3u8; 32];
 
-        let (b_hi, _b_hi_rx) = mpsc::unbounded_channel();
         let (b_lo, mut b_rx) = mpsc::unbounded_channel();
-        c.relay().register(b_pubkey.to_vec(), b_hi, b_lo);
+        c.relay().register(&b_pubkey, Lane::Lo, b_lo);
 
         let uplink = encode_relay_frame(&b_pubkey, b"ping");
         assert!(route_uplink(&c, &a_pubkey, &uplink).is_none());
@@ -324,5 +380,19 @@ mod tests {
             .expect("a");
         let a_pubkey = [1u8; 32];
         assert!(route_uplink(&c, &a_pubkey, &[0u8; 10]).is_none());
+    }
+
+    /// The `?lane=` contract: only the exact string [`LANE_HI`] selects the hi
+    /// lane; the lo wire value, an unknown string, and ABSENCE (legacy joiner)
+    /// all degrade to `Lo` — never a rejection. The `LANE_HI` literal is pinned
+    /// here so a drift from the joiner's copy fails a test rather than silently
+    /// reviving the bug.
+    #[test]
+    fn parse_lane_maps_only_hi_to_hi_else_legacy_lo() {
+        assert_eq!(LANE_HI, "hi", "the hi wire value must match the joiner");
+        assert_eq!(parse_lane(Some("hi")), Lane::Hi);
+        assert_eq!(parse_lane(Some("lo")), Lane::Lo);
+        assert_eq!(parse_lane(None), Lane::Lo, "legacy no-lane → lo");
+        assert_eq!(parse_lane(Some("garbage")), Lane::Lo, "unknown → lo, never reject");
     }
 }

@@ -233,10 +233,11 @@ mod tests {
             relay_only: false,
         };
         coord.apply_peer_joined(&joined).expect("apply joined");
-        // Register a live relay connection for this peer's pubkey.
-        let (hi, _hi_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Register a live relay connection (lo lane) for this peer's pubkey.
         let (lo, _lo_rx) = tokio::sync::mpsc::unbounded_channel();
-        coord.relay().register(pubkey.clone(), hi, lo);
+        coord
+            .relay()
+            .register(&pubkey, crate::relay::Lane::Lo, lo);
         assert!(
             coord.relay().forward(&pubkey, vec![1, 2, 3], false),
             "relay forward should reach the live conn before peer-left"

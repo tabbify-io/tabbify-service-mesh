@@ -29,14 +29,52 @@ pub struct RelayOutbound {
     pub payload: Vec<u8>,
 }
 
-/// The two priority lanes the relay client task drains: `hi` (WG
-/// handshake/cookie frames) is emptied BEFORE `lo` (bulk transport data), so a
-/// saturated bulk transfer can never starve a peer's rekey handshake — the
-/// cause of `REKEY_TIMEOUT` that killed long transfers at the ~2-min rekey.
+/// Wire value of `?lane=hi` — the handshake/cookie socket. MUST stay
+/// byte-identical to the coordinator's copy (`mesh-coordinator`
+/// `http::relay::LANE_HI`); a mismatch silently routes every handshake to the
+/// coordinator's legacy `lo` fallback, reviving the `REKEY_TIMEOUT` bug with
+/// NO error surfaced. Same independent-copy rule as the relay frame codec.
+pub const LANE_HI: &str = "hi";
+/// Wire value of `?lane=lo` — the bulk transport-data socket. See [`LANE_HI`].
+pub const LANE_LO: &str = "lo";
+
+/// Which of a peer's two dedicated relay sockets a client task drives. Each
+/// joiner runs ONE [`run`] task per lane: a [`RelayLane::Hi`] socket carrying
+/// ONLY WG handshake/cookie frames and a [`RelayLane::Lo`] socket carrying ONLY
+/// bulk transport data. The sockets are physically separate WS/TCP
+/// connections, so a saturated bulk transfer on `Lo` (which bufferbloats its
+/// kernel send buffer to ~10 s) cannot delay a rekey handshake on the
+/// near-empty `Hi` socket.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RelayLane {
+    /// Handshake/cookie — the near-empty, never-bloated socket.
+    Hi,
+    /// Bulk transport data — may bloat, but only ITS own socket.
+    Lo,
+}
+
+impl RelayLane {
+    /// The `?lane=` query value this lane connects with.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hi => LANE_HI,
+            Self::Lo => LANE_LO,
+        }
+    }
+}
+
+/// The producer-side lane split: [`RelayHandle::try_relay`] classifies each
+/// frame by WG type and pushes it onto `hi` (handshake/cookie) or `lo` (bulk
+/// data). Each receiver feeds a SEPARATE relay client task on its OWN WS
+/// socket ([`RelayLane`]), so a saturated bulk transfer on `lo`'s socket
+/// cannot bufferbloat `hi`'s — the cause of `REKEY_TIMEOUT` that killed long
+/// transfers at the ~2-min rekey. The caller (`joiner.rs`) destructures this
+/// into the two single-lane [`RelayTask`]s.
 pub struct RelayOutboundRx {
-    /// High-priority receiver — handshake/cookie frames.
+    /// High-priority receiver — drained by the `hi` socket's task.
     pub hi: mpsc::UnboundedReceiver<RelayOutbound>,
-    /// Low-priority receiver — bulk transport data.
+    /// Low-priority receiver — drained by the `lo` socket's task.
     pub lo: mpsc::UnboundedReceiver<RelayOutbound>,
 }
 
@@ -149,9 +187,13 @@ pub struct RelayTask {
     pub socket: Arc<UdpSocket>,
     /// TUN device — where decapsulated inner packets are delivered.
     pub tun: Arc<dyn tabbify_mesh_fabric::tun::TunDevice>,
-    /// Receivers (two priority lanes) the WG TX seams queue outbound relayed
-    /// datagrams on.
-    pub outbound_rx: RelayOutboundRx,
+    /// This task's lane — selects the `?lane=` query value and which half of
+    /// the [`RelayOutboundRx`] split it drains. The joiner spawns one task per
+    /// lane.
+    pub lane: RelayLane,
+    /// Receiver of the THIS-lane outbound datagrams the WG TX seams queued
+    /// (the `hi` or `lo` half of a [`RelayOutboundRx`]).
+    pub outbound_rx: mpsc::UnboundedReceiver<RelayOutbound>,
     /// Shutdown signal — the task exits when this flips to `true`.
     pub shutdown: watch::Receiver<bool>,
 }
@@ -198,7 +240,9 @@ pub async fn run(mut task: RelayTask) {
 
     let base = derive_relay_url(&task.coordinator_url, task.relay_url.as_deref());
     let pubkey_q = B64URL.encode(task.my_pubkey);
-    let url = format!("{base}?pubkey={pubkey_q}");
+    // `&lane=` tags which dedicated socket this is so the coordinator registers
+    // it on the matching lane (handshakes on `hi`, bulk on `lo`).
+    let url = format!("{base}?pubkey={pubkey_q}&lane={}", task.lane.as_str());
 
     let backoff = [1u64, 2, 5, 10];
     let mut attempt: usize = 0;
@@ -265,22 +309,18 @@ async fn connect_once(url: &str, task: &mut RelayTask) -> ConnOutcome {
                     return ConnOutcome::ShutdownRequested;
                 }
             }
-            // HIGH priority: handshake/cookie frames first, so a rekey completes
-            // even while we saturate the relay with bulk data.
-            outbound = task.outbound_rx.hi.recv() => {
+            // Drain THIS lane's outbound queue onto its own socket. There is
+            // nothing to prioritise within a socket — priority comes from the
+            // SEPARATE sockets (the near-empty `hi` socket never bloats).
+            outbound = task.outbound_rx.recv() => {
                 let Some(out) = outbound else {
-                    // The handle was dropped (joiner tearing down) — exit.
-                    return ConnOutcome::ShutdownRequested;
-                };
-                let frame = encode_relay_frame(&out.dst_pubkey, &out.payload);
-                if let Err(e) = sink.send(Message::Binary(frame)).await {
-                    tracing::warn!(error = %e, "relay: sink send failed");
-                    return ConnOutcome::Disconnected("sink-send-failed");
-                }
-            }
-            // LOW priority: bulk transport-data frames.
-            outbound = task.outbound_rx.lo.recv() => {
-                let Some(out) = outbound else {
+                    // Defensive only: `recv()` yields `None` solely when EVERY
+                    // `RelayHandle` sender is dropped, but this task holds a
+                    // `SessionTable` clone that OWNS the `RelayHandle`
+                    // (tx_hi/tx_lo), so the senders outlive the task. Normal
+                    // teardown happens via the `shutdown` watch (the biased arm
+                    // above), NOT channel close — do not refactor teardown to
+                    // rely on this branch.
                     return ConnOutcome::ShutdownRequested;
                 };
                 let frame = encode_relay_frame(&out.dst_pubkey, &out.payload);
@@ -488,6 +528,9 @@ mod tests {
             written: parking_lot::Mutex::new(Vec::new()),
         });
         let (handle, outbound_rx) = RelayHandle::new(false);
+        // `b"hello"` (first byte 'h') is a DATA frame → the lo lane; drive the
+        // lo-lane task.
+        let RelayOutboundRx { hi: _hi, lo } = outbound_rx;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let task = tokio::spawn(run(RelayTask {
@@ -498,7 +541,8 @@ mod tests {
             sessions,
             socket,
             tun,
-            outbound_rx,
+            lane: RelayLane::Lo,
+            outbound_rx: lo,
             shutdown: shutdown_rx,
         }));
 
@@ -542,11 +586,83 @@ mod tests {
                 sessions,
                 socket,
                 tun,
-                outbound_rx,
+                lane: RelayLane::Hi,
+                outbound_rx: outbound_rx.hi,
                 shutdown: shutdown_rx,
             }),
         )
         .await;
         assert!(res.is_ok(), "secure-mode relay task must return, not hang");
+    }
+
+    /// `as_str` pins the `?lane=` wire values; a drift from the coordinator's
+    /// `LANE_HI`/`LANE_LO` would silently route handshakes to the legacy
+    /// fallback (the `REKEY_TIMEOUT` bug), so assert them explicitly.
+    #[test]
+    fn relay_lane_wire_values() {
+        assert_eq!(RelayLane::Hi.as_str(), "hi");
+        assert_eq!(RelayLane::Lo.as_str(), "lo");
+        assert_eq!((LANE_HI, LANE_LO), ("hi", "lo"));
+    }
+
+    /// The relay task connects with its lane in the query string: a `Hi` task
+    /// builds `…?pubkey=…&lane=hi`. Captures the upgrade request URI on a fake
+    /// coordinator and asserts the `lane` param — the joiner half of the
+    /// cross-end lane contract.
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // tokio-tungstenite's accept_hdr callback signature
+    async fn run_connects_with_lane_query() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (uri_tx, uri_rx) = tokio::sync::oneshot::channel::<String>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut uri_tx = Some(uri_tx);
+            let _ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
+                if let Some(tx) = uri_tx.take() {
+                    let _ = tx.send(req.uri().to_string());
+                }
+                Ok(resp)
+            })
+            .await
+            .unwrap();
+        });
+
+        let sessions = SessionTable::new();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tun: Arc<dyn TunDevice> = Arc::new(RecordingTun {
+            written: parking_lot::Mutex::new(Vec::new()),
+        });
+        let (_handle, outbound_rx) = RelayHandle::new(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let task = tokio::spawn(run(RelayTask {
+            coordinator_url: format!("http://{addr}"),
+            relay_url: None,
+            my_pubkey: [42u8; 32],
+            insecure_no_mtls: true,
+            sessions,
+            socket,
+            tun,
+            lane: RelayLane::Hi,
+            outbound_rx: outbound_rx.hi,
+            shutdown: shutdown_rx,
+        }));
+
+        let uri = tokio::time::timeout(Duration::from_secs(5), uri_rx)
+            .await
+            .expect("server captured the upgrade URI in time")
+            .expect("uri channel ok");
+        assert!(
+            uri.contains("lane=hi"),
+            "hi-lane task must connect with &lane=hi; got {uri}"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
     }
 }

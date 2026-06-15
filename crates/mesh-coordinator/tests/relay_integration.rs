@@ -111,12 +111,32 @@ async fn register(
     resp.json().await.expect("register json")
 }
 
-/// Open a real relay WebSocket for `seed`'s registered pubkey.
+/// Open a real relay WebSocket for `seed`'s registered pubkey with NO `?lane=`
+/// — the legacy single-WS joiner shape (the coordinator treats it as the `lo`
+/// lane, with hi→lo fallback for handshakes).
 async fn open_relay(
     addr: SocketAddr,
     seed: u8,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let url = format!("ws://{addr}/v1/mesh/relay?pubkey={}", pubkey_b64url(seed));
+    let (ws, _resp) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(url))
+        .await
+        .expect("relay WS connect did not time out")
+        .expect("relay WS connected");
+    ws
+}
+
+/// Open a real relay WebSocket for `seed`'s pubkey on a specific `lane`
+/// (`"hi"` or `"lo"`) — the dual-WS joiner shape (one socket per lane).
+async fn open_relay_lane(
+    addr: SocketAddr,
+    seed: u8,
+    lane: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let url = format!(
+        "ws://{addr}/v1/mesh/relay?pubkey={}&lane={lane}",
+        pubkey_b64url(seed)
+    );
     let (ws, _resp) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(url))
         .await
         .expect("relay WS connect did not time out")
@@ -218,6 +238,86 @@ async fn relay_ws_accepts_url_unsafe_pubkey() {
     // Connects with the base64url ?pubkey=; must upgrade (no 400). If the URL
     // alphabet were wrong, `open_relay`'s `connect_async` would error and panic.
     let _ws = open_relay(addr, 0xFB).await;
+}
+
+/// Dual-WS (Option A): B opens TWO sockets (`?lane=hi` + `?lane=lo`). A
+/// handshake-typed uplink (WG type 1) is delivered on B's HI socket; a
+/// data-typed uplink (type 4) on B's LO socket. If routing were wrong the HI
+/// recv would time out (handshake mis-sent to lo) or the LO recv would return
+/// the handshake instead of the data — either way the asserts fail.
+#[tokio::test]
+async fn relay_routes_handshake_to_hi_and_data_to_lo() {
+    let (addr, _s) = spawn().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let _ = register(&client, &base, 1, "a", "a", &["tag:user-a"]).await;
+    let _ = register(&client, &base, 2, "b", "svc", &["tag:svc"]).await;
+
+    let a_pubkey = raw_pubkey(1);
+    let b_pubkey = raw_pubkey(2);
+
+    let mut a_ws = open_relay(addr, 1).await; // sender lane is irrelevant
+    let mut b_hi = open_relay_lane(addr, 2, "hi").await;
+    let mut b_lo = open_relay_lane(addr, 2, "lo").await;
+
+    // Handshake (first byte 1) → B's HI socket.
+    let handshake: &[u8] = &[1u8, 7, 7, 7];
+    a_ws.send(Message::Binary(encode_relay_frame(&b_pubkey, handshake)))
+        .await
+        .expect("A handshake uplink sent");
+    let got_hi = recv_binary(&mut b_hi)
+        .await
+        .expect("B's HI socket received the handshake");
+    assert_eq!(
+        got_hi,
+        encode_relay_frame(&a_pubkey, handshake),
+        "handshake must ride the hi socket, source-rewritten to A"
+    );
+
+    // Data (first byte 4) → B's LO socket. If the handshake had wrongly gone
+    // to lo, this recv would return the handshake bytes and fail the assert.
+    let data: &[u8] = &[4u8, 8, 8, 8];
+    a_ws.send(Message::Binary(encode_relay_frame(&b_pubkey, data)))
+        .await
+        .expect("A data uplink sent");
+    let got_lo = recv_binary(&mut b_lo)
+        .await
+        .expect("B's LO socket received the data frame");
+    assert_eq!(
+        got_lo,
+        encode_relay_frame(&a_pubkey, data),
+        "data must ride the lo socket, source-rewritten to A"
+    );
+}
+
+/// Rollout back-compat: a legacy peer B with ONLY a no-lane socket (treated as
+/// `lo`) still receives a HANDSHAKE-typed frame via the coordinator's hi→lo
+/// fallback. Without the fallback a mixed-version mesh would strand every
+/// legacy peer's rekey — the exact failure this whole effort fixes.
+#[tokio::test]
+async fn relay_legacy_no_lane_peer_receives_handshake_via_fallback() {
+    let (addr, _s) = spawn().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let _ = register(&client, &base, 1, "a", "a", &["tag:user-a"]).await;
+    let _ = register(&client, &base, 2, "b", "svc", &["tag:svc"]).await;
+
+    let a_pubkey = raw_pubkey(1);
+    let b_pubkey = raw_pubkey(2);
+
+    let mut a_ws = open_relay(addr, 1).await;
+    let mut b_ws = open_relay(addr, 2).await; // no ?lane= → legacy → lo slot
+
+    let handshake: &[u8] = &[1u8, 2, 3];
+    a_ws.send(Message::Binary(encode_relay_frame(&b_pubkey, handshake)))
+        .await
+        .expect("A handshake uplink sent");
+    let got = recv_binary(&mut b_ws)
+        .await
+        .expect("legacy B received the handshake via hi→lo fallback");
+    assert_eq!(got, encode_relay_frame(&a_pubkey, handshake));
 }
 
 /// Read the next BINARY frame from a relay WS, skipping protocol pings/pongs
