@@ -29,6 +29,40 @@ pub struct RelayOutbound {
     pub payload: Vec<u8>,
 }
 
+/// The two priority lanes the relay client task drains: `hi` (WG
+/// handshake/cookie frames) is emptied BEFORE `lo` (bulk transport data), so a
+/// saturated bulk transfer can never starve a peer's rekey handshake — the
+/// cause of `REKEY_TIMEOUT` that killed long transfers at the ~2-min rekey.
+pub struct RelayOutboundRx {
+    /// High-priority receiver — handshake/cookie frames.
+    pub hi: mpsc::UnboundedReceiver<RelayOutbound>,
+    /// Low-priority receiver — bulk transport data.
+    pub lo: mpsc::UnboundedReceiver<RelayOutbound>,
+}
+
+#[cfg(test)]
+impl RelayOutboundRx {
+    /// Test helper: receive from either lane, preferring `hi` — mirrors the
+    /// production biased drain. Lets tests that only assert THAT a frame was
+    /// queued for relay (not which lane) stay agnostic to the priority split.
+    pub(crate) async fn recv(&mut self) -> Option<RelayOutbound> {
+        tokio::select! {
+            biased;
+            v = self.hi.recv() => v,
+            v = self.lo.recv() => v,
+        }
+    }
+
+    /// Test helper: non-blocking receive from either lane (`hi` first).
+    /// `Err` only when BOTH lanes are empty/closed.
+    pub(crate) fn try_recv(&mut self) -> Result<RelayOutbound, mpsc::error::TryRecvError> {
+        match self.hi.try_recv() {
+            Ok(v) => Ok(v),
+            Err(_) => self.lo.try_recv(),
+        }
+    }
+}
+
 /// Cheap-clone handle the WG TX seams use to relay a packet when no direct
 /// endpoint is known.
 ///
@@ -38,7 +72,10 @@ pub struct RelayOutbound {
 /// silent drop).
 #[derive(Clone)]
 pub struct RelayHandle {
-    tx: mpsc::UnboundedSender<RelayOutbound>,
+    /// HIGH-priority lane: WG handshake/cookie frames (drained before `tx_lo`).
+    tx_hi: mpsc::UnboundedSender<RelayOutbound>,
+    /// LOW-priority lane: bulk transport-data frames.
+    tx_lo: mpsc::UnboundedSender<RelayOutbound>,
     /// `true` when the LOCAL node joined `relay_only` — it declared it has no
     /// usable direct path, so its TX must NEVER attempt a direct probe in
     /// `send_wire`; every frame rides the relay. Direct-dialing from a
@@ -53,9 +90,17 @@ pub struct RelayHandle {
 impl RelayHandle {
     /// Create a handle paired with the receiver the relay task drains.
     /// `relay_only` is the LOCAL node's policy (see the field doc).
-    pub(crate) fn new(relay_only: bool) -> (Self, mpsc::UnboundedReceiver<RelayOutbound>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx, relay_only }, rx)
+    pub(crate) fn new(relay_only: bool) -> (Self, RelayOutboundRx) {
+        let (tx_hi, hi) = mpsc::unbounded_channel();
+        let (tx_lo, lo) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx_hi,
+                tx_lo,
+                relay_only,
+            },
+            RelayOutboundRx { hi, lo },
+        )
     }
 
     /// `true` when the local node is `relay_only` (see the field doc). The TX
@@ -70,10 +115,13 @@ impl RelayHandle {
     /// Best-effort: a send to a closed channel (relay task gone) is
     /// silently dropped.
     pub fn try_relay(&self, dst_pubkey: [u8; 32], payload: Vec<u8>) {
-        let _ = self.tx.send(RelayOutbound {
-            dst_pubkey,
-            payload,
-        });
+        // WG message type = cleartext first byte: 1=init, 2=resp, 3=cookie → the
+        // HIGH lane; 4=transport data → the LOW lane. Prioritising handshakes
+        // lets a peer's rekey complete even while this node saturates the relay
+        // with bulk data (the cause of REKEY_TIMEOUT that killed long transfers).
+        let hi = payload.first().is_some_and(|&t| matches!(t, 1..=3));
+        let ch = if hi { &self.tx_hi } else { &self.tx_lo };
+        let _ = ch.send(RelayOutbound { dst_pubkey, payload });
     }
 }
 
@@ -101,8 +149,9 @@ pub struct RelayTask {
     pub socket: Arc<UdpSocket>,
     /// TUN device — where decapsulated inner packets are delivered.
     pub tun: Arc<dyn tabbify_mesh_fabric::tun::TunDevice>,
-    /// Receiver the WG TX seams queue outbound relayed datagrams on.
-    pub outbound_rx: mpsc::UnboundedReceiver<RelayOutbound>,
+    /// Receivers (two priority lanes) the WG TX seams queue outbound relayed
+    /// datagrams on.
+    pub outbound_rx: RelayOutboundRx,
     /// Shutdown signal — the task exits when this flips to `true`.
     pub shutdown: watch::Receiver<bool>,
 }
@@ -216,10 +265,22 @@ async fn connect_once(url: &str, task: &mut RelayTask) -> ConnOutcome {
                     return ConnOutcome::ShutdownRequested;
                 }
             }
-            // Drain one queued outbound datagram → relay frame on the wire.
-            outbound = task.outbound_rx.recv() => {
+            // HIGH priority: handshake/cookie frames first, so a rekey completes
+            // even while we saturate the relay with bulk data.
+            outbound = task.outbound_rx.hi.recv() => {
                 let Some(out) = outbound else {
                     // The handle was dropped (joiner tearing down) — exit.
+                    return ConnOutcome::ShutdownRequested;
+                };
+                let frame = encode_relay_frame(&out.dst_pubkey, &out.payload);
+                if let Err(e) = sink.send(Message::Binary(frame)).await {
+                    tracing::warn!(error = %e, "relay: sink send failed");
+                    return ConnOutcome::Disconnected("sink-send-failed");
+                }
+            }
+            // LOW priority: bulk transport-data frames.
+            outbound = task.outbound_rx.lo.recv() => {
+                let Some(out) = outbound else {
                     return ConnOutcome::ShutdownRequested;
                 };
                 let frame = encode_relay_frame(&out.dst_pubkey, &out.payload);
@@ -307,13 +368,28 @@ mod tests {
 
     /// A queued datagram arrives on the receiver verbatim — the channel
     /// the relay task drains carries the destination pubkey + payload.
+    /// The payload's first byte is `1` (WG handshake init), so it must land
+    /// on the HIGH-priority lane, not the low one.
     #[tokio::test]
     async fn try_relay_queues_outbound() {
         let (handle, mut rx) = RelayHandle::new(false);
         handle.try_relay([9u8; 32], vec![1, 2, 3]);
-        let got = rx.recv().await.expect("queued outbound");
+        let got = rx.hi.recv().await.expect("queued outbound on hi lane");
         assert_eq!(got.dst_pubkey, [9u8; 32]);
         assert_eq!(got.payload, vec![1, 2, 3]);
+    }
+
+    /// A transport-data frame (first byte `4`) lands on the LOW lane while
+    /// the HIGH lane stays empty — the classifier splits the two correctly.
+    #[tokio::test]
+    async fn try_relay_routes_transport_data_to_low_lane() {
+        let (handle, mut rx) = RelayHandle::new(false);
+        handle.try_relay([5u8; 32], vec![4, 0, 0, 0]);
+        let got = rx.lo.recv().await.expect("queued outbound on lo lane");
+        assert_eq!(got.dst_pubkey, [5u8; 32]);
+        assert_eq!(got.payload, vec![4, 0, 0, 0]);
+        // The HIGH lane must be empty — a data frame must never ride it.
+        assert!(rx.hi.try_recv().is_err(), "hi lane must stay empty");
     }
 
     /// `try_relay` after the receiver is dropped does not panic — the

@@ -497,10 +497,10 @@ struct SpawnContext {
     /// This joiner's own compile-time version ([`MESH_VERSION`]), self-reported
     /// on register + every heartbeat alongside `software_version`.
     mesh_version: Option<String>,
-    /// Receiver the relay client task drains for outbound relayed
-    /// datagrams. `Some` only when relay is enabled; `None` (`--no-relay`)
-    /// skips spawning the relay task entirely.
-    relay_outbound_rx: Option<mpsc::UnboundedReceiver<crate::relay::client::RelayOutbound>>,
+    /// The two priority receivers (hi=handshake, lo=bulk) the relay client
+    /// task drains for outbound relayed datagrams. `Some` only when relay is
+    /// enabled; `None` (`--no-relay`) skips spawning the relay task entirely.
+    relay_outbound_rx: Option<crate::relay::client::RelayOutboundRx>,
     /// Explicit relay endpoint URL override; `None` derives it from
     /// `coordinator_url`.
     relay_url: Option<String>,
@@ -1002,7 +1002,7 @@ fn build_relay_channel(
     relay_only: bool,
 ) -> (
     Option<crate::relay::RelayHandle>,
-    Option<mpsc::UnboundedReceiver<crate::relay::client::RelayOutbound>>,
+    Option<crate::relay::client::RelayOutboundRx>,
 ) {
     if relay_enabled && insecure_no_mtls {
         let (h, rx) = crate::relay::RelayHandle::new(relay_only);
