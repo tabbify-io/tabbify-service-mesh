@@ -234,10 +234,11 @@ mod tests {
         };
         coord.apply_peer_joined(&joined).expect("apply joined");
         // Register a live relay connection for this peer's pubkey.
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        coord.relay().register(pubkey.clone(), tx);
+        let (hi, _hi_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (lo, _lo_rx) = tokio::sync::mpsc::unbounded_channel();
+        coord.relay().register(pubkey.clone(), hi, lo);
         assert!(
-            coord.relay().forward(&pubkey, vec![1, 2, 3]),
+            coord.relay().forward(&pubkey, vec![1, 2, 3], false),
             "relay forward should reach the live conn before peer-left"
         );
         // Peer leaves -> its relay conn must be dropped.
@@ -248,7 +249,7 @@ mod tests {
         };
         coord.apply_peer_left(&left);
         assert!(
-            !coord.relay().forward(&pubkey, vec![4, 5, 6]),
+            !coord.relay().forward(&pubkey, vec![4, 5, 6], false),
             "relay conn must be gone after peer-left"
         );
     }

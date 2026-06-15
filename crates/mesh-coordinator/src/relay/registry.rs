@@ -7,14 +7,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// Per-peer live connection. Two send channels feed the SAME WS, drained by a
+/// biased send task that empties `hi` before `lo`: `WireGuard` HANDSHAKE/cookie
+/// frames go to `hi`, bulk transport DATA to `lo`. Without this, a saturated
+/// bulk download (e.g. a multi-MB OCI image pull) fills the single FIFO and
+/// STARVES the peer's rekey handshake response behind thousands of data frames
+/// → `REKEY_TIMEOUT` at the ~2-min rekey → the tunnel (and the long transfer)
+/// dies. Prioritising handshakes lets the rekey complete mid-transfer.
 struct RelayConn {
     id: u64,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    hi: mpsc::UnboundedSender<Vec<u8>>,
+    lo: mpsc::UnboundedSender<Vec<u8>>,
 }
 
-/// A frame held for a pubkey that had no live connection at send time.
+/// A frame held for a pubkey that had no live connection at send time, tagged
+/// with the priority it must flush to on (re)register.
 struct SpooledFrame {
     at: Instant,
+    hi_prio: bool,
     frame: Vec<u8>,
 }
 
@@ -54,63 +64,70 @@ impl RelayRegistry {
         Self::default()
     }
 
-    /// Register a connection's sender under `pubkey` (last connection wins),
-    /// then FLUSH any non-expired spooled frames to it (in arrival order) so a
-    /// handshake frame that arrived microseconds before this WS upgrade is
-    /// delivered, not lost.
-    pub fn register(&self, pubkey: Vec<u8>, tx: mpsc::UnboundedSender<Vec<u8>>) -> u64 {
+    /// Register a connection's two send channels under `pubkey` (last
+    /// connection wins), then FLUSH any non-expired spooled frames to the right
+    /// channel (in arrival order) so a handshake frame that arrived microseconds
+    /// before this WS upgrade is delivered, not lost.
+    pub fn register(
+        &self,
+        pubkey: Vec<u8>,
+        hi: mpsc::UnboundedSender<Vec<u8>>,
+        lo: mpsc::UnboundedSender<Vec<u8>>,
+    ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        // Flush frames spooled for this pubkey to the NEW sender (in arrival
-        // order, dropping any past the TTL) BEFORE registering it, so the
-        // common case — a handshake frame that landed microseconds before this
-        // WS upgrade — is delivered, not lost.
         if let Some((_, held)) = self.spool.remove(&pubkey) {
             let now = Instant::now();
             for sf in held {
                 if now.duration_since(sf.at) > SPOOL_TTL {
                     continue; // stale handshake frame — useless, drop it
                 }
-                if tx.send(sf.frame).is_err() {
+                let ch = if sf.hi_prio { &hi } else { &lo };
+                if ch.send(sf.frame).is_err() {
                     break; // the brand-new receiver is already gone
                 }
             }
         }
-        self.conns.insert(pubkey, RelayConn { id, tx });
+        self.conns.insert(pubkey, RelayConn { id, hi, lo });
         id
     }
 
-    /// Forward a fully-encoded downlink frame to `pubkey`. Returns `true` only
-    /// when it was delivered to a LIVE connection. When there is no live
-    /// connection (or the live send races a just-closed receiver), the frame
-    /// is SPOOLED briefly instead of discarded (see [`Self::spool`]) and the
-    /// method returns `false` — the caller treats `false` as "not forwarded
-    /// yet", but the frame is held, not lost.
+    /// Forward a fully-encoded downlink frame to `pubkey` on the priority lane
+    /// `hi_prio` selects (handshake/cookie → `hi`, bulk data → `lo`). Returns
+    /// `true` only when delivered to a LIVE connection. When there is no live
+    /// connection (or the live send races a just-closed receiver), the frame is
+    /// SPOOLED briefly instead of discarded (see [`Self::spool`]) and the method
+    /// returns `false` — "not forwarded yet", but the frame is held, not lost.
     #[must_use]
-    pub fn forward(&self, pubkey: &[u8], frame: Vec<u8>) -> bool {
-        if let Some(tx) = self.conns.get(pubkey).map(|c| c.tx.clone()) {
-            match tx.send(frame) {
+    pub fn forward(&self, pubkey: &[u8], frame: Vec<u8>, hi_prio: bool) -> bool {
+        if let Some(ch) = self
+            .conns
+            .get(pubkey)
+            .map(|c| if hi_prio { c.hi.clone() } else { c.lo.clone() })
+        {
+            match ch.send(frame) {
                 Ok(()) => return true,
                 Err(mpsc::error::SendError(frame)) => {
                     // Entry existed but its receiver just died — hold the
                     // recovered frame for the imminent reconnect.
-                    self.push_spool(pubkey, frame);
+                    self.push_spool(pubkey, hi_prio, frame);
                     return false;
                 }
             }
         }
-        self.push_spool(pubkey, frame);
+        self.push_spool(pubkey, hi_prio, frame);
         false
     }
 
-    /// Hold `frame` for `pubkey` until it (re)registers, bounded to the newest
-    /// [`SPOOL_CAP`] frames (oldest evicted first).
-    fn push_spool(&self, pubkey: &[u8], frame: Vec<u8>) {
+    /// Hold `frame` (with its priority) for `pubkey` until it (re)registers,
+    /// bounded to the newest [`SPOOL_CAP`] frames (oldest evicted first).
+    fn push_spool(&self, pubkey: &[u8], hi_prio: bool, frame: Vec<u8>) {
         let mut q = self.spool.entry(pubkey.to_vec()).or_default();
         if q.len() >= SPOOL_CAP {
             q.pop_front();
         }
         q.push_back(SpooledFrame {
             at: Instant::now(),
+            hi_prio,
             frame,
         });
     }
@@ -129,17 +146,14 @@ impl RelayRegistry {
         self.spool.remove(pubkey);
     }
 
-    /// Reap entries whose receiver has been dropped — i.e. the relay WS task
+    /// Reap entries whose receivers have been dropped — i.e. the relay WS task
     /// ended without a matched [`Self::unregister`] (a panic or abnormal close).
-    /// Returns the number removed.
-    ///
-    /// `UnboundedSender::is_closed()` is `true` exactly when the paired receiver
-    /// was dropped, so this is a PRECISE liveness signal: it never evicts a
-    /// live-but-idle connection (no TTL guesswork). Called periodically by the
-    /// background sweeper so a stalled/leaked entry can't accumulate forever.
+    /// Returns the number removed. Both lanes share the one send task, so they
+    /// close together; testing either is a PRECISE liveness signal (no TTL
+    /// guesswork). Called periodically by the background sweeper.
     pub fn reap_closed(&self) -> usize {
         let before = self.conns.len();
-        self.conns.retain(|_, c| !c.tx.is_closed());
+        self.conns.retain(|_, c| !c.lo.is_closed());
         before - self.conns.len()
     }
 
@@ -177,46 +191,65 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    /// Register a pubkey and return its (`hi_rx`, `lo_rx`) so a test can assert
+    /// which lane a frame landed on.
+    fn register(
+        reg: &RelayRegistry,
+        pubkey: Vec<u8>,
+    ) -> (
+        mpsc::UnboundedReceiver<Vec<u8>>,
+        mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        let (hi, hi_rx) = mpsc::unbounded_channel();
+        let (lo, lo_rx) = mpsc::unbounded_channel();
+        reg.register(pubkey, hi, lo);
+        (hi_rx, lo_rx)
+    }
+
     #[test]
     fn register_returns_increasing_ids() {
         let reg = RelayRegistry::new();
-        let (tx_a, _rx_a) = mpsc::unbounded_channel();
-        let (tx_b, _rx_b) = mpsc::unbounded_channel();
-        let id_a = reg.register(vec![1u8; 32], tx_a);
-        let id_b = reg.register(vec![2u8; 32], tx_b);
+        let (hi_a, _) = mpsc::unbounded_channel();
+        let (lo_a, _) = mpsc::unbounded_channel();
+        let (hi_b, _) = mpsc::unbounded_channel();
+        let (lo_b, _) = mpsc::unbounded_channel();
+        let id_a = reg.register(vec![1u8; 32], hi_a, lo_a);
+        let id_b = reg.register(vec![2u8; 32], hi_b, lo_b);
         assert!(id_b > id_a, "ids must strictly increase");
     }
 
     #[test]
-    fn forward_delivers_to_registered_pubkey() {
+    fn forward_routes_to_the_priority_lane() {
         let reg = RelayRegistry::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        reg.register(vec![9u8; 32], tx);
-        assert!(reg.forward(&[9u8; 32], vec![1, 2, 3]));
-        assert_eq!(rx.try_recv().expect("frame delivered"), vec![1, 2, 3]);
+        let (mut hi_rx, mut lo_rx) = register(&reg, vec![9u8; 32]);
+        // A handshake frame goes to the HI lane.
+        assert!(reg.forward(&[9u8; 32], vec![1, 0, 0, 0], true));
+        assert_eq!(hi_rx.try_recv().expect("hi lane"), vec![1, 0, 0, 0]);
+        assert!(lo_rx.try_recv().is_err(), "data lane stays empty");
+        // A bulk data frame goes to the LO lane.
+        assert!(reg.forward(&[9u8; 32], vec![4, 0, 0, 0], false));
+        assert_eq!(lo_rx.try_recv().expect("lo lane"), vec![4, 0, 0, 0]);
+        assert!(hi_rx.try_recv().is_err(), "hi lane stays empty");
     }
 
     #[test]
     fn forward_to_unknown_pubkey_is_false() {
         let reg = RelayRegistry::new();
         // No live conn -> returns false (not delivered) but the frame is HELD.
-        assert!(!reg.forward(&[0u8; 32], vec![1, 2, 3]));
+        assert!(!reg.forward(&[0u8; 32], vec![1, 2, 3], true));
     }
 
     #[test]
-    fn forward_to_unregistered_spools_and_register_flushes() {
+    fn forward_to_unregistered_spools_and_register_flushes_to_the_right_lane() {
         // THE regression for the REKEY_TIMEOUT storm: a frame for a pubkey
-        // whose relay WS is momentarily unregistered (post-reconnect race)
-        // must be held and delivered the instant it (re)registers — not
-        // silently dropped.
+        // whose relay WS is momentarily unregistered must be held and delivered
+        // — on its ORIGINAL priority lane — the instant it (re)registers.
         let reg = RelayRegistry::new();
-        assert!(!reg.forward(&[7u8; 32], vec![1, 2, 3]), "no live conn yet");
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        reg.register(vec![7u8; 32], tx);
-        assert_eq!(
-            rx.try_recv().expect("spooled frame flushed on register"),
-            vec![1, 2, 3]
-        );
+        assert!(!reg.forward(&[7u8; 32], vec![2, 9, 9], true), "no live conn");
+        assert!(!reg.forward(&[7u8; 32], vec![4, 8, 8], false), "no live conn");
+        let (mut hi_rx, mut lo_rx) = register(&reg, vec![7u8; 32]);
+        assert_eq!(hi_rx.try_recv().expect("hi spooled flush"), vec![2, 9, 9]);
+        assert_eq!(lo_rx.try_recv().expect("lo spooled flush"), vec![4, 8, 8]);
     }
 
     #[test]
@@ -224,12 +257,11 @@ mod tests {
         let reg = RelayRegistry::new();
         let n = u8::try_from(SPOOL_CAP).expect("cap fits u8") + 5;
         for i in 0..n {
-            let _ = reg.forward(&[8u8; 32], vec![i]);
+            let _ = reg.forward(&[8u8; 32], vec![i], false);
         }
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        reg.register(vec![8u8; 32], tx);
+        let (_, mut lo_rx) = register(&reg, vec![8u8; 32]);
         let mut got = vec![];
-        while let Ok(f) = rx.try_recv() {
+        while let Ok(f) = lo_rx.try_recv() {
             got.push(f[0]);
         }
         assert_eq!(got.len(), SPOOL_CAP, "spool holds at most SPOOL_CAP frames");
@@ -240,75 +272,66 @@ mod tests {
     #[test]
     fn reap_expired_spool_keeps_fresh_frames() {
         let reg = RelayRegistry::new();
-        let _ = reg.forward(&[1u8; 32], vec![9]);
+        let _ = reg.forward(&[1u8; 32], vec![9], true);
         assert_eq!(reg.reap_expired_spool(), 0, "fresh frame is not reaped");
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        reg.register(vec![1u8; 32], tx);
-        assert_eq!(
-            rx.try_recv().expect("fresh spooled frame survives reap"),
-            vec![9]
-        );
+        let (mut hi_rx, _) = register(&reg, vec![1u8; 32]);
+        assert_eq!(hi_rx.try_recv().expect("fresh survives reap"), vec![9]);
     }
 
     #[test]
     fn drop_pubkey_clears_spool() {
         let reg = RelayRegistry::new();
-        let _ = reg.forward(&[2u8; 32], vec![1]);
+        let _ = reg.forward(&[2u8; 32], vec![1], false);
         reg.drop_pubkey(&[2u8; 32]);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        reg.register(vec![2u8; 32], tx);
-        assert!(rx.try_recv().is_err(), "spool cleared on drop_pubkey");
+        let (_, mut lo_rx) = register(&reg, vec![2u8; 32]);
+        assert!(lo_rx.try_recv().is_err(), "spool cleared on drop_pubkey");
     }
 
     #[test]
     fn unregister_only_removes_matching_id() {
         let reg = RelayRegistry::new();
-        let (tx_old, _rx_old) = mpsc::unbounded_channel();
-        let old_id = reg.register(vec![5u8; 32], tx_old);
+        let (hi_old, _) = mpsc::unbounded_channel();
+        let (lo_old, _) = mpsc::unbounded_channel();
+        let old_id = reg.register(vec![5u8; 32], hi_old, lo_old);
         // A newer connection replaces the entry under the same pubkey.
-        let (tx_new, mut rx_new) = mpsc::unbounded_channel();
-        let _new_id = reg.register(vec![5u8; 32], tx_new);
+        let (mut hi_new_rx, _lo_new_rx) = register(&reg, vec![5u8; 32]);
         // Unregistering the OLD id must be a no-op (the new conn still wins).
         reg.unregister(&[5u8; 32], old_id);
-        assert!(reg.forward(&[5u8; 32], vec![7]));
-        assert_eq!(rx_new.try_recv().expect("new conn still live"), vec![7]);
+        assert!(reg.forward(&[5u8; 32], vec![1, 7], true));
+        assert_eq!(hi_new_rx.try_recv().expect("new conn still live"), vec![1, 7]);
     }
 
     #[test]
     fn drop_pubkey_removes_unconditionally() {
         let reg = RelayRegistry::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        reg.register(vec![3u8; 32], tx);
+        let _ = register(&reg, vec![3u8; 32]);
         assert_eq!(reg.len(), 1);
         reg.drop_pubkey(&[3u8; 32]);
         assert!(reg.is_empty());
-        assert!(!reg.forward(&[3u8; 32], vec![1]));
+        assert!(!reg.forward(&[3u8; 32], vec![1], false));
     }
 
     #[test]
     fn reap_closed_removes_only_dead_connections() {
         let reg = RelayRegistry::new();
-        // A live connection — keep its receiver alive so the sender stays open.
-        let (tx_live, _rx_live) = mpsc::unbounded_channel();
-        reg.register(vec![1u8; 32], tx_live);
-        // A dead connection — drop the receiver so the sender reports closed.
-        let (tx_dead, rx_dead) = mpsc::unbounded_channel();
-        reg.register(vec![2u8; 32], tx_dead);
-        drop(rx_dead);
+        // A live connection — keep its receivers alive so the senders stay open.
+        let (_hi_live_rx, _lo_live_rx) = register(&reg, vec![1u8; 32]);
+        // A dead connection — drop its receivers so the senders report closed.
+        {
+            let _ = register(&reg, vec![2u8; 32]);
+        } // both receivers dropped here
 
         assert_eq!(reg.len(), 2);
         assert_eq!(reg.reap_closed(), 1, "only the dead conn is reaped");
         assert_eq!(reg.len(), 1);
-        assert!(reg.forward(&[1u8; 32], vec![9]), "live conn survives");
-        // Dead conn is gone -> forward now spools (false) instead of delivering.
-        assert!(!reg.forward(&[2u8; 32], vec![9]), "dead conn is gone");
+        assert!(reg.forward(&[1u8; 32], vec![9], false), "live conn survives");
+        assert!(!reg.forward(&[2u8; 32], vec![9], false), "dead conn is gone");
     }
 
     #[test]
     fn reap_closed_is_a_noop_when_all_live() {
         let reg = RelayRegistry::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        reg.register(vec![4u8; 32], tx);
+        let (_hi_rx, _lo_rx) = register(&reg, vec![4u8; 32]);
         assert_eq!(reg.reap_closed(), 0);
         assert_eq!(reg.len(), 1);
     }

@@ -1361,10 +1361,11 @@ async fn register_evicts_stale_holder_and_adopts_requested_ula() {
     let pubkey_a = pubkey_bytes(40);
     // Register a live relay connection under A's pubkey — eviction must
     // tear it down (proves `apply_peer_left` -> `relay.drop_pubkey(A)`).
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    c.relay().register(pubkey_a.clone(), tx);
+    let (hi, _hi_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (lo, _lo_rx) = tokio::sync::mpsc::unbounded_channel();
+    c.relay().register(pubkey_a.clone(), hi, lo);
     assert!(
-        c.relay().forward(&pubkey_a, vec![1, 2, 3]),
+        c.relay().forward(&pubkey_a, vec![1, 2, 3], false),
         "relay conn for A is live before eviction"
     );
     make_stale(&c, a.peer_id);
@@ -1391,7 +1392,7 @@ async fn register_evicts_stale_holder_and_adopts_requested_ula() {
     );
     // A's relay connection was dropped by the eviction.
     assert!(
-        !c.relay().forward(&pubkey_a, vec![4, 5, 6]),
+        !c.relay().forward(&pubkey_a, vec![4, 5, 6], false),
         "stale A's relay conn must be torn down on eviction"
     );
 

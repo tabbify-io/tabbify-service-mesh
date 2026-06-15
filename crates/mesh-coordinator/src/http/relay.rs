@@ -65,8 +65,15 @@ pub fn route_uplink(
         );
         return None;
     }
+    // WireGuard message type = cleartext first byte of the inner packet:
+    // 1=handshake init, 2=handshake response, 3=cookie reply, 4=transport data.
+    // Handshake/cookie frames take the HIGH-priority lane so a saturated bulk
+    // transfer (e.g. a multi-MB OCI pull) can't starve a peer's rekey handshake
+    // behind thousands of data frames — the cause of REKEY_TIMEOUT mid-transfer
+    // (the tunnel then dies and the long transfer EOFs).
+    let hi_prio = payload.first().is_some_and(|&t| matches!(t, 1..=3));
     let downlink = encode_relay_frame(my_pubkey, payload);
-    if coordinator.relay().forward(&dst, downlink.clone()) {
+    if coordinator.relay().forward(&dst, downlink.clone(), hi_prio) {
         tracing::debug!(
             src = %B64URL.encode(my_pubkey),
             dst = %B64URL.encode(dst),
@@ -127,8 +134,14 @@ pub async fn relay_ws_handler(
 /// send-task (drains the registry channel + emits keepalive pings) and a
 /// recv-loop (decodes uplink frames and forwards them). Cleans up on exit.
 async fn relay_conn(coordinator: Coordinator, my_pubkey: [u8; 32], socket: WebSocket) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let id = coordinator.relay().register(my_pubkey.to_vec(), tx);
+    // Two lanes feeding the SAME socket: `hi` carries WireGuard
+    // handshake/cookie frames, `lo` carries bulk transport data. The send task
+    // drains `hi` BEFORE `lo` (biased select), so a saturated bulk download
+    // can't starve a peer's rekey handshake — the cause of REKEY_TIMEOUT that
+    // killed long transfers (multi-MB OCI pulls) at the ~2-min rekey.
+    let (hi_tx, mut hi_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (lo_tx, mut lo_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let id = coordinator.relay().register(my_pubkey.to_vec(), hi_tx, lo_tx);
     tracing::info!(pubkey = %B64URL.encode(my_pubkey), conn_id = id, "relay: peer connected");
     let (mut sink, mut stream) = socket.split();
 
@@ -137,7 +150,16 @@ async fn relay_conn(coordinator: Coordinator, my_pubkey: [u8; 32], socket: WebSo
         let mut ping = tokio::time::interval(RELAY_PING_INTERVAL);
         loop {
             tokio::select! {
-                frame = rx.recv() => {
+                biased;
+                // Priority: handshake/cookie frames first so the rekey
+                // completes even mid bulk transfer.
+                frame = hi_rx.recv() => {
+                    let Some(frame) = frame else { break };
+                    if sink.send(Message::Binary(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                frame = lo_rx.recv() => {
                     let Some(frame) = frame else { break };
                     if sink.send(Message::Binary(frame)).await.is_err() {
                         break;
@@ -238,8 +260,9 @@ mod tests {
         let a_pubkey = [1u8; 32];
         let b_pubkey = [2u8; 32];
 
-        let (b_tx, mut b_rx) = mpsc::unbounded_channel();
-        c.relay().register(b_pubkey.to_vec(), b_tx);
+        let (b_hi, _b_hi_rx) = mpsc::unbounded_channel();
+        let (b_lo, mut b_rx) = mpsc::unbounded_channel();
+        c.relay().register(b_pubkey.to_vec(), b_hi, b_lo);
 
         let uplink = encode_relay_frame(&b_pubkey, b"ping");
         let forwarded = route_uplink(&c, &a_pubkey, &uplink).expect("forwarded");
@@ -265,8 +288,9 @@ mod tests {
         let a_pubkey = [1u8; 32];
         let b_pubkey = [3u8; 32];
 
-        let (b_tx, mut b_rx) = mpsc::unbounded_channel();
-        c.relay().register(b_pubkey.to_vec(), b_tx);
+        let (b_hi, _b_hi_rx) = mpsc::unbounded_channel();
+        let (b_lo, mut b_rx) = mpsc::unbounded_channel();
+        c.relay().register(b_pubkey.to_vec(), b_hi, b_lo);
 
         let uplink = encode_relay_frame(&b_pubkey, b"ping");
         assert!(route_uplink(&c, &a_pubkey, &uplink).is_none());
