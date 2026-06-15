@@ -36,6 +36,31 @@ use tokio::sync::mpsc;
 /// the sink errors and the connection is torn down.
 const RELAY_PING_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Bounded capacity of a peer's HI (handshake/cookie) downlink channel. Large
+/// on purpose: handshakes are tiny and infrequent and drain over the dedicated
+/// near-empty `hi` socket, so this never fills in practice — it exists only so
+/// `hi` and `lo` share one bounded `Sender` type while guaranteeing handshakes
+/// are never dropped under steady-state load.
+const RELAY_HI_CAP: usize = 1024;
+
+/// Bounded capacity of a peer's LO (bulk transport) downlink channel. SMALL on
+/// purpose — this IS the bufferbloat debloat. The coordinator must not buffer
+/// more than a fraction of a second of bulk for a peer whose downlink can't
+/// keep up: when this channel fills, `RelayRegistry::forward` DROPS new frames,
+/// so the inner TCP sees the loss, shrinks its congestion window, and the
+/// lane's RTT stays low (~ms) instead of ballooning to ~10 s (which starved
+/// the inner transfer and EOF'd large pulls). ~256 × 1.4 KB ≈ 360 KB, far
+/// below the multi-MB / ~10 s backlog the unbounded channel used to grow.
+const RELAY_LO_CAP: usize = 256;
+
+/// Per-lane bounded-channel capacity (see [`RELAY_HI_CAP`] / [`RELAY_LO_CAP`]).
+const fn lane_channel_cap(lane: Lane) -> usize {
+    match lane {
+        Lane::Hi => RELAY_HI_CAP,
+        Lane::Lo => RELAY_LO_CAP,
+    }
+}
+
 /// Wire value of `?lane=hi` — the handshake/cookie socket. Any OTHER value
 /// (including `lo`, an unknown string, or absence) is treated as the legacy /
 /// `lo` lane, so this is the ONLY lane string the coordinator must recognise.
@@ -111,15 +136,17 @@ pub fn route_uplink(
         );
         Some(downlink)
     } else {
-        // No live relay connection right now — the frame was SPOOLED (held
-        // briefly) rather than dropped, so it is delivered the instant the
-        // destination's WS (re)registers. This bridges the post-reconnect
-        // registration race that otherwise stranded WireGuard handshakes
-        // (the REKEY_TIMEOUT storm).
+        // Not forwarded to a live socket. Either (a) no live connection → the
+        // frame was SPOOLED (held briefly) and delivered the instant the
+        // destination's WS (re)registers — bridging the post-reconnect race
+        // that otherwise stranded WireGuard handshakes (the REKEY_TIMEOUT
+        // storm); or (b) the destination's bounded `lo` channel was FULL → the
+        // bulk frame was DROPPED (congestion debloat), and the inner TCP will
+        // retransmit it.
         tracing::debug!(
             src = %B64URL.encode(my_pubkey),
             dst = %B64URL.encode(dst),
-            "relay: destination not yet connected — frame spooled for imminent (re)register"
+            "relay: not forwarded (destination not yet connected → spooled, or lo congested → dropped)"
         );
         None
     }
@@ -172,7 +199,10 @@ pub async fn relay_ws_handler(
 /// socket; priority is achieved by the SEPARATE sockets (the near-empty `hi`
 /// socket never bufferbloats under a bulk transfer on `lo`).
 async fn relay_conn(coordinator: Coordinator, my_pubkey: [u8; 32], lane: Lane, socket: WebSocket) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // BOUNDED channel: a small `lo` capacity caps how much bulk the coordinator
+    // buffers for this peer's downlink, so `forward` drops (rather than bloats)
+    // under congestion. `hi` is sized large so handshakes are never dropped.
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(lane_channel_cap(lane));
     let id = coordinator.relay().register(&my_pubkey, lane, tx);
     tracing::info!(pubkey = %B64URL.encode(my_pubkey), conn_id = id, ?lane, "relay: peer connected");
     let (mut sink, mut stream) = socket.split();
@@ -290,7 +320,7 @@ mod tests {
         let b_pubkey = [2u8; 32];
 
         // `b"ping"` (first byte 'p') is a DATA frame → the lo lane.
-        let (b_lo, mut b_rx) = mpsc::unbounded_channel();
+        let (b_lo, mut b_rx) = mpsc::channel(16);
         c.relay().register(&b_pubkey, Lane::Lo, b_lo);
 
         let uplink = encode_relay_frame(&b_pubkey, b"ping");
@@ -320,7 +350,7 @@ mod tests {
         let b_pubkey = [2u8; 32];
 
         // Legacy peer: only the lo lane (no ?lane=hi socket).
-        let (b_lo, mut b_rx) = mpsc::unbounded_channel();
+        let (b_lo, mut b_rx) = mpsc::channel(16);
         c.relay().register(&b_pubkey, Lane::Lo, b_lo);
 
         // A WireGuard handshake-init (type 1) must still reach the legacy peer.
@@ -345,7 +375,7 @@ mod tests {
         let a_pubkey = [1u8; 32];
         let b_pubkey = [3u8; 32];
 
-        let (b_lo, mut b_rx) = mpsc::unbounded_channel();
+        let (b_lo, mut b_rx) = mpsc::channel(16);
         c.relay().register(&b_pubkey, Lane::Lo, b_lo);
 
         let uplink = encode_relay_frame(&b_pubkey, b"ping");

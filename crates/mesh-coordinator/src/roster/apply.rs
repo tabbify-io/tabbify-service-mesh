@@ -234,7 +234,7 @@ mod tests {
         };
         coord.apply_peer_joined(&joined).expect("apply joined");
         // Register a live relay connection (lo lane) for this peer's pubkey.
-        let (lo, _lo_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (lo, _lo_rx) = tokio::sync::mpsc::channel(16);
         coord
             .relay()
             .register(&pubkey, crate::relay::Lane::Lo, lo);

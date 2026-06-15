@@ -24,12 +24,18 @@ pub enum Lane {
     Lo,
 }
 
-/// One live single-lane relay socket: a send channel drained by that socket's
-/// send task, tagged with the registration `id` so an id-matched
+/// One live single-lane relay socket: a BOUNDED send channel drained by that
+/// socket's send task, tagged with the registration `id` so an id-matched
 /// [`RelayRegistry::unregister`] never clobbers a newer reconnect.
+///
+/// The channel is bounded (not unbounded) so a peer whose downlink can't drain
+/// fast enough cannot make the coordinator buffer unboundedly:
+/// [`RelayRegistry::forward`] DROPS on a full `lo` channel, which is the
+/// bufferbloat debloat (the channel capacity is set per-lane by the relay HTTP
+/// handler).
 struct LaneConn {
     id: u64,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
 }
 
 /// A peer's pair of live relay sockets. A new joiner populates BOTH (`hi` +
@@ -60,7 +66,7 @@ impl PeerConns {
     /// rollout. Bulk data (`!hi_prio`) uses `lo` ONLY and NEVER falls back to
     /// `hi`: letting bulk onto the handshake socket would re-bloat it and undo
     /// the entire fix.
-    fn pick(&self, hi_prio: bool) -> Option<&mpsc::UnboundedSender<Vec<u8>>> {
+    fn pick(&self, hi_prio: bool) -> Option<&mpsc::Sender<Vec<u8>>> {
         if hi_prio {
             self.hi.as_ref().or(self.lo.as_ref()).map(|c| &c.tx)
         } else {
@@ -129,7 +135,7 @@ impl RelayRegistry {
     /// each one — so a frame that arrived microseconds before this WS upgrade
     /// is delivered on whichever lane now claims it (or re-held for the lane
     /// still connecting). Returns the connection id.
-    pub fn register(&self, pubkey: &[u8], lane: Lane, tx: mpsc::UnboundedSender<Vec<u8>>) -> u64 {
+    pub fn register(&self, pubkey: &[u8], lane: Lane, tx: mpsc::Sender<Vec<u8>>) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         {
             // Scope the entry guard: it write-locks the shard, and the spool
@@ -157,16 +163,29 @@ impl RelayRegistry {
     ///
     /// Handshake/cookie → `hi` (falling back to `lo` for a legacy single-WS
     /// peer), bulk data → `lo` only. Returns `true` only when delivered to a
-    /// LIVE socket. When there is no usable live socket (or the send races a
-    /// just-closed receiver), the frame is SPOOLED briefly instead of
-    /// discarded (see [`Self::spool`]) and the method returns `false` — "not
-    /// forwarded yet", but the frame is held, not lost.
+    /// LIVE socket. Three non-delivery cases:
+    /// - no live socket / a just-closed receiver → the frame is SPOOLED briefly
+    ///   (see [`Self::spool`]) so a reconnect-race handshake is not lost;
+    /// - the lane's BOUNDED channel is FULL (the peer's downlink can't drain
+    ///   fast enough) → the frame is DROPPED, not spooled. This is the
+    ///   bufferbloat debloat: capping per-peer in-flight makes the inner TCP
+    ///   see the loss and shrink its window, so the lane's RTT stays low (~ms)
+    ///   instead of ballooning to ~10 s and killing long transfers. A dropped
+    ///   transport frame is retransmitted by the inner TCP; a dropped handshake
+    ///   by boringtun's rekey timer (and the `hi` lane is sized so it never
+    ///   fills in practice).
+    ///
+    /// Returns `false` for all three (held OR dropped) — "not forwarded".
     #[must_use]
     pub fn forward(&self, pubkey: &[u8], frame: Vec<u8>, hi_prio: bool) -> bool {
         if let Some(tx) = self.conns.get(pubkey).and_then(|c| c.pick(hi_prio).cloned()) {
-            match tx.send(frame) {
+            match tx.try_send(frame) {
                 Ok(()) => return true,
-                Err(mpsc::error::SendError(frame)) => {
+                Err(mpsc::error::TrySendError::Full(_frame)) => {
+                    // Steady-state congestion — DROP (debloat), do not spool.
+                    return false;
+                }
+                Err(mpsc::error::TrySendError::Closed(frame)) => {
                     // The chosen lane's receiver just died — hold the recovered
                     // frame (with its ORIGINAL priority) for the imminent
                     // reconnect.
@@ -282,26 +301,28 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    /// Channel capacity for the test lanes — comfortably above `SPOOL_CAP` so a
+    /// full spool flush is delivered, not drop-on-full (the drop path has its
+    /// own dedicated test with a tiny cap).
+    const TEST_CAP: usize = 64;
+
     /// Register BOTH lanes for a pubkey (the new dual-WS joiner shape) and
     /// return their (`hi_rx`, `lo_rx`) so a test can assert which lane a frame
     /// landed on.
     fn register_both(
         reg: &RelayRegistry,
         pubkey: &[u8],
-    ) -> (
-        mpsc::UnboundedReceiver<Vec<u8>>,
-        mpsc::UnboundedReceiver<Vec<u8>>,
-    ) {
-        let (hi, hi_rx) = mpsc::unbounded_channel();
-        let (lo, lo_rx) = mpsc::unbounded_channel();
+    ) -> (mpsc::Receiver<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let (hi, hi_rx) = mpsc::channel(TEST_CAP);
+        let (lo, lo_rx) = mpsc::channel(TEST_CAP);
         reg.register(pubkey, Lane::Hi, hi);
         reg.register(pubkey, Lane::Lo, lo);
         (hi_rx, lo_rx)
     }
 
     /// Register ONLY the lo lane (the legacy single-WS joiner shape).
-    fn register_lo(reg: &RelayRegistry, pubkey: &[u8]) -> mpsc::UnboundedReceiver<Vec<u8>> {
-        let (lo, lo_rx) = mpsc::unbounded_channel();
+    fn register_lo(reg: &RelayRegistry, pubkey: &[u8]) -> mpsc::Receiver<Vec<u8>> {
+        let (lo, lo_rx) = mpsc::channel(TEST_CAP);
         reg.register(pubkey, Lane::Lo, lo);
         lo_rx
     }
@@ -309,8 +330,8 @@ mod tests {
     #[test]
     fn register_returns_increasing_ids() {
         let reg = RelayRegistry::new();
-        let (hi_a, _) = mpsc::unbounded_channel();
-        let (lo_b, _) = mpsc::unbounded_channel();
+        let (hi_a, _) = mpsc::channel(TEST_CAP);
+        let (lo_b, _) = mpsc::channel(TEST_CAP);
         let id_a = reg.register(&[1u8; 32], Lane::Hi, hi_a);
         let id_b = reg.register(&[2u8; 32], Lane::Lo, lo_b);
         assert!(id_b > id_a, "ids must strictly increase");
@@ -363,7 +384,7 @@ mod tests {
         // handshake-only socket (that would re-bloat it). With only a hi lane
         // live, a data frame is spooled, not delivered to hi.
         let reg = RelayRegistry::new();
-        let (hi, mut hi_rx) = mpsc::unbounded_channel();
+        let (hi, mut hi_rx) = mpsc::channel(TEST_CAP);
         reg.register(&[8u8; 32], Lane::Hi, hi);
         assert!(
             !reg.forward(&[8u8; 32], vec![4, 0, 0], false),
@@ -377,6 +398,32 @@ mod tests {
         let reg = RelayRegistry::new();
         // No live conn -> returns false (not delivered) but the frame is HELD.
         assert!(!reg.forward(&[0u8; 32], vec![1, 2, 3], true));
+    }
+
+    #[test]
+    fn forward_drops_on_full_lane_without_spooling() {
+        // The debloat: when a peer's bounded lo channel is full (its downlink
+        // can't drain), forward DROPS the frame (returns false) and does NOT
+        // spool it — steady-state congestion must not be replayed on the next
+        // (re)register, only the sub-second reconnect race is.
+        let reg = RelayRegistry::new();
+        let (lo, lo_rx) = mpsc::channel(2); // tiny cap, receiver NOT drained
+        reg.register(&[1u8; 32], Lane::Lo, lo);
+        assert!(reg.forward(&[1u8; 32], vec![4, 1], false), "1st fits");
+        assert!(reg.forward(&[1u8; 32], vec![4, 2], false), "2nd fits (cap 2)");
+        assert!(
+            !reg.forward(&[1u8; 32], vec![4, 3], false),
+            "3rd is dropped — channel full"
+        );
+        // Replace the lo conn with a fresh, drained one: the dropped frame must
+        // NOT reappear (it was dropped, not spooled). The two that fit are still
+        // queued on the OLD receiver, which we drop here.
+        drop(lo_rx);
+        let mut fresh_rx = register_lo(&reg, &[1u8; 32]);
+        assert!(
+            fresh_rx.try_recv().is_err(),
+            "a congestion-dropped frame is never spooled/replayed"
+        );
     }
 
     #[test]
@@ -416,7 +463,7 @@ mod tests {
         let reg = RelayRegistry::new();
         assert!(!reg.forward(&[6u8; 32], vec![4, 2, 2], false), "data spooled");
         // hi registers first: the data frame must NOT flush to hi.
-        let (hi, mut hi_rx) = mpsc::unbounded_channel();
+        let (hi, mut hi_rx) = mpsc::channel(TEST_CAP);
         reg.register(&[6u8; 32], Lane::Hi, hi);
         assert!(hi_rx.try_recv().is_err(), "data must never ride the hi socket");
         // lo registers: now the data frame flushes to lo.
@@ -468,8 +515,8 @@ mod tests {
         // Tearing down the hi socket must leave the live lo socket intact
         // (independent sockets now).
         let reg = RelayRegistry::new();
-        let (hi, _hi_rx) = mpsc::unbounded_channel();
-        let (lo, mut lo_rx) = mpsc::unbounded_channel();
+        let (hi, _hi_rx) = mpsc::channel(TEST_CAP);
+        let (lo, mut lo_rx) = mpsc::channel(TEST_CAP);
         let hi_id = reg.register(&[5u8; 32], Lane::Hi, hi);
         reg.register(&[5u8; 32], Lane::Lo, lo);
         reg.unregister(&[5u8; 32], Lane::Hi, hi_id);
@@ -482,10 +529,10 @@ mod tests {
     #[test]
     fn unregister_only_removes_matching_id() {
         let reg = RelayRegistry::new();
-        let (lo_old, _) = mpsc::unbounded_channel();
+        let (lo_old, _) = mpsc::channel(TEST_CAP);
         let old_id = reg.register(&[5u8; 32], Lane::Lo, lo_old);
         // A newer connection replaces the lo slot under the same pubkey.
-        let (lo_new, mut lo_new_rx) = mpsc::unbounded_channel();
+        let (lo_new, mut lo_new_rx) = mpsc::channel(TEST_CAP);
         reg.register(&[5u8; 32], Lane::Lo, lo_new);
         // Unregistering the OLD id must be a no-op (the new conn still wins).
         reg.unregister(&[5u8; 32], Lane::Lo, old_id);
@@ -496,7 +543,7 @@ mod tests {
     #[test]
     fn unregister_removes_pubkey_when_last_lane_gone() {
         let reg = RelayRegistry::new();
-        let (lo, _lo_rx) = mpsc::unbounded_channel();
+        let (lo, _lo_rx) = mpsc::channel(TEST_CAP);
         let lo_id = reg.register(&[3u8; 32], Lane::Lo, lo);
         assert_eq!(reg.len(), 1);
         reg.unregister(&[3u8; 32], Lane::Lo, lo_id);
@@ -517,10 +564,10 @@ mod tests {
     fn reap_closed_reaps_a_dead_lane_keeping_the_live_one() {
         let reg = RelayRegistry::new();
         // hi alive (keep its rx), lo dead (drop its rx so the sender closes).
-        let (hi, _hi_rx) = mpsc::unbounded_channel();
+        let (hi, _hi_rx) = mpsc::channel(TEST_CAP);
         reg.register(&[1u8; 32], Lane::Hi, hi);
         {
-            let (lo, _lo_rx) = mpsc::unbounded_channel();
+            let (lo, _lo_rx) = mpsc::channel(TEST_CAP);
             reg.register(&[1u8; 32], Lane::Lo, lo);
         } // lo receiver dropped here -> lo sender closed
         assert_eq!(reg.reap_closed(), 1, "only the dead lo lane is reaped");
