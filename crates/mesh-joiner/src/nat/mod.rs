@@ -1,8 +1,9 @@
 //! NAT traversal — Stage 2 UDP hole-punch subscriber.
 //!
-//! Holds the joiner-side hole-punch subscriber stub ([`holepunch`]). The
-//! real implementation (firing UDP packets at a peer's external endpoint)
-//! is deferred until the SSE wire mechanism for `HolePunchInitiate` events
-//! is decided; this pins the import path + protocol shape now.
+//! Holds the joiner-side hole-punch subscriber ([`holepunch`]), which IS wired
+//! and functional: the SSE consumer (`coordinator::peer_sync`) forwards
+//! `HolePunchInitiate` events to it and it fires synchronized UDP bursts at the
+//! target's reflexive endpoint. Advanced symmetric-NAT handling (type
+//! detection, retry strategy) is the only deferred part.
 
 pub mod holepunch;

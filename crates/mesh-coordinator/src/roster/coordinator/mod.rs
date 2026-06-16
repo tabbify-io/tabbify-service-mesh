@@ -81,7 +81,7 @@ pub struct PeerEntry {
     /// peer's heartbeat (source IP+port from the HTTP request). Empty when
     /// no heartbeat has been recorded yet or the source addr was
     /// unavailable (e.g. tests driving the router without connect-info).
-    /// Used by the Stage 2 hole punch skeleton to know which pairs
+    /// Used by the Stage 2 hole-punch coordinator to know which pairs
     /// are eligible for a `HolePunchInitiate` emission.
     pub observed_external: String,
     /// Whether [`Self::listen_endpoint`] was DERIVED from the

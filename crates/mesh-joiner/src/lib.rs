@@ -55,7 +55,7 @@
 //!   UDP / TUN / timer byte-pump loops, and X25519 keypair plumbing.
 //! * [`platform`] — per-OS shell-outs to wire the TUN device into the
 //!   kernel routing table.
-//! * [`nat`] — Stage 2 hole-punch subscriber stub.
+//! * [`nat`] — Stage 2 reflexive-discovery + the FUNCTIONAL hole-punch subscriber (advanced symmetric-NAT deferred).
 //! * [`relay`] — Stage 3 DERP-style relay client: forwards
 //!   already-encrypted WG datagrams through the coordinator when no
 //!   direct path is known.

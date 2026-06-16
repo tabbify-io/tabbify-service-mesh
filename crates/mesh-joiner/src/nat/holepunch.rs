@@ -1,29 +1,24 @@
-//! Stage 2 skeleton — UDP hole punch subscriber stub.
+//! Stage 2 — joiner-side UDP hole-punch subscriber (FUNCTIONAL, not a stub).
 //!
-//! The real implementation will:
+//! [`run`] is a live tokio task: the SSE consumer (`coordinator::peer_sync`)
+//! decodes `HolePunchInitiate` frames off the coordinator's
+//! `/v1/mesh/peers/stream` and forwards them on the `punch_rx` channel this
+//! task drains. For each event where WE are the initiator (matched against the
+//! LIVE `peer_id`, which a 404 re-register may have swapped):
 //!
-//! 1. Subscribe to `HolePunchInitiate` events from the coordinator (on
-//!    segment `platform.mesh.peers`). The current SSE endpoint
-//!    (`/v1/mesh/peers/stream`) only carries roster-shape `peer_added`
-//!    / `peer_updated` / `peer_removed` frames — Stage 2 will need
-//!    either an extension of that stream to carry hole-punch events
-//!    or a sibling endpoint (`/v1/mesh/holepunch/stream`) carrying
-//!    them.
-//! 2. For each event where `initiator_peer_id` matches our peer id,
-//!    fire a sequence of UDP packets at `target_external_endpoint` on
-//!    our existing WG socket, then mark the session as "punched" so
-//!    `wg_session::upsert` skips its normal handshake-initiation logic.
-//! 3. For each event where `target_peer_id` matches our peer id, expect
-//!    inbound packets from the initiator's endpoint and accept them.
-//! 4. Handle timing (the simultaneous-fire is the whole point) via a
-//!    delayed dispatch keyed off `timestamp_micros`.
+//! 1. [`plan_punch`] resolves the event to the target's session + reflexive
+//!    endpoint (returns `None` for not-initiator / no-session / bad endpoint).
+//! 2. [`execute_punch`] fires a synchronized burst of WG handshake-inits
+//!    (`PUNCH_BURST` × `PUNCH_INTERVAL`) at that endpoint to open our NAT
+//!    mapping, AND — while the path is still unconfirmed — relays the same
+//!    handshake in parallel (so a no-inbound peer still converges). Once a real
+//!    direct DATA packet arrives (`confirm_direct`), TX upgrades to the direct
+//!    path and the parallel relay stops.
 //!
-//! For now this module is a **stub** that runs a tokio task respecting
-//! shutdown, logs that it's running, and exits cleanly. The
-//! [`handle_holepunch_initiate`] entry point is exported separately so
-//! the eventual SSE consumer can call it once the wire mechanism is
-//! decided — gives downstream code the right import path now without
-//! requiring SSE-extension work today.
+//! The direct plane is gated by `relay_only`: a `relay_only` node (no usable
+//! direct path) never probes/punches — that contract is what prevents the
+//! 2026-06-07 double-sided-handshake-thrash outage. So this task only does
+//! useful work for peers that genuinely have a reachable endpoint.
 
 use crate::coordinator::heartbeat::SharedPeerId;
 use crate::relay::RelayHandle;

@@ -1,16 +1,17 @@
-//! Stage 2 skeleton — UDP hole punch initiation events.
+//! Stage 2 — UDP hole-punch initiation events (FUNCTIONAL; basic cone-NAT).
 //!
 //! When two peers each have a known `observed_external` socket addr
 //! (recorded from prior heartbeats), the coordinator emits a pair of
 //! `HolePunchInitiate` events on the `platform.mesh.peers` segment — one
 //! per peer, with `initiator_peer_id` / `target_peer_id` swapped so
 //! both sides know the other's external endpoint and can fire UDP packets
-//! simultaneously.
+//! simultaneously. The joiner-side subscriber consumes these and actually
+//! fires the synchronized bursts (see `mesh-joiner` `nat::holepunch`), so the
+//! basic cone-NAT punch path is END-TO-END LIVE, not a skeleton.
 //!
-//! The real hole-punching state machine (timing, retries, NAT type
-//! detection, fallback to relay) is **deferred to a cloud rollout with
-//! real NAT topology**. This module only pins the protocol shape so
-//! joiner subscribers don't churn when the real implementation lands.
+//! Deferred (advanced only): NAT-type detection, retry/backoff strategy for
+//! symmetric NAT, and adaptive timing. The relay floor already provides the
+//! fallback when a punch doesn't establish a direct path.
 //!
 //! Gating logic: the coordinator tracks an in-memory `DashMap<(Uuid,
 //! Uuid), last_emit_micros>` of punched ordered pairs and RE-EMITS a pair
@@ -209,7 +210,7 @@ pub async fn try_emit_pair(
         b = %b.peer_id,
         ext_a = %a.dial_endpoint,
         ext_b = %b.dial_endpoint,
-        "holepunch: emitting initiate pair (skeleton — no real punching yet)",
+        "holepunch: emitting initiate pair (joiners will fire synchronized bursts)",
     );
     // Event 1: A is initiator, B is target. A sends first to B's external.
     let ev_a = HolePunchInitiate {
