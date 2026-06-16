@@ -290,7 +290,14 @@ async fn connect_once(url: &str, task: &mut RelayTask) -> ConnOutcome {
             return if *task.shutdown.borrow() { ConnOutcome::ShutdownRequested }
                    else { ConnOutcome::Disconnected("shutdown-flap") };
         }
-        connect = tokio_tungstenite::connect_async(url) => match connect {
+        // `disable_nagle = true` → `TCP_NODELAY` on the relay socket. The relay
+        // tunnels WireGuard frames, many of them small (handshakes, cookies,
+        // and — critically — the inner TCP's ACKs riding inside small WG
+        // transport frames). Nagle's algorithm would hold those back up to
+        // ~40 ms waiting to coalesce, delaying ACK delivery and throttling the
+        // inner transfer's window growth (pure overhead on top of the WAN). Off
+        // it goes.
+        connect = tokio_tungstenite::connect_async_with_config(url, None, true) => match connect {
             Ok((ws, _resp)) => ws,
             Err(e) => {
                 tracing::warn!(error = %e, url, "relay: connect failed");
