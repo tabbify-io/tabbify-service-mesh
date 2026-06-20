@@ -14,8 +14,11 @@
 //!   `RegisterOutcome`, `Coordinator`, `Inner`), constructors / accessors,
 //!   snapshot / `stale_peers`, free helpers, the `PEER_SEGMENT` constant.
 
+pub mod command_queue;
 mod heartbeat;
 mod registration;
+
+pub use command_queue::NodeCommandDto;
 
 #[cfg(test)]
 mod jwt_tests;
@@ -135,6 +138,16 @@ pub struct PeerEntry {
     /// next heartbeat (correct — stale "direct" must never survive a
     /// restart). Empty for a freshly-joined or older (no-`peer_paths`) peer.
     pub paths: std::collections::HashMap<Uuid, (bool, u64)>,
+    /// Per-peer signed-command relay queue (Track C remote-restart). The
+    /// coordinator is a dumb relay — these are fully-signed
+    /// [`NodeCommandDto`](crate::roster::coordinator::command_queue::NodeCommandDto)s
+    /// the super-admin issued via `POST /v1/mesh/peers/{id}/commands`; they are
+    /// drained into the peer's next `HeartbeatResponse.pending_commands` and
+    /// removed once the node acks them via `executed_command_ids`. Ephemeral
+    /// live-state (NOT in the durable `PeerJoined` event) — a coordinator
+    /// restart drops un-acked commands, which is correct: the super-admin
+    /// re-issues, and a stale reboot must never survive a restart.
+    pub pending_commands: Vec<crate::roster::coordinator::command_queue::NodeCommandDto>,
 }
 
 impl PeerEntry {

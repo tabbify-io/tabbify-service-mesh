@@ -73,6 +73,10 @@ impl Coordinator {
             // durable `PeerJoined` event: a freshly-joined (or restored) peer
             // starts with none and populates them on its first heartbeat.
             paths: std::collections::HashMap::new(),
+            // Track C: signed-command relay queue, also ephemeral live-state —
+            // a freshly-joined (or restored) peer starts with an empty queue;
+            // the super-admin re-issues after a coordinator restart.
+            pending_commands: Vec::new(),
         };
         self.inner.roster.insert(peer_id, entry.clone());
         self.inner
