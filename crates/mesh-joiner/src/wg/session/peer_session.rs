@@ -243,6 +243,14 @@ impl PeerSession {
             && now_micros - self.last_direct_rx_micros.load(Ordering::Relaxed) > ttl_micros
         {
             self.direct_confirmed.store(false, Ordering::Relaxed);
+            // Anti-oscillation: a path that confirmed then went silent is now
+            // suspect. Count the downgrade as a handshake failure so the next
+            // `send_wire` does NOT immediately re-probe and re-flap — the
+            // candidate must serve out a back-off window first. A path that is
+            // genuinely back (return frames resume) clears this on the next
+            // valid `note_direct_rx`. Only the ACTUAL confirmed→relay
+            // transition penalises; a no-op downgrade leaves the count alone.
+            self.note_handshake_failure(now_micros);
         }
     }
 
@@ -514,6 +522,43 @@ mod tests {
             last_window, DIRECT_BACKOFF_CAP_MICROS,
             "after enough failures the window saturates exactly at the cap"
         );
+    }
+
+    /// A-c anti-oscillation: when a confirmed path is downgraded for staleness,
+    /// it must enter the back-off so the next send does NOT immediately
+    /// re-probe and re-flap. A downgrade therefore opens a suppression window.
+    #[test]
+    fn stale_downgrade_opens_backoff_to_stop_oscillation() {
+        let s = bare_session();
+        s.confirm_direct(0);
+        // Path goes silent past the TTL → downgrade.
+        s.downgrade_direct_if_stale(DIRECT_PATH_TTL_MICROS + 1, DIRECT_PATH_TTL_MICROS);
+        assert!(!s.direct_confirmed(), "stale path downgrades to relay");
+        assert!(
+            s.direct_suppressed(DIRECT_PATH_TTL_MICROS + 1),
+            "a downgrade must open a back-off window (anti-oscillation)"
+        );
+        assert!(
+            s.failed_handshake_count() >= 1,
+            "a downgrade counts as a handshake failure for the back-off curve"
+        );
+    }
+
+    /// A downgrade that does NOTHING (path not stale / not confirmed) must NOT
+    /// open a back-off — only an actual confirmed→relay transition penalises.
+    #[test]
+    fn noop_downgrade_does_not_open_backoff() {
+        let s = bare_session();
+        // Not confirmed → downgrade is a no-op → no penalty.
+        s.downgrade_direct_if_stale(1_000_000, DIRECT_PATH_TTL_MICROS);
+        assert!(!s.direct_suppressed(1_000_000));
+        assert_eq!(s.failed_handshake_count(), 0);
+
+        // Confirmed + fresh → within TTL → no-op → no penalty.
+        s.confirm_direct(1_000_000);
+        s.downgrade_direct_if_stale(1_000_000 + 1, DIRECT_PATH_TTL_MICROS);
+        assert!(s.direct_confirmed());
+        assert_eq!(s.failed_handshake_count(), 0, "a no-op downgrade must not penalise");
     }
 
     /// A keepalive refresh (`note_direct_rx`) keeps a confirmed-but-idle
