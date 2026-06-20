@@ -24,7 +24,7 @@ use rand_core::{OsRng, RngCore};
 use std::collections::HashSet;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -502,6 +502,9 @@ impl SessionTable {
             direct_confirmed: AtomicBool::new(false),
             last_direct_rx_micros: AtomicI64::new(0),
             last_probe_micros: AtomicI64::new(0),
+            // A freshly-upserted peer starts un-penalised (A-c hysteresis).
+            failed_handshake_count: AtomicU32::new(0),
+            direct_suppressed_until: AtomicI64::new(0),
             tunn: Mutex::new(tunn),
         });
         // Re-apply any app-ULAs this peer already hosts onto the FRESH

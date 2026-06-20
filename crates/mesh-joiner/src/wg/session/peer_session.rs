@@ -9,7 +9,7 @@ use crate::peer::PeerInfo;
 use boringtun::noise::Tunn;
 use std::collections::HashSet;
 use std::net::{Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use tokio::sync::Mutex;
 
 /// How long a confirmed-direct path may go without a VALID inbound UDP
@@ -22,6 +22,23 @@ use tokio::sync::Mutex;
 /// change) no keepalives arrive, the timestamp ages past this TTL, and the
 /// next `downgrade_direct_if_stale` falls the session back to the relay.
 pub const DIRECT_PATH_TTL_MICROS: i64 = 35_000_000;
+
+/// Base back-off window after the FIRST failed direct handshake (A-c).
+///
+/// Each consecutive failure roughly doubles the window (capped at
+/// `DIRECT_BACKOFF_CAP_MICROS`), so a black-hole candidate is re-probed
+/// exponentially less often instead of every probe interval forever. 2 s is a
+/// few WG retransmit cycles — enough that a transient stall recovers without a
+/// long penalty, short enough to retry a flapping path soon.
+pub const DIRECT_BACKOFF_BASE_MICROS: i64 = 2_000_000;
+
+/// Cap on the exponential direct-handshake back-off (A-c).
+///
+/// A permanently unreachable candidate (symmetric NAT / black hole) is
+/// re-probed at most once per cap interval — the durable replacement for the
+/// `relay_only` sledgehammer. 5 min keeps the SPOF-relief probe rare while
+/// still periodically re-checking in case the NAT mapping changes.
+pub const DIRECT_BACKOFF_CAP_MICROS: i64 = 300_000_000;
 
 /// One peer's encryption state + routing metadata.
 pub struct PeerSession {
@@ -77,6 +94,20 @@ pub struct PeerSession {
     /// while still letting one probe win the race on a genuinely reachable
     /// path. `0` = never probed, so the first send probes immediately.
     pub last_probe_micros: AtomicI64,
+    /// Count of consecutive FAILED direct handshakes to this peer's candidate
+    /// endpoint (A-c hysteresis). Drives the exponential back-off window in
+    /// `direct_suppressed_until`. Reset to 0 on ANY valid inbound datagram
+    /// (`note_direct_rx`) — a live candidate is never penalised. A relaxed
+    /// counter is fine: an off-by-one in a racing double-increment only
+    /// nudges the back-off by one step.
+    pub failed_handshake_count: AtomicU32,
+    /// Unix-micros until which the unconfirmed direct PROBE is SUPPRESSED for
+    /// this peer (A-c hysteresis). Set by `note_handshake_failure` to
+    /// `now + min(BASE << (failures-1), CAP)`. `0` = never failed → not
+    /// suppressed. The probe gate in `send_wire` skips probing while
+    /// `now < direct_suppressed_until`, converting the 1/s forever-probe into
+    /// bounded, exponentially-spaced attempts. Cleared on a valid inbound rx.
+    pub direct_suppressed_until: AtomicI64,
     /// Boringtun session state. Wrapped in a tokio Mutex so async
     /// send + receive halves can serialise access without holding a
     /// guard across socket I/O.
@@ -120,6 +151,9 @@ impl PeerSession {
     pub fn note_direct_rx(&self, now_micros: i64) {
         self.last_direct_rx_micros
             .store(now_micros, Ordering::Relaxed);
+        // A valid inbound datagram proves this candidate is alive → drop any
+        // accumulated handshake-failure penalty so it is probed freely again.
+        self.clear_handshake_backoff();
     }
 
     /// THE upgrade signal: a decrypted DATA packet arrived over UDP,
@@ -147,6 +181,57 @@ impl PeerSession {
         } else {
             false
         }
+    }
+
+    /// Snapshot the consecutive failed-handshake count (diagnostics + tests).
+    #[must_use]
+    pub fn failed_handshake_count(&self) -> u32 {
+        self.failed_handshake_count.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot the suppression deadline (diagnostics + tests).
+    #[must_use]
+    pub fn direct_suppressed_until_micros(&self) -> i64 {
+        self.direct_suppressed_until.load(Ordering::Relaxed)
+    }
+
+    /// `true` iff the unconfirmed direct probe is currently SUPPRESSED for this
+    /// peer — i.e. `now_micros` is before the back-off deadline a prior
+    /// failure set. The probe gate consults this so a black-hole candidate is
+    /// re-probed only on the exponential schedule, not every interval.
+    #[must_use]
+    pub fn direct_suppressed(&self, now_micros: i64) -> bool {
+        now_micros < self.direct_suppressed_until.load(Ordering::Relaxed)
+    }
+
+    /// Record one FAILED direct handshake: bump the consecutive-failure count
+    /// and open an exponential-capped back-off window. The window is
+    /// `min(BASE << (failures-1), CAP)` so the first failure backs off `BASE`,
+    /// the second `2·BASE`, … saturating at `CAP`. A relaxed load/store pair is
+    /// fine — a racing double-call at worst advances the schedule one step.
+    pub fn note_handshake_failure(&self, now_micros: i64) {
+        let failures = self.failed_handshake_count.fetch_add(1, Ordering::Relaxed) + 1;
+        // Saturating shift: clamp the exponent so the `<<` can't overflow, then
+        // clamp the product to the cap. `failures - 1` is the step (1st failure
+        // ⇒ exponent 0 ⇒ BASE).
+        let exp = (failures - 1).min(30); // BASE << 30 already ≫ CAP
+        // `checked_shl` returns None on an out-of-range shift; we clamp `exp`
+        // to 30 (BASE << 30 ≈ 2^51, well within i64 and already ≫ CAP), so the
+        // shift never overflows and the `.min(CAP)` below caps the window.
+        let window = DIRECT_BACKOFF_BASE_MICROS
+            .checked_shl(exp)
+            .unwrap_or(DIRECT_BACKOFF_CAP_MICROS)
+            .min(DIRECT_BACKOFF_CAP_MICROS);
+        self.direct_suppressed_until
+            .store(now_micros.saturating_add(window), Ordering::Relaxed);
+    }
+
+    /// Clear the back-off: reset the failure count to 0 and lift any
+    /// suppression window. Called when the candidate proves itself alive (a
+    /// valid inbound datagram). Folded into `note_direct_rx` below.
+    pub fn clear_handshake_backoff(&self) {
+        self.failed_handshake_count.store(0, Ordering::Relaxed);
+        self.direct_suppressed_until.store(0, Ordering::Relaxed);
     }
 
     /// Downgrade a confirmed path back to the relay floor if it has gone
@@ -239,6 +324,14 @@ impl std::fmt::Debug for PeerSession {
                 "last_probe_micros",
                 &self.last_probe_micros.load(Ordering::Relaxed),
             )
+            .field(
+                "failed_handshake_count",
+                &self.failed_handshake_count.load(Ordering::Relaxed),
+            )
+            .field(
+                "direct_suppressed_until",
+                &self.direct_suppressed_until.load(Ordering::Relaxed),
+            )
             .field("tunn", &"<Tunn>")
             .finish()
     }
@@ -249,7 +342,7 @@ impl std::fmt::Debug for PeerSession {
 mod tests {
     use super::*;
     use boringtun::noise::Tunn;
-    use std::sync::atomic::{AtomicBool, AtomicI64};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32};
     use x25519_dalek::{PublicKey, StaticSecret};
 
     /// Build a bare `PeerSession` (no endpoint, empty allowed-set) for
@@ -264,6 +357,8 @@ mod tests {
             direct_confirmed: AtomicBool::new(false),
             last_direct_rx_micros: AtomicI64::new(0),
             last_probe_micros: AtomicI64::new(0),
+            failed_handshake_count: AtomicU32::new(0),
+            direct_suppressed_until: AtomicI64::new(0),
             tunn: Mutex::new(Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
@@ -360,6 +455,65 @@ mod tests {
         let (direct, age) = s.path_status(1_005);
         assert!(direct, "confirmed session must report direct");
         assert_eq!(age, 5, "age = now - last_direct_rx_micros");
+    }
+
+    /// A-c hysteresis: a fresh session is NOT suppressed and has a zero
+    /// failure count. After `note_handshake_failure` the count climbs and a
+    /// back-off window opens; `note_direct_rx` (any valid inbound) RESETS the
+    /// failure count + clears suppression (the candidate proved itself alive).
+    #[test]
+    fn handshake_backoff_climbs_and_resets_on_rx() {
+        let s = bare_session();
+        assert!(!s.direct_suppressed(1_000), "fresh session is not suppressed");
+        assert_eq!(s.failed_handshake_count(), 0);
+
+        // First failure at t=1_000 opens a back-off window of BASE micros.
+        s.note_handshake_failure(1_000);
+        assert_eq!(s.failed_handshake_count(), 1);
+        assert!(
+            s.direct_suppressed(1_000),
+            "immediately after a failure the candidate is suppressed"
+        );
+        assert!(
+            !s.direct_suppressed(1_000 + DIRECT_BACKOFF_BASE_MICROS),
+            "suppression lifts once the back-off window elapses"
+        );
+
+        // A valid inbound datagram resets the counter and clears suppression —
+        // the candidate is alive again, so we stop penalising it.
+        s.note_direct_rx(2_000);
+        assert_eq!(s.failed_handshake_count(), 0, "rx resets the failure count");
+        assert!(!s.direct_suppressed(2_000), "rx clears the suppression window");
+    }
+
+    /// The back-off is EXPONENTIAL and CAPPED: each consecutive failure roughly
+    /// doubles the window (base, 2·base, 4·base, …) until it saturates at
+    /// `DIRECT_BACKOFF_CAP_MICROS`, so a permanent black-hole candidate is
+    /// probed at most once per cap interval — never the old 1/s forever.
+    #[test]
+    fn handshake_backoff_is_exponential_and_capped() {
+        let s = bare_session();
+        // Drive many failures; the window must never exceed the cap.
+        let mut last_window = 0i64;
+        for n in 1..=20 {
+            let t = i64::from(n) * 1_000_000;
+            s.note_handshake_failure(t);
+            // The window currently in force = direct_suppressed_until - t.
+            let window = s.direct_suppressed_until_micros() - t;
+            assert!(
+                window <= DIRECT_BACKOFF_CAP_MICROS,
+                "back-off window {window} must never exceed the cap {DIRECT_BACKOFF_CAP_MICROS}"
+            );
+            // Monotonic non-decreasing until the cap.
+            if last_window < DIRECT_BACKOFF_CAP_MICROS {
+                assert!(window >= last_window, "back-off must not shrink before the cap");
+            }
+            last_window = window;
+        }
+        assert_eq!(
+            last_window, DIRECT_BACKOFF_CAP_MICROS,
+            "after enough failures the window saturates exactly at the cap"
+        );
     }
 
     /// A keepalive refresh (`note_direct_rx`) keeps a confirmed-but-idle

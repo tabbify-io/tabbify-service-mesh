@@ -717,6 +717,8 @@ mod tests {
             direct_confirmed: std::sync::atomic::AtomicBool::new(false),
             last_direct_rx_micros: std::sync::atomic::AtomicI64::new(0),
             last_probe_micros: std::sync::atomic::AtomicI64::new(0),
+            failed_handshake_count: std::sync::atomic::AtomicU32::new(0),
+            direct_suppressed_until: std::sync::atomic::AtomicI64::new(0),
             tunn: tokio::sync::Mutex::new(boringtun::noise::Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
