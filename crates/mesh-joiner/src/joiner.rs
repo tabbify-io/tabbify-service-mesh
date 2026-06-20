@@ -127,8 +127,37 @@ impl Joiner {
     /// Surfaces `anyhow::Result` because the failure surface is broad —
     /// HTTP, TUN setup, UDP bind, and sudo all share this path. The
     /// underlying error is a [`JoinerError`] variant in every case.
-    #[allow(clippy::too_many_lines)]
+    /// Register + spawn the background tasks WITHOUT remote-command support.
+    ///
+    /// A thin delegate to [`Self::join_with_commands`] with no super-admin
+    /// pubkey + a no-op sink: the heartbeat task's command gate is fail-closed
+    /// (every signed command rejected), so a host that does not opt into Track-C
+    /// remote restart simply never acts. Keeps `JoinConfig` a plain data struct
+    /// (the sink is a SEPARATE argument, not a config field).
     pub async fn join(config: JoinConfig) -> anyhow::Result<Self> {
+        Self::join_with_commands(config, None, None, None).await
+    }
+
+    /// Like [`Self::join`] but wires Track-C signed remote commands.
+    ///
+    /// * `super_admin_pubkey` — the super-admin Ed25519 pubkey (32 raw bytes)
+    ///   the node verifies every command against end-to-end. `None` ⇒ remote
+    ///   commands disabled (fail-closed; every command rejected at the gate).
+    /// * `command_nonce_path` — path for the persisted executed-nonce
+    ///   replay-guard sidecar. `None` ⇒ derived from the identity dir
+    ///   ([`default_command_nonce_path`]).
+    /// * `command_sink` — host-side process-effects sink
+    ///   (`RestartJoiner` / `RebootHost`). `None` ⇒ a [`NoopCommandSink`].
+    ///
+    /// The sink is a SEPARATE argument (not a `JoinConfig` field) so `JoinConfig`
+    /// stays a plain `Clone`/`Debug` data struct.
+    #[allow(clippy::too_many_lines)]
+    pub async fn join_with_commands(
+        config: JoinConfig,
+        super_admin_pubkey: Option<[u8; 32]>,
+        command_nonce_path: Option<std::path::PathBuf>,
+        command_sink: Option<Arc<dyn crate::coordinator::command_exec::CommandSink>>,
+    ) -> anyhow::Result<Self> {
         let (keypair, sticky_ula, effective_requested_ula) = resolve_identity(&config)?;
 
         // 1) Open the UDP socket. We bind to v4 wildcard because the
@@ -268,18 +297,17 @@ impl Joiner {
         let hosted_app_ulas: Arc<dashmap::DashMap<Ipv6Addr, ()>> = Arc::default();
         let shared_peer_id: SharedPeerId = Arc::new(tokio::sync::RwLock::new(peer_id));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        // Track C: build the signed-command gate + sink. `Joiner::join`
-        // (this plain entry point) wires a FAIL-CLOSED gate (no super-admin
-        // pubkey → every command rejected) + a no-op sink, so a host that does
-        // not opt into remote commands never acts. A host that wants remote
-        // restart calls `Joiner::join_with_commands` with the real pubkey +
-        // sink (Track C C9 / supervisor wiring).
-        let command_gate = crate::coordinator::command_gate::CommandGate::new(
-            None,
-            &default_command_nonce_path(&config),
-        );
-        let command_sink: Arc<dyn crate::coordinator::command_exec::CommandSink> =
-            Arc::new(crate::coordinator::command_exec::NoopCommandSink);
+        // Track C: build the signed-command gate + sink from the caller's
+        // overrides. A `None` pubkey → a FAIL-CLOSED gate (every command
+        // rejected); a `None` sink → a no-op sink — so a host that does not opt
+        // into remote commands never acts. The supervisor passes the real
+        // super-admin pubkey + a process-restart sink (Track C C9).
+        let nonce_path =
+            command_nonce_path.unwrap_or_else(|| default_command_nonce_path(&config));
+        let command_gate =
+            crate::coordinator::command_gate::CommandGate::new(super_admin_pubkey, &nonce_path);
+        let command_sink: Arc<dyn crate::coordinator::command_exec::CommandSink> = command_sink
+            .unwrap_or_else(|| Arc::new(crate::coordinator::command_exec::NoopCommandSink));
         let mut tasks = spawn_background_tasks(SpawnContext {
             socket: socket.clone(),
             sessions: sessions.clone(),
