@@ -9,5 +9,6 @@
 //! * [`peer_sync`] — SSE consumer for `/v1/mesh/peers/stream`.
 
 pub mod client;
+pub mod command;
 pub mod heartbeat;
 pub mod peer_sync;

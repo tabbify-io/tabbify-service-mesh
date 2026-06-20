@@ -66,6 +66,15 @@ clap = { version = "4.6", features = ["derive", "env"] }
 # Encoding
 base64 = "0.22"
 
+# Ed25519 end-to-end command signing (Track C remote-restart). `rand_core`
+# is already pinned above for keypair gen; we only need verify on the joiner
+# and (test-only) sign. musl-clean: dalek is pure-rust, no openssl. ed25519-dalek
+# 2 pins the SAME x25519-dalek-2 / curve25519-dalek line boringtun already uses,
+# so there is no second dalek version in the lock.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2          = "0.10"
+hex           = "0.4"
+
 # OpenAPI 3 + Swagger UI. Pinned to versions compatible with axum 0.7
 # (utoipa-swagger-ui 9.x requires axum 0.8). `axum_extras` enables
 # IntoResponses for axum, `uuid` adds a schema for `uuid::Uuid`.
