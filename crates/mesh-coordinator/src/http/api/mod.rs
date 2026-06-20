@@ -30,6 +30,7 @@ pub(crate) use handlers::{
 };
 pub(crate) use stream::stream_handler;
 
+use crate::http::command_api::{CommandApiState, get_commands_handler, post_command_handler};
 use crate::http::policy_api::{PolicyApiState, get_policy_handler, put_policy_handler};
 use crate::roster::coordinator::Coordinator;
 use axum::{
@@ -60,6 +61,11 @@ pub fn build_router(coordinator: Coordinator) -> Router {
 /// different axum state types, so they are built as two sub-routers and
 /// merged.
 pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<String>) -> Router {
+    // Clone the inputs for the command sub-router before they are moved into
+    // the peer/policy states below (Track C signed remote-restart).
+    let command_state_coord = coordinator.clone();
+    let command_state_token = admin_token.clone();
+
     let peer_routes = Router::new()
         .route("/v1/mesh/register", post(register_handler))
         .route("/v1/mesh/heartbeat", post(heartbeat_handler))
@@ -81,8 +87,23 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
         )
         .with_state(policy_state);
 
+    // Track C signed remote-restart: admin-gated per-peer command queue.
+    // Same fail-closed `MESH_ADMIN_TOKEN` gate as the policy API; carried in
+    // its own state type, so it is a third sub-router merged below.
+    let command_state = CommandApiState {
+        coordinator: command_state_coord,
+        admin_token: command_state_token,
+    };
+    let command_routes = Router::new()
+        .route(
+            "/v1/mesh/peers/:peer_id/commands",
+            post(post_command_handler).get(get_commands_handler),
+        )
+        .with_state(command_state);
+
     peer_routes
         .merge(policy_routes)
+        .merge(command_routes)
         // Swagger UI at `/swagger-ui` + the raw spec at `/openapi.json`.
         // Unauthenticated, so operators can browse the contract before
         // they hold a join token / admin token.

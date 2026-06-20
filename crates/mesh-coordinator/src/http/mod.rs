@@ -6,6 +6,7 @@
 //! live under `/v1/mesh/...`; the ACL admin endpoints under `/v1/policy`.
 
 pub mod api;
+pub mod command_api;
 pub mod mtls;
 pub mod policy_api;
 pub(crate) mod relay;
