@@ -194,32 +194,56 @@ impl Coordinator {
         }
     }
 
-    /// Build a punch candidate from a roster entry. A peer is eligible once
-    /// it has heartbeated (we've seen its public source -> non-empty
-    /// `observed_external`) AND has a dialable endpoint (`listen_endpoint`).
-    /// The punch TARGET is that reflexive `WireGuard` endpoint (`ip:wg_port`),
-    /// NOT the raw heartbeat TCP source — a punch fired at the TCP source
-    /// would miss the `WireGuard` UDP NAT mapping entirely.
+    /// Build a punch candidate for `e` IN THE CONTEXT of a specific peer pair.
     ///
-    /// A **relay-only** peer is NEVER a punch candidate (returns `None`),
-    /// regardless of any endpoint. Because `try_emit_holepunch_pairs` builds
-    /// each pair from `punch_peer(a)` AND `punch_peer(b)`, returning `None`
-    /// here for either end suppresses the whole pair — so a punch is never
-    /// emitted when EITHER peer is relay-only. A punch is pointless when one
-    /// end has no reachable direct path; firing handshake-inits at its
-    /// black-hole endpoint in parallel with the relay is exactly the
-    /// simultaneous-init thrash this fix eliminates. The pair must relay, and
-    /// with no punch directive the handshake stays single-sided and completes.
-    /// (A relay-only peer also has `listen_endpoint == None` via the reflexive
-    /// resolver, so the dial-endpoint check below would skip it too — this
-    /// explicit guard makes the intent unconditional and self-documenting.)
-    fn punch_peer(e: &PeerEntry) -> Option<PunchPeer> {
-        if e.relay_only {
-            return None;
-        }
+    /// A peer is normally eligible once it has heartbeated (non-empty
+    /// `observed_external`) AND has a dialable `listen_endpoint`. The punch
+    /// TARGET is that reflexive `WireGuard` endpoint (`ip:wg_port`), NOT the raw
+    /// heartbeat TCP source — a punch fired at the TCP source would miss the
+    /// `WireGuard` UDP NAT mapping entirely.
+    ///
+    /// A **relay-only** peer is NEVER a punch candidate (returns `None`) for an
+    /// UNFLAGGED pair: `try_emit_holepunch_pairs` builds each pair from
+    /// `punch_peer_for_pair(a, b)` AND `punch_peer_for_pair(b, a)`, so returning
+    /// `None` for either end suppresses the whole pair — preserving the
+    /// 2026-06-07 contract (no punch when EITHER peer is relay-only, so neither
+    /// side double-inits a handshake at a black-hole endpoint).
+    ///
+    /// Track A-a is the ONE deliberate relaxation: when the `(e, other)` pair is
+    /// explicitly flagged `direct`, a `relay_only` peer is NOT skipped — instead
+    /// its reflexive endpoint is synthesized ON THE FLY from its observed
+    /// heartbeat source so the flagged punch has a dial target. The synthesized
+    /// endpoint is computed HERE and never stored on the entry, so an unflagged
+    /// peer's `listen_endpoint` invariant (`None` for `relay_only`) is untouched
+    /// — it never sees a black-hole endpoint. Only an explicitly-flagged pair
+    /// gets a direct dial target; every other pair stays on the relay floor.
+    fn punch_peer_for_pair(&self, e: &PeerEntry, other: Uuid) -> Option<PunchPeer> {
         if e.observed_external.is_empty() {
             return None;
         }
+        if e.relay_only {
+            // Relay-only is normally suppressed. Relax ONLY for a flagged pair.
+            if !self.inner.direct_pair_flags.is_direct(e.peer_id, other) {
+                return None;
+            }
+            // Synthesize the reflexive endpoint from the observed source +
+            // reported WG port for THIS punch only — never stored on the entry.
+            let observed: SocketAddr = e.observed_external.parse().ok()?;
+            // Reuse the joiner-reported WG port if the reflexive listen_endpoint
+            // carried one; fall back to the well-known WG port when absent.
+            let port = e
+                .listen_endpoint
+                .as_deref()
+                .and_then(|s| s.rsplit(':').next())
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(51820);
+            let dial = crate::nat::reflexive::reflexive_endpoint(observed.ip(), port);
+            return Some(PunchPeer {
+                peer_id: e.peer_id,
+                dial_endpoint: dial,
+            });
+        }
+        // Non-relay-only: the standard reflexive listen_endpoint.
         let dial = e.listen_endpoint.clone().filter(|s| !s.is_empty())?;
         Some(PunchPeer {
             peer_id: e.peer_id,
@@ -231,31 +255,32 @@ impl Coordinator {
     /// pair for every other dialable peer that hasn't yet been paired.
     /// Best-effort — publish failures are swallowed via `publish_event`.
     async fn try_emit_holepunch_pairs(&self, just_heartbeated: &PeerEntry) {
-        let Some(a) = Self::punch_peer(just_heartbeated) else {
-            return;
-        };
-        // Collect candidates before await to avoid holding the DashMap
-        // shard locks across .await points.
-        let candidates: Vec<PunchPeer> = self
+        let a_id = just_heartbeated.peer_id;
+        // Snapshot candidate entries before await (no DashMap guard held).
+        let candidates: Vec<PeerEntry> = self
             .inner
             .roster
             .iter()
-            .filter_map(|kv| {
-                let e = kv.value();
-                if e.peer_id == a.peer_id {
-                    return None;
-                }
-                Self::punch_peer(e)
-            })
+            .filter(|kv| kv.value().peer_id != a_id)
+            .map(|kv| kv.value().clone())
             .collect();
         let now = now_unix_micros();
         for b in candidates {
+            // Pair-aware builder: a flagged direct pair relaxes the relay_only
+            // suppression for THIS pair only; every unflagged pair stays
+            // suppressed (returns None for the relay_only end exactly as before).
+            let (Some(pa), Some(pb)) = (
+                self.punch_peer_for_pair(just_heartbeated, b.peer_id),
+                self.punch_peer_for_pair(&b, a_id),
+            ) else {
+                continue;
+            };
             try_emit_pair(
                 self.inner.publisher.as_ref(),
                 &self.inner.broadcaster,
                 &self.inner.punch_tracker,
-                &a,
-                &b,
+                &pa,
+                &pb,
                 now,
             )
             .await;

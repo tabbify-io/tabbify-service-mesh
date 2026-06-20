@@ -912,6 +912,96 @@ async fn heartbeat_emits_holepunch_for_two_non_relay_only_peers() {
     );
 }
 
+/// Track A-a: with a pair explicitly flagged `direct`, the coordinator DOES
+/// emit a hole-punch pair EVEN THOUGH one peer is relay-only — the one
+/// deliberate, flagged relaxation of the 06-07 suppression. The flagged
+/// relay-only peer's reflexive endpoint is synthesized from its observed
+/// heartbeat source so the punch has a target. Unflagged relay-only pairs
+/// remain fully suppressed (the existing test still passes).
+#[tokio::test]
+async fn flagged_direct_pair_emits_holepunch_despite_relay_only() {
+    let pub_ = StdArc::new(CapturingPublisher::new());
+    let c = coordinator_with(pub_.clone());
+    // Two peers: alice public, bob relay-only behind NAT (the MSI shape).
+    let (alice, _) = c.register(req(86, "alice")).await.expect("a");
+    let (bob, _) = c.register(req(87, "bob")).await.expect("b");
+    {
+        // Mark bob relay-only after register; the reflexive resolver drops its
+        // listen_endpoint, so the only dial target is the synthesized one.
+        let mut e = c.inner.roster.get_mut(&bob.peer_id).expect("bob entry");
+        e.relay_only = true;
+    }
+
+    // Both heartbeat with a public observed source (so a reflexive endpoint
+    // CAN be synthesized for the flagged pair).
+    c.heartbeat(
+        alice.peer_id,
+        "203.0.113.86:11111".into(),
+        Some(51820),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("alice hb");
+    c.heartbeat(
+        bob.peer_id,
+        "198.51.100.87:22222".into(),
+        Some(51820),
+        vec![],
+        None,
+        None,
+        true, // relay_only stays true
+    )
+    .await
+    .expect("bob hb");
+
+    // Baseline: WITHOUT the flag, no punch fires for the relay_only pair.
+    assert_eq!(
+        c.punch_tracker().len(),
+        0,
+        "relay_only pair must be suppressed until explicitly flagged direct"
+    );
+
+    // Flip the per-pair flag direct, then heartbeat again.
+    c.direct_pair_flags().set_direct(alice.peer_id, bob.peer_id, true);
+    c.heartbeat(
+        bob.peer_id,
+        "198.51.100.87:22222".into(),
+        Some(51820),
+        vec![],
+        None,
+        None,
+        true,
+    )
+    .await
+    .expect("bob hb #2");
+
+    assert_eq!(
+        c.punch_tracker().len(),
+        1,
+        "a flagged direct pair MUST emit a hole-punch even with a relay_only peer"
+    );
+    // And the punch target for the flagged relay-only peer is its SYNTHESIZED
+    // reflexive endpoint (observed-ip:wg-port), proving the on-the-fly dial
+    // target was built rather than read from a (None) listen_endpoint.
+    let events: Vec<HolePunchInitiate> = pub_
+        .events()
+        .into_iter()
+        .filter(|(t, _, _)| t == "holepunch_initiate")
+        .map(|(_, _, bytes)| serde_json::from_slice::<HolePunchInitiate>(&bytes).expect("decode"))
+        .collect();
+    let to_bob = events
+        .iter()
+        .find(|e| e.target_peer_id == bob.peer_id.to_string())
+        .expect("a punch targeting bob");
+    assert_eq!(
+        to_bob.target_external_endpoint, "198.51.100.87:51820",
+        "flagged relay-only peer's punch target is its synthesized reflexive endpoint"
+    );
+}
+
 /// A relay-only peer registered through the full `register_authenticated`
 /// path (with a public observed source) gets `listen_endpoint = None` — the
 /// coordinator advertises NO direct dial target for it. Verifies the
