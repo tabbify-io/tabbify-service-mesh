@@ -467,3 +467,92 @@ async fn http_peers_stamps_connectivity_from_vantage() {
         .expect("M present");
     assert_eq!(m["connectivity"].as_str(), Some("relay"));
 }
+
+/// Register a peer and return its coordinator-assigned `peer_id`.
+async fn register_peer(client: &reqwest::Client, base: &str, seed: u8, name: &str) -> String {
+    let body = json_body(
+        post_json(
+            client,
+            &format!("{base}/v1/mesh/register"),
+            serde_json::json!({ "wg_public_key": pubkey(seed), "display_name": name, "tags": [] }),
+        )
+        .await,
+    )
+    .await;
+    body["peer_id"].as_str().expect("peer_id").to_owned()
+}
+
+/// POST a heartbeat for `peer_id` carrying the given `peer_paths` array.
+async fn heartbeat_with_paths(
+    client: &reqwest::Client,
+    base: &str,
+    peer_id: &str,
+    peer_paths: Value,
+) {
+    let resp = post_json(
+        client,
+        &format!("{base}/v1/mesh/heartbeat"),
+        serde_json::json!({ "peer_id": peer_id, "peer_paths": peer_paths }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "heartbeat must succeed");
+}
+
+/// GET the roster (optionally with `?vantage`) and return the `peers` array.
+async fn get_roster(client: &reqwest::Client, base: &str, vantage: Option<&str>) -> Vec<Value> {
+    let url = vantage.map_or_else(
+        || format!("{base}/v1/mesh/peers"),
+        |v| format!("{base}/v1/mesh/peers?vantage={v}"),
+    );
+    let body = json_body(client.get(&url).send().await.expect("get peers")).await;
+    body["peers"].as_array().cloned().unwrap_or_default()
+}
+
+/// The `connectivity` string a roster entry carries for `peer_id`, if any.
+fn connectivity_of(peers: &[Value], peer_id: &str) -> Option<String> {
+    peers
+        .iter()
+        .find(|p| p["peer_id"].as_str() == Some(peer_id))
+        .and_then(|p| p.get("connectivity"))
+        .and_then(|c| c.as_str())
+        .map(str::to_owned)
+}
+
+/// AUDIT (Track V regression net): the live roster GET must stamp
+/// `connectivity` two ways and NEVER stamp it for a peer that reported no
+/// edges. Default (no `?vantage`) = per-machine self-view; `?vantage=<id>` =
+/// that vantage's edge. A no-edge peer stays `connectivity: null`.
+#[tokio::test]
+async fn roster_get_stamps_connectivity_self_view_and_vantage() {
+    let (addr, _server) = spawn_server().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let reporter = register_peer(&client, &base, 1, "reporter").await;
+    let target = register_peer(&client, &base, 2, "target").await;
+    let lonely = register_peer(&client, &base, 3, "lonely").await;
+
+    // reporter reports a DIRECT path to target.
+    heartbeat_with_paths(
+        &client,
+        &base,
+        &reporter,
+        serde_json::json!([
+            { "peer_id": target, "direct": true, "last_rx_age_ms": 9 }
+        ]),
+    )
+    .await;
+
+    // Default roster: self-view. reporter holds a direct edge → "direct";
+    // target/lonely reported nothing → null.
+    let peers = get_roster(&client, &base, None).await;
+    assert_eq!(connectivity_of(&peers, &reporter).as_deref(), Some("direct"));
+    assert_eq!(connectivity_of(&peers, &target), None, "no self-edges → null");
+    assert_eq!(connectivity_of(&peers, &lonely), None, "silent peer → null");
+
+    // `?vantage=reporter`: the path reporter sees TO each peer. To target it
+    // reported direct; to lonely it reported nothing → null.
+    let peers = get_roster(&client, &base, Some(&reporter)).await;
+    assert_eq!(connectivity_of(&peers, &target).as_deref(), Some("direct"));
+    assert_eq!(connectivity_of(&peers, &lonely), None);
+}
