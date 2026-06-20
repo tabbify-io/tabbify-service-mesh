@@ -33,6 +33,7 @@ mod tls;
 
 pub use decode::{decode_pubkey, remote_to_info};
 
+use crate::coordinator::command::NodeCommand;
 use crate::error::{JoinerError, Result};
 use crate::peer::RemotePeer;
 use base64::engine::{Engine as _, general_purpose::STANDARD as B64};
@@ -203,6 +204,12 @@ pub struct HeartbeatRequest {
     /// new coordinator never evicts a legacy peer for a missing field.
     #[serde(default = "default_dataplane_healthy")]
     pub dataplane_healthy: bool,
+    /// Track C: command ids this node executed since the last heartbeat. The
+    /// coordinator removes them from the pending queue (ack). Omitted when
+    /// empty for a tidy body; `#[serde(default)]` so an older coordinator
+    /// simply ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executed_command_ids: Vec<String>,
 }
 
 /// serde default for [`HeartbeatRequest::dataplane_healthy`]: `true`
@@ -226,6 +233,12 @@ pub struct HeartbeatResponse {
     /// older coordinator.
     #[serde(default)]
     pub observed_endpoint: Option<String>,
+    /// Track C remote-restart: signed commands the super-admin queued for this
+    /// node, drained on this heartbeat. Verified + executed in `tick_once`,
+    /// then acked via `executed_command_ids` next tick. `#[serde(default)]` →
+    /// empty from an older coordinator that omits the field.
+    #[serde(default)]
+    pub pending_commands: Vec<NodeCommand>,
 }
 
 /// Body of `POST /v1/mesh/deregister`.
@@ -425,6 +438,9 @@ impl CoordinatorClient {
     /// (connectivity visibility): for each session, is our data path to that
     /// peer direct or relay, and how stale. Empty when there are no sessions
     /// (omitted from the wire) — the coordinator then keeps no edges for us.
+    /// `executed_command_ids` are the Track-C command ids this node ran since
+    /// the previous heartbeat — the coordinator clears them from the pending
+    /// queue (ack). Empty (the common case) is omitted from the wire.
     #[allow(clippy::too_many_arguments)]
     pub async fn heartbeat(
         &self,
@@ -436,6 +452,7 @@ impl CoordinatorClient {
         relay_only: bool,
         peer_paths: Vec<PeerPath>,
         dataplane_healthy: bool,
+        executed_command_ids: &[String],
     ) -> Result<HeartbeatResponse> {
         let url = format!("{}/v1/mesh/heartbeat", self.base_url);
         let body = HeartbeatRequest {
@@ -447,6 +464,7 @@ impl CoordinatorClient {
             relay_only,
             peer_paths,
             dataplane_healthy,
+            executed_command_ids: executed_command_ids.to_vec(),
         };
         let resp = self
             .http

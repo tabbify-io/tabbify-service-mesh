@@ -277,6 +277,9 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
             reregister.relay_only,
             peer_paths,
             dataplane_healthy,
+            // Track C: executed-command acks. Wired to the real ack list in C7
+            // (the command-exec integration); empty until then.
+            &[],
         )
         .await
     {

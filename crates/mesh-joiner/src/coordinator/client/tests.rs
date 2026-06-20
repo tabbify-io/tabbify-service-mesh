@@ -84,6 +84,7 @@ fn relay_only_round_trips_and_defaults_false() {
         relay_only: true,
         peer_paths: vec![],
         dataplane_healthy: true,
+        executed_command_ids: vec![],
     };
     let hv = serde_json::to_value(&hb).unwrap();
     assert_eq!(hv["relay_only"], true);
@@ -113,6 +114,7 @@ fn heartbeat_dataplane_healthy_round_trips_and_defaults() {
         relay_only: true,
         peer_paths: vec![],
         dataplane_healthy: false,
+        executed_command_ids: vec![],
     };
     let json = serde_json::to_string(&hb).expect("serialize");
     let back: HeartbeatRequest = serde_json::from_str(&json).expect("round-trip");
@@ -602,10 +604,69 @@ async fn heartbeat_returns_roster_snapshot() {
         .await;
     let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
     let resp = client
-        .heartbeat(Uuid::nil(), Some(51820), &[], None, None, false, Vec::new(), true)
+        .heartbeat(
+            Uuid::nil(),
+            Some(51820),
+            &[],
+            None,
+            None,
+            false,
+            Vec::new(),
+            true,
+            &[],
+        )
         .await
         .unwrap();
     assert!(resp.peers.is_empty());
+}
+
+/// Track C: the heartbeat round-trip serializes `executed_command_ids` in the
+/// request and deserializes `pending_commands` (typed `NodeCommand`) from the
+/// response.
+#[tokio::test]
+async fn heartbeat_carries_acks_and_parses_pending_commands() {
+    use crate::coordinator::command::CommandVerb;
+    use wiremock::matchers::body_partial_json;
+    let server = MockServer::start().await;
+    // Response carries one pending command.
+    Mock::given(method("POST"))
+        .and(path("/v1/mesh/heartbeat"))
+        .and(body_partial_json(serde_json::json!({
+            "executed_command_ids": ["done-1"]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "peers": [],
+            "pending_commands": [{
+                "command_id": "01910f10-0000-7000-8000-0000000000aa",
+                "verb": "restart_joiner",
+                "peer_id": "01910f10-0000-7000-8000-0000000000bb",
+                "nonce": "n1",
+                "issued_at": 1,
+                "expiry": 9_999_999_999_999i64,
+                "signature": "ab"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+    let resp = client
+        .heartbeat(
+            Uuid::nil(),
+            Some(51820),
+            &[],
+            None,
+            None,
+            false,
+            vec![],
+            true,
+            &["done-1".to_owned()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.pending_commands.len(), 1);
+    assert_eq!(resp.pending_commands[0].verb, CommandVerb::RestartJoiner);
+    drop(server);
 }
 
 /// Per-app-ULA routing: when the joiner hosts app-ULAs, the heartbeat
@@ -640,6 +701,7 @@ async fn heartbeat_sends_hosted_app_ulas() {
             false,
             Vec::new(),
             true,
+            &[],
         )
         .await
         .expect("heartbeat with hosted app-ULAs should match the body");
@@ -658,6 +720,7 @@ async fn heartbeat_omits_empty_hosted_app_ulas() {
         relay_only: false,
         peer_paths: vec![],
         dataplane_healthy: true,
+        executed_command_ids: vec![],
     })
     .unwrap();
     assert!(
