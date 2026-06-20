@@ -143,6 +143,10 @@ impl Coordinator {
             // the TTL reaper is only a backstop for peers that vanish without
             // a clean deregister) so the tracker doesn't accumulate dead pairs.
             self.inner.punch_tracker.remove_peer(peer_id);
+            // Drop this peer's direct-pair flags too (Track A-a) so a departed
+            // peer leaves no stale `direct` enable that a future identity reuse
+            // could inherit — the pair must re-flag explicitly.
+            self.inner.direct_pair_flags.remove_peer(peer_id);
         }
     }
 }

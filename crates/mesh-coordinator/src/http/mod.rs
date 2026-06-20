@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod command_api;
+pub mod direct_api;
 pub mod mtls;
 pub mod policy_api;
 pub(crate) mod relay;

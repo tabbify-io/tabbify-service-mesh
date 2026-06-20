@@ -31,6 +31,7 @@ pub(crate) use handlers::{
 pub(crate) use stream::stream_handler;
 
 use crate::http::command_api::{CommandApiState, get_commands_handler, post_command_handler};
+use crate::http::direct_api::{DirectApiState, post_direct_handler};
 use crate::http::policy_api::{PolicyApiState, get_policy_handler, put_policy_handler};
 use crate::roster::coordinator::Coordinator;
 use axum::{
@@ -65,6 +66,9 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
     // the peer/policy states below (Track C signed remote-restart).
     let command_state_coord = coordinator.clone();
     let command_state_token = admin_token.clone();
+    // Clone again for the Track A-a per-pair direct-flag sub-router.
+    let direct_state_coord = coordinator.clone();
+    let direct_state_token = admin_token.clone();
 
     let peer_routes = Router::new()
         .route("/v1/mesh/register", post(register_handler))
@@ -101,9 +105,24 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
         )
         .with_state(command_state);
 
+    // Track A-a per-pair direct flag: admin-gated, same fail-closed
+    // `MESH_ADMIN_TOKEN` gate. Its own state type → a fourth sub-router merged
+    // below. Defaults OFF; this is the only path that flips a pair direct.
+    let direct_state = DirectApiState {
+        coordinator: direct_state_coord,
+        admin_token: direct_state_token,
+    };
+    let direct_routes = Router::new()
+        .route(
+            "/v1/mesh/pairs/:a/:b/direct",
+            post(post_direct_handler),
+        )
+        .with_state(direct_state);
+
     peer_routes
         .merge(policy_routes)
         .merge(command_routes)
+        .merge(direct_routes)
         // Swagger UI at `/swagger-ui` + the raw spec at `/openapi.json`.
         // Unauthenticated, so operators can browse the contract before
         // they hold a join token / admin token.

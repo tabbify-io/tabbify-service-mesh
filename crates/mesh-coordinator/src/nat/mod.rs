@@ -11,5 +11,6 @@
 //!   to a cloud rollout with real NAT topology; this pins the protocol
 //!   shape now.
 
+pub mod direct_flags;
 pub mod holepunch;
 pub mod reflexive;

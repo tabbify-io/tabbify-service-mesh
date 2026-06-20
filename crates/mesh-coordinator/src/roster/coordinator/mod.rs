@@ -28,6 +28,7 @@ mod tests;
 use crate::auth::AuthValidator;
 use crate::http::api::{PeerInfo, TopologyEdge, TopologyMachine, TopologyResponse};
 use crate::http::sse::PeerBroadcaster;
+use crate::nat::direct_flags::DirectPairFlags;
 use crate::nat::holepunch::PunchTracker;
 use crate::policy::PolicyStore;
 use crate::publisher::SharedPublisher;
@@ -315,6 +316,13 @@ pub(crate) struct Inner {
     /// pairs have already had their `HolePunchInitiate` events emitted
     /// so a noisy heartbeat stream doesn't re-publish each tick.
     pub(crate) punch_tracker: PunchTracker,
+    /// Per-pair `direct` flags (Track A-a) — the instant on/off lever for
+    /// direct WG between an explicitly-flagged pair (incl. a `relay_only` /
+    /// NAT-ed peer like MSI). DEFAULTS OFF for every pair: an empty store means
+    /// every pair stays on the relay floor, and a coordinator restart drops the
+    /// whole store → every pair returns to relay (the SAFE direction — a restart
+    /// never silently leaves a pair direct). Set only via the admin-gated API.
+    pub(crate) direct_pair_flags: DirectPairFlags,
     /// Ephemeral pubkey → live relay WS connection (Stage-3 relay floor).
     pub(crate) relay: crate::relay::RelayRegistry,
     /// Durable roster snapshot sink. Persisted on every membership change
@@ -403,6 +411,7 @@ impl Coordinator {
                 validator,
                 heartbeat_timeout,
                 punch_tracker: PunchTracker::new(),
+                direct_pair_flags: DirectPairFlags::new(),
                 relay: crate::relay::RelayRegistry::new(),
                 roster_store,
             }),
@@ -480,6 +489,14 @@ impl Coordinator {
     #[must_use]
     pub fn punch_tracker(&self) -> &PunchTracker {
         &self.inner.punch_tracker
+    }
+
+    /// Borrow the per-pair direct-flag store (Track A-a). The admin API toggles
+    /// a pair direct through this; the heartbeat punch path reads it to relax
+    /// the `relay_only` suppression for a flagged pair only.
+    #[must_use]
+    pub fn direct_pair_flags(&self) -> &DirectPairFlags {
+        &self.inner.direct_pair_flags
     }
 
     /// Borrow the relay registry — the WS handler registers/forwards through it.
