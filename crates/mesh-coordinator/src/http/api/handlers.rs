@@ -169,6 +169,10 @@ pub async fn heartbeat_handler(
     // the heartbeat call below — they are stored separately (connectivity
     // visibility), not threaded through the heartbeat event.
     let peer_paths = req.peer_paths;
+    // Track K / black-hole pill (Track V): capture the reporter's self-reported
+    // data-plane health before `req` is consumed — stored separately and used to
+    // stamp the self-view `connectivity` as "dead" for a wedged peer.
+    let req_dataplane_healthy = req.dataplane_healthy;
     // Track C: capture the node's executed-command acks before `req` is moved.
     let executed = req.executed_command_ids;
     match coordinator
@@ -188,6 +192,9 @@ pub async fn heartbeat_handler(
             // only on a successful heartbeat (the entry exists), mirroring the
             // wholesale-replace the heartbeat does for hosted_app_ulas.
             coordinator.record_peer_paths(entry.peer_id, &peer_paths);
+            // Track K / black-hole pill: record the reporter's data-plane health
+            // so a wedged peer's self-view connectivity stamps "dead".
+            coordinator.record_dataplane_health(entry.peer_id, req_dataplane_healthy);
             // Track C: ack any command the node reported executed, THEN drain
             // the remaining queue into this response. Ack-before-drain so a
             // command acked this tick is removed before we snapshot.

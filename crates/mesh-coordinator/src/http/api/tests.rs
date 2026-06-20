@@ -190,6 +190,24 @@ fn heartbeat_request_peer_paths_back_compat_and_present() {
     assert_eq!(modern.peer_paths[1].last_rx_age_ms, 0);
 }
 
+/// Track V / Track K black-hole pill: the heartbeat parses `dataplane_healthy`,
+/// and an older joiner that omits it defaults to `true` (fail-open — a node that
+/// can't report is assumed healthy, never a false black hole).
+#[test]
+fn heartbeat_request_parses_dataplane_healthy_back_compat() {
+    let legacy: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+        "peer_id": "01910f10-0000-7000-8000-000000000001",
+    }))
+    .expect("legacy heartbeat body must parse");
+    assert!(legacy.dataplane_healthy, "older joiner → assumed healthy");
+    let modern: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+        "peer_id": "01910f10-0000-7000-8000-000000000001",
+        "dataplane_healthy": false,
+    }))
+    .expect("modern heartbeat body parses");
+    assert!(!modern.dataplane_healthy);
+}
+
 /// A `PeerInfo` roster entry from an older coordinator omits `relay_only`;
 /// a consumer reads it back as `false` (visible + round-trips).
 #[test]
@@ -255,6 +273,7 @@ async fn call_heartbeat(
         mesh_version: None,
         relay_only: false,
         peer_paths: vec![],
+        dataplane_healthy: true,
         executed_command_ids: acked.to_vec(),
     };
     let resp = heartbeat_handler(State(coord.clone()), None, axum::Json(req)).await;
@@ -345,4 +364,21 @@ async fn topology_handler_returns_machines_and_edges() {
     assert_eq!(edges.len(), 1, "exactly one collapsed edge");
     assert_eq!(edges[0]["direct"], serde_json::json!(true), "A↔B is direct");
     assert_eq!(edges[0]["age_ms"], serde_json::json!(12));
+}
+
+/// Track V: a topology machine carries its self-view `connectivity` so the
+/// graph can paint a wedged (data-plane-dead) machine 🔴, in parity with the
+/// node list. A black-holed reporter is "dead".
+#[tokio::test]
+async fn topology_machine_carries_self_connectivity() {
+    let c = test_coordinator();
+    let (m, _) = c.register(machine_req(3, "wedged")).await.expect("reg");
+    c.record_dataplane_health(m.peer_id, false);
+    let topo = c.topology();
+    let machine = topo
+        .machines
+        .iter()
+        .find(|x| x.peer_id == m.peer_id.to_string())
+        .expect("machine present");
+    assert_eq!(machine.connectivity.as_deref(), Some("dead"));
 }

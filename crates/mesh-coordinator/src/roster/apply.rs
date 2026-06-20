@@ -73,6 +73,10 @@ impl Coordinator {
             // durable `PeerJoined` event: a freshly-joined (or restored) peer
             // starts with none and populates them on its first heartbeat.
             paths: std::collections::HashMap::new(),
+            // Track K / black-hole pill: a freshly-joined (or restored) peer is
+            // healthy until it reports otherwise — fail-open so a missing signal
+            // never paints a false "dead". Refreshed on every heartbeat.
+            dataplane_healthy: true,
             // Track C: signed-command relay queue, also ephemeral live-state —
             // a freshly-joined (or restored) peer starts with an empty queue;
             // the super-admin re-issues after a coordinator restart.

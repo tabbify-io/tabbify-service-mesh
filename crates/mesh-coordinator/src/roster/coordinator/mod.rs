@@ -138,6 +138,17 @@ pub struct PeerEntry {
     /// next heartbeat (correct — stale "direct" must never survive a
     /// restart). Empty for a freshly-joined or older (no-`peer_paths`) peer.
     pub paths: std::collections::HashMap<Uuid, (bool, u64)>,
+    /// This reporter's last self-reported WG data-plane health (Track K /
+    /// black-hole pill, Track V). `false` ⇒ the node is sending but receiving
+    /// zero decap frames (a wedged WG return path — the MSI incident); the
+    /// self-view connectivity stamps `"dead"`, overriding stale edges. Set on
+    /// every heartbeat from `HeartbeatRequest.dataplane_healthy`. Defaults to
+    /// `true` (fail-open: a freshly-joined or older peer that never reports is
+    /// assumed healthy — a missing signal must NEVER paint a false "dead").
+    /// Ephemeral live-state: NOT carried in the durable `PeerJoined` event, so a
+    /// coordinator restart starts each peer healthy until its next heartbeat
+    /// (correct — a stale "dead" must never survive a restart).
+    pub dataplane_healthy: bool,
     /// Per-peer signed-command relay queue (Track C remote-restart). The
     /// coordinator is a dumb relay — these are fully-signed
     /// [`NodeCommandDto`](crate::roster::coordinator::command_queue::NodeCommandDto)s
@@ -157,16 +168,24 @@ impl PeerEntry {
     /// [`Self::to_info_with_connectivity`] for a vantage-stamped view.
     #[must_use]
     pub fn to_info(&self) -> PeerInfo {
-        self.to_info_with_connectivity(None)
+        self.to_info_with_connectivity(None, None)
     }
 
     /// Like [`Self::to_info`] but stamps the live-path `connectivity` field
-    /// (connectivity visibility) from a requested vantage. The caller
-    /// resolves the vantage→this-peer edge (via [`Coordinator::edge`]) into
-    /// `Some("direct")` / `Some("relay")` / `None` (no vantage or no edge →
-    /// unknown) and passes it here.
+    /// (connectivity visibility) from a requested vantage, plus the
+    /// `connectivity_age_ms` freshness behind it (the admin pill's "last data
+    /// Ns ago" tooltip). The caller resolves the vantage→this-peer edge (via
+    /// [`Coordinator::edge`]) or the self-view (via
+    /// [`Coordinator::self_connectivity_aged`]) into `Some("direct")` /
+    /// `Some("relay")` / `Some("dead")` / `None` (no vantage or no edge →
+    /// unknown) + the matching age, and passes both here. The age is `None`
+    /// whenever `connectivity` is `None` or `"dead"`.
     #[must_use]
-    pub fn to_info_with_connectivity(&self, connectivity: Option<String>) -> PeerInfo {
+    pub fn to_info_with_connectivity(
+        &self,
+        connectivity: Option<String>,
+        connectivity_age_ms: Option<u64>,
+    ) -> PeerInfo {
         PeerInfo {
             peer_id: self.peer_id.to_string(),
             wg_public_key: base64::Engine::encode(
@@ -187,6 +206,7 @@ impl PeerEntry {
             mesh_version: self.mesh_version.clone(),
             relay_only: self.relay_only,
             connectivity,
+            connectivity_age_ms,
         }
     }
 
@@ -510,17 +530,21 @@ impl Coordinator {
         entries
             .iter()
             .map(|e| {
-                let connectivity = vantage.map_or_else(
-                    // Default → per-machine self-view from the peer's own paths.
-                    || self.self_connectivity(e.peer_id),
-                    // Explicit vantage → legacy single-vantage edge view.
-                    |v| {
-                        self.edge(v, e.peer_id).map(|(direct, _age)| {
-                            if direct { "direct" } else { "relay" }.to_owned()
-                        })
+                let (connectivity, age) = vantage.map_or_else(
+                    // Default → per-machine self-view from the peer's own paths,
+                    // carrying the freshest age behind the pill (Track V tooltip).
+                    || self.self_connectivity_aged(e.peer_id),
+                    // Explicit vantage → legacy single-vantage edge view (string
+                    // + that edge's age).
+                    |v| match self.edge(v, e.peer_id) {
+                        Some((direct, age)) => (
+                            Some(if direct { "direct" } else { "relay" }.to_owned()),
+                            Some(age),
+                        ),
+                        None => (None, None),
                     },
                 );
-                e.to_info_with_connectivity(connectivity)
+                e.to_info_with_connectivity(connectivity, age)
             })
             .collect()
     }
@@ -575,6 +599,19 @@ impl Coordinator {
         }
     }
 
+    /// Record `reporter`'s self-reported WG data-plane health from a heartbeat
+    /// (Track K / black-hole pill, Track V). `false` ⇒ the node is a black hole
+    /// (control heartbeat alive, WG decap-RX dead — the MSI incident); the
+    /// self-view connectivity then stamps `"dead"`, overriding any stale edges.
+    /// A no-op when `reporter` is not (or no longer) in the roster — a heartbeat
+    /// can race a deregister. Fail-open: a peer that never calls this stays
+    /// healthy (the default), so a missing signal never paints a false "dead".
+    pub fn record_dataplane_health(&self, reporter: Uuid, healthy: bool) {
+        if let Some(mut entry) = self.inner.roster.get_mut(&reporter) {
+            entry.dataplane_healthy = healthy;
+        }
+    }
+
     /// Read `vantage`'s reported live path to `target` (connectivity
     /// visibility): `Some((direct, last_rx_age_ms))` when the vantage peer
     /// reported an edge to that target on its last heartbeat, else `None`
@@ -614,6 +651,39 @@ impl Coordinator {
         }
         let any_direct = entry.paths.values().any(|(direct, _age)| *direct);
         Some(if any_direct { "direct" } else { "relay" }.to_owned())
+    }
+
+    /// Self-view connectivity AND the freshest age behind it (Track V tooltip):
+    /// `(Some("direct"|"relay"), Some(min_age_ms))` from the peer's own edges,
+    /// or `(None, None)` when it reported no edges. The age is the MINIMUM
+    /// `last_rx_age_ms` across the peer's edges — the freshest evidence the
+    /// path is live, which is the most honest number for the "last data Ns ago"
+    /// tooltip. This is the aged sibling of [`Self::self_connectivity`] (kept
+    /// for its existing callers); the default roster stamping uses this one so
+    /// the pill carries its age.
+    #[must_use]
+    pub fn self_connectivity_aged(&self, peer_id: Uuid) -> (Option<String>, Option<u64>) {
+        let Some(entry) = self.inner.roster.get(&peer_id) else {
+            return (None, None);
+        };
+        // Black-hole override (Track K / Track V): a node whose data plane is
+        // dead is "dead" regardless of its (now-stale) edges — the MSI incident
+        // (control heartbeat alive, WG decap-RX dead). The dead state carries no
+        // age (a wedged plane has no live edge to age). Fail-open:
+        // `dataplane_healthy` defaults `true`, so a peer that never reports its
+        // health (older joiner / just-joined) never false-paints "dead".
+        if !entry.dataplane_healthy {
+            return (Some("dead".to_owned()), None);
+        }
+        if entry.paths.is_empty() {
+            return (None, None);
+        }
+        let any_direct = entry.paths.values().any(|(direct, _age)| *direct);
+        let min_age = entry.paths.values().map(|(_direct, age)| *age).min();
+        (
+            Some(if any_direct { "direct" } else { "relay" }.to_owned()),
+            min_age,
+        )
     }
 
     /// Project the roster into the **machine graph** (`GET /v1/mesh/topology`).
@@ -659,6 +729,9 @@ impl Coordinator {
                 relay_only: e.relay_only,
                 software_version: e.software_version.clone(),
                 mesh_version: e.mesh_version.clone(),
+                // Self-view connectivity (Track V) so the graph can paint a
+                // wedged ("dead") machine — same default stamp as the node list.
+                connectivity: self.self_connectivity_aged(e.peer_id).0,
             })
             .collect();
 

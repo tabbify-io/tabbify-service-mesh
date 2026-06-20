@@ -90,10 +90,29 @@ pub struct PeerInfo {
     /// back-compatible (older coordinators omit it → `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connectivity: Option<String>,
+    /// Age in ms of the connectivity observation that produced
+    /// [`Self::connectivity`] — the value behind the admin pill's "last data
+    /// Ns ago" tooltip (2026-06-07 visibility design). For the self-view
+    /// default this is the FRESHEST (min) age across the peer's own reported
+    /// edges; for an explicit `?vantage` it is that single edge's age. `None`
+    /// when `connectivity` is `None` (no edge → nothing to age), and also for
+    /// the `"dead"` black-hole state (a wedged data plane has no live edge to
+    /// age). `#[serde(default, skip_serializing_if = ...)]` keeps the wire
+    /// back-compatible (older coordinators omit it → `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connectivity_age_ms: Option<u64>,
 }
 
 pub(super) fn default_kind() -> String {
     "peer".to_owned()
+}
+
+/// serde default for [`HeartbeatRequest::dataplane_healthy`]: `true`. Fail-open
+/// — an absent field means a legacy joiner that can't report, and it must be
+/// assumed healthy, never a black hole (so a new coordinator never paints a
+/// false "dead" pill for an older peer).
+pub(super) const fn default_dataplane_healthy() -> bool {
+    true
 }
 
 /// Body of `POST /v1/mesh/register`.
@@ -268,6 +287,15 @@ pub struct HeartbeatRequest {
     /// joiners, which the coordinator reads as "no edges → unknown".
     #[serde(default)]
     pub peer_paths: Vec<PeerPathDto>,
+    /// Reporter's own WG data-plane health (Track K / black-hole pill, Track V).
+    /// `false` = this node is sending but receiving zero decap frames (a wedged
+    /// WG return path — the MSI black hole); the coordinator stamps its self-view
+    /// `connectivity` as `"dead"`, overriding any now-stale edges. `#[serde(default
+    /// = "default_dataplane_healthy")]` → `true` for older joiners (fail-open: a
+    /// node that cannot report is assumed healthy, so a transient gap never paints
+    /// a false "dead").
+    #[serde(default = "default_dataplane_healthy")]
+    pub dataplane_healthy: bool,
     /// Track C: command ids the node executed since its last heartbeat. The
     /// coordinator removes each from the peer's pending queue (ack) so the
     /// at-least-once carrier never re-delivers an already-run verb.
@@ -357,6 +385,12 @@ pub struct TopologyMachine {
     /// when unknown), like `software_version` above, so the node + frontend can
     /// rely on the key existing.
     pub mesh_version: Option<String>,
+    /// Self-view live connectivity (`"direct"` / `"relay"` / `"dead"` / `None`)
+    /// so the topology graph can paint a wedged machine 🔴 — the same value as
+    /// the default [`PeerInfo::connectivity`] stamp (Track V). Always present
+    /// (serializes `null` when unknown) like `software_version`, so the node +
+    /// frontend can rely on the key existing.
+    pub connectivity: Option<String>,
 }
 
 /// One undirected edge in the [`TopologyResponse`] graph.

@@ -315,6 +315,135 @@ async fn snapshot_with_vantage_overrides_with_single_vantage_view() {
     );
 }
 
+/// Track V tooltip: the roster snapshot must carry the live `connectivity_age_ms`
+/// next to `connectivity`, sourced from the SAME edge — self-view default uses
+/// the freshest (min) age across the peer's own edges; `?vantage` uses that
+/// vantage's single edge age. A no-edge peer carries `None`.
+#[tokio::test]
+async fn snapshot_carries_connectivity_age_alongside_connectivity() {
+    use crate::http::api::PeerPathDto;
+    let c = coordinator();
+    let (reporter, _) = c.register(req(60, "reporter")).await.expect("reg reporter");
+    let (a, _) = c.register(req(61, "a")).await.expect("reg a");
+    let (b, _) = c.register(req(62, "b")).await.expect("reg b");
+
+    // reporter holds one relay edge (age 500) and one direct edge (age 12).
+    c.record_peer_paths(
+        reporter.peer_id,
+        &[
+            PeerPathDto {
+                peer_id: a.peer_id.to_string(),
+                direct: false,
+                last_rx_age_ms: 500,
+            },
+            PeerPathDto {
+                peer_id: b.peer_id.to_string(),
+                direct: true,
+                last_rx_age_ms: 12,
+            },
+        ],
+    );
+
+    // Self-view default: reporter is "direct" (has a direct edge) and the
+    // age is the FRESHEST observation it holds (min) = 12.
+    let snap = c.snapshot();
+    let r = snap
+        .iter()
+        .find(|p| p.peer_id == reporter.peer_id.to_string())
+        .unwrap();
+    assert_eq!(r.connectivity.as_deref(), Some("direct"));
+    assert_eq!(r.connectivity_age_ms, Some(12), "self-view age = freshest edge");
+
+    // `?vantage=reporter`: to peer `a` it reported relay@500.
+    let snap = c.snapshot_with_vantage(Some(reporter.peer_id));
+    let ra = snap
+        .iter()
+        .find(|p| p.peer_id == a.peer_id.to_string())
+        .unwrap();
+    assert_eq!(ra.connectivity.as_deref(), Some("relay"));
+    assert_eq!(ra.connectivity_age_ms, Some(500), "vantage age = that edge");
+
+    // A peer with no edges carries neither.
+    let rb_self = c.snapshot();
+    let b_self = rb_self
+        .iter()
+        .find(|p| p.peer_id == b.peer_id.to_string())
+        .unwrap();
+    assert_eq!(b_self.connectivity, None);
+    assert_eq!(b_self.connectivity_age_ms, None);
+}
+
+/// A peer that heartbeats `dataplane_healthy: false` is stamped
+/// `connectivity: "dead"` in the self-view roster — overriding whatever its
+/// (now-stale) edges say. This is the black-hole pill A-a watches.
+#[tokio::test]
+async fn dead_data_plane_overrides_self_connectivity() {
+    let c = coordinator();
+    let (m, _) = c.register(req(70, "wedged")).await.expect("reg");
+    // It still has a (stale) direct edge from before it wedged...
+    c.record_peer_paths(
+        m.peer_id,
+        &[crate::http::api::PeerPathDto {
+            peer_id: Uuid::now_v7().to_string(),
+            direct: true,
+            last_rx_age_ms: 99_999,
+        }],
+    );
+    // ...but it just reported its data plane is dead.
+    c.record_dataplane_health(m.peer_id, false);
+    let snap = c.snapshot();
+    let me = snap
+        .iter()
+        .find(|p| p.peer_id == m.peer_id.to_string())
+        .unwrap();
+    assert_eq!(
+        me.connectivity.as_deref(),
+        Some("dead"),
+        "dead data plane must override a stale 'direct'"
+    );
+    // The dead state omits the age (a wedged plane has no live edge to age).
+    assert_eq!(me.connectivity_age_ms, None, "dead pill carries no age");
+
+    // Recovery: data plane returns healthy → the override lifts and the
+    // (still-stale-but-present) edge re-surfaces as "direct".
+    c.record_dataplane_health(m.peer_id, true);
+    let snap = c.snapshot();
+    let me = snap
+        .iter()
+        .find(|p| p.peer_id == m.peer_id.to_string())
+        .unwrap();
+    assert_eq!(
+        me.connectivity.as_deref(),
+        Some("direct"),
+        "healthy again → edge re-surfaces (fail-open, never stuck dead)"
+    );
+}
+
+/// Fail-open: a freshly-registered peer that never reported its data-plane
+/// health is healthy by default — `record_dataplane_health` is never called,
+/// so the default-`true` `PeerEntry` field must NEVER paint a false "dead".
+#[tokio::test]
+async fn missing_dataplane_health_never_paints_dead() {
+    use crate::http::api::PeerPathDto;
+    let c = coordinator();
+    let (m, _) = c.register(req(71, "fresh")).await.expect("reg");
+    c.record_peer_paths(
+        m.peer_id,
+        &[PeerPathDto {
+            peer_id: Uuid::now_v7().to_string(),
+            direct: false,
+            last_rx_age_ms: 10,
+        }],
+    );
+    // No record_dataplane_health call → default healthy.
+    let (conn, _age) = c.self_connectivity_aged(m.peer_id);
+    assert_eq!(
+        conn.as_deref(),
+        Some("relay"),
+        "a peer that never reported health is healthy by default (fail-open)"
+    );
+}
+
 #[tokio::test]
 async fn deregister_is_idempotent() {
     let c = coordinator();
