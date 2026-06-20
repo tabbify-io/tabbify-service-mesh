@@ -40,6 +40,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         relay_only,
         source_scoped_routes,
         manage_firewall,
+        mesh_stun_server,
     } = args;
 
     println!("joining... coordinator={coordinator}");
@@ -74,6 +75,9 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         // tailscaled-style firewall trust). Off by default.
         source_scoped_routes,
         manage_firewall,
+        // Track A-a: optional STUN server for a symmetric-NAT-correct WG
+        // mapping. Unset (default) keeps coordinator-reflexive advertise.
+        stun_server: mesh_stun_server,
         // Runner-specific fields are not exposed via CLI — plain join is
         // always a plain peer. Per-app-runner processes set these
         // programmatically via JoinConfig directly.

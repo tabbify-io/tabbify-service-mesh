@@ -1,5 +1,6 @@
 //! `clap` definitions for the `tabbify-mesh` binary.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -171,6 +172,15 @@ pub struct JoinArgs {
     /// connections. Best-effort: missing ip6tables only warns.
     #[arg(long, env = "TABBIFY_MESH_MANAGE_FIREWALL")]
     pub manage_firewall: bool,
+
+    /// Optional STUN server (`ip:port`) used to discover this node's
+    /// `WireGuard` UDP mapping FROM the WG socket itself (Track A-a), correcting
+    /// the symmetric-NAT port nuance the coordinator's TCP-observed reflexive
+    /// guess cannot. When set, the joiner advertises the STUN-discovered
+    /// `ip:port` (overriding reflexive discovery). Unset (default) keeps today's
+    /// coordinator-reflexive behaviour. Relay always stays the floor regardless.
+    #[arg(long, env = "TABBIFY_MESH_STUN_SERVER")]
+    pub mesh_stun_server: Option<SocketAddr>,
 }
 
 /// Arguments for the `peers` subcommand.

@@ -153,7 +153,7 @@ impl Joiner {
     /// stays a plain `Clone`/`Debug` data struct.
     #[allow(clippy::too_many_lines)]
     pub async fn join_with_commands(
-        config: JoinConfig,
+        mut config: JoinConfig,
         super_admin_pubkey: Option<[u8; 32]>,
         command_nonce_path: Option<std::path::PathBuf>,
         command_sink: Option<Arc<dyn crate::coordinator::command_exec::CommandSink>>,
@@ -177,6 +177,41 @@ impl Joiner {
         //    succeeds.
         let preferred_port = config.listen_port.unwrap_or(DEFAULT_WG_LISTEN_PORT);
         let (socket, wg_listen_port) = bind_wg_socket(preferred_port).await?;
+
+        // 1b) Track A-a: if a STUN server is configured, discover the WG
+        //     socket's actual public mapping (symmetric-NAT-correct) and prefer
+        //     it as the advertised endpoint. Best-effort — a `None` result falls
+        //     through to whatever `config.advertise_endpoint` already held (the
+        //     coordinator's reflexive discovery when that is `None` too). Relay
+        //     remains the floor either way: we assert `relay_enabled` is
+        //     untouched (a STUN mapping NEVER disables relay), and the
+        //     coordinator only honours the advertise for a pair it has flagged
+        //     `direct` — an unflagged relay_only peer is still resolved to no
+        //     direct endpoint. So even a node that advertises a STUN mapping
+        //     stays on the relay floor until its pair is explicitly flagged.
+        debug_assert!(
+            config.relay_enabled,
+            "relay floor invariant: STUN/direct never disables relay"
+        );
+        if let Some(stun) = config.stun_server {
+            match crate::nat::stun::discover_wg_mapping(
+                &socket,
+                stun,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            {
+                Some(mapping) => {
+                    tracing::info!(%mapping, "joiner: STUN-discovered WG mapping (A-a)");
+                    config.advertise_endpoint = Some(mapping.to_string());
+                }
+                None => {
+                    tracing::debug!(
+                        "joiner: STUN discovery returned nothing, using reflexive/advertise"
+                    );
+                }
+            }
+        }
 
         // 2) Register with the coordinator.
         //

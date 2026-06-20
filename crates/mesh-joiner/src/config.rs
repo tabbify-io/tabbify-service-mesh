@@ -5,6 +5,7 @@
 //! `Joiner::join(JoinConfig::default())` call against
 //! `http://127.0.0.1:8888` is a usable smoke test out of the box.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -178,6 +179,16 @@ pub struct JoinConfig {
     /// fails the join (containers). `false` (default): firewall
     /// untouched.
     pub manage_firewall: bool,
+    /// Optional STUN server to discover this node's `WireGuard` UDP mapping from
+    /// the WG socket itself (Track A-a), correcting the symmetric-NAT port
+    /// nuance the coordinator's TCP-observed reflexive guess cannot.
+    ///
+    /// When `Some`, the joiner issues a STUN binding request over its WG socket
+    /// and advertises the discovered `ip:port` (overriding reflexive discovery).
+    /// `None` (default) — today's coordinator-reflexive behaviour, unchanged.
+    /// NOTE: this only ever affects the ADVERTISED endpoint; `relay_enabled`
+    /// stays the floor, so a failed direct path always falls back to relay.
+    pub stun_server: Option<SocketAddr>,
 }
 
 impl Default for JoinConfig {
@@ -224,6 +235,10 @@ impl Default for JoinConfig {
             // (supervisor + runners) flip both.
             source_scoped_routes: false,
             manage_firewall: false,
+            // No STUN by default: keep today's coordinator-reflexive advertise
+            // behaviour. An operator opts in via `--mesh-stun-server` for a
+            // symmetric-NAT-correct WG mapping. Relay stays the floor regardless.
+            stun_server: None,
         }
     }
 }
@@ -287,6 +302,7 @@ mod tests {
             relay_only: true,
             source_scoped_routes: true,
             manage_firewall: true,
+            stun_server: Some("203.0.113.1:3478".parse().unwrap()),
         };
         let cloned = cfg.clone();
         assert_eq!(cloned.coordinator_url, cfg.coordinator_url);
@@ -310,6 +326,25 @@ mod tests {
         assert_eq!(cloned.relay_only, cfg.relay_only);
         assert_eq!(cloned.source_scoped_routes, cfg.source_scoped_routes);
         assert_eq!(cloned.manage_firewall, cfg.manage_firewall);
+        assert_eq!(cloned.stun_server, cfg.stun_server);
+    }
+
+    /// A-a: the optional STUN server (for symmetric-NAT-correct reflexive
+    /// discovery from the WG socket) defaults to None (today's behaviour) and
+    /// round-trips through Clone. Relay stays the floor regardless — a STUN
+    /// mapping is an ADVERTISE input, never a relay opt-out.
+    #[test]
+    fn stun_server_default_is_none_and_clones() {
+        let cfg = JoinConfig::default();
+        assert!(cfg.stun_server.is_none(), "no STUN server by default");
+        assert!(cfg.relay_enabled, "relay stays the floor with or without STUN");
+        let cfg2 = JoinConfig {
+            stun_server: Some("203.0.113.1:3478".parse().unwrap()),
+            ..JoinConfig::default()
+        };
+        let cloned = cfg2.clone();
+        assert_eq!(cloned.stun_server, cfg2.stun_server);
+        assert!(cloned.relay_enabled, "relay floor preserved through clone");
     }
 
     /// `relay_only` defaults OFF (a peer is directly reachable unless it
