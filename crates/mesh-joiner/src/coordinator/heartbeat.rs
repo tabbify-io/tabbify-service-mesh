@@ -258,6 +258,14 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
     // session table this tick reconciles, stamped with the data-plane clock.
     let peer_paths =
         crate::joiner::peer_paths_from_sessions(sessions, crate::wg::loops::now_micros());
+    // Track K keystone: report THIS node's live data-plane health on every
+    // heartbeat, stamped with the SAME clock as `peer_paths` above so the two
+    // views agree. The coordinator surfaces it (visibility pill / Track V);
+    // the local OTA gate (Track D) reads its own value directly.
+    let dataplane_healthy = sessions.dataplane_healthy(
+        crate::wg::loops::now_micros(),
+        crate::joiner::DATAPLANE_RX_SILENCE_THRESHOLD_MICROS,
+    );
     let current_id = *peer_id.read().await;
     match client
         .heartbeat(
@@ -268,6 +276,7 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
             mesh_version,
             reregister.relay_only,
             peer_paths,
+            dataplane_healthy,
         )
         .await
     {

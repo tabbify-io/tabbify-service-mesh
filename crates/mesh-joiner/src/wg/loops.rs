@@ -87,9 +87,15 @@ pub(crate) fn now_micros() -> i64 {
 async fn send_wire(
     socket: &UdpSocket,
     relay: Option<&RelayHandle>,
+    sessions: &SessionTable,
     session: &Arc<PeerSession>,
     bytes: Vec<u8>,
 ) {
+    // Track K: stamp the send-attempt clock at the single TX chokepoint so
+    // `dataplane_healthy` can tell an idle node (no TX) from a black hole (TX
+    // happening, zero RX). Read-only w.r.t. routing — this never changes the
+    // direct-vs-relay decision below.
+    sessions.note_send_attempt(now_micros());
     if session.direct_confirmed() {
         if let Some(endpoint) = session.endpoint() {
             tracing::debug!(peer = %session.peer_id, %endpoint, len = bytes.len(), "send_wire: direct (confirmed)");
@@ -175,7 +181,7 @@ pub(crate) async fn udp_recv_loop(
                         // `via_direct = true`: this arrived over the UDP
                         // socket, the only path that can prove a direct route.
                         if let Some(session) = sessions.by_endpoint(peer_addr) {
-                            process_inbound_datagram(&socket, relay, true, &tun, &session, datagram).await;
+                            process_inbound_datagram(&socket, relay, true, &tun, &sessions, &session, datagram).await;
                             continue;
                         }
                         // Slow path: unknown source addr. WireGuard
@@ -219,8 +225,13 @@ pub(crate) async fn udp_recv_loop(
                             // fast-path `note_direct_rx`). This alone does
                             // NOT confirm; a direct DeliverToTun does.
                             session.note_direct_rx(now_micros());
+                            // Track K: the slow path inlines its own decap, so
+                            // refresh the table-global liveness clock here too
+                            // (the fast path does it inside
+                            // `process_inbound_datagram`).
+                            sessions.note_inbound_data_frame(now_micros());
                             // `via_direct = true`: slow path is still UDP.
-                            apply_wg_action(&socket, relay, true, &tun, &session, attempt).await;
+                            apply_wg_action(&socket, relay, true, &tun, &sessions, &session, attempt).await;
                             // Drain any queued frames (mirrors process_inbound_datagram).
                             loop {
                                 let next = {
@@ -232,7 +243,7 @@ pub(crate) async fn udp_recv_loop(
                                 if matches!(next, WgAction::Nothing) {
                                     break;
                                 }
-                                apply_wg_action(&socket, relay, true, &tun, &session, next).await;
+                                apply_wg_action(&socket, relay, true, &tun, &sessions, &session, next).await;
                             }
                             accepted = true;
                             break;
@@ -264,6 +275,7 @@ pub(crate) async fn process_inbound_datagram(
     relay: Option<&RelayHandle>,
     via_direct: bool,
     tun: &Arc<dyn TunDevice>,
+    sessions: &SessionTable,
     session: &Arc<PeerSession>,
     datagram: &[u8],
 ) {
@@ -295,7 +307,18 @@ pub(crate) async fn process_inbound_datagram(
     if via_direct && !matches!(first, WgAction::Error(_)) {
         session.note_direct_rx(now_micros());
     }
-    apply_wg_action(socket, relay, via_direct, tun, session, first).await;
+    // KEYSTONE (Track K): a valid WG decap over ANY path — direct UDP OR
+    // relay — proves the data plane is alive. Refresh the TABLE-GLOBAL
+    // liveness clock for both. Distinct from the per-session `note_direct_rx`
+    // above (which is `via_direct`-gated because only a UDP datagram can prove
+    // a DIRECT path): a relayed frame must NOT confirm a direct path, but it
+    // DOES prove inbound data reaches us, so it refreshes the global
+    // black-hole signal. Fixes the `via_direct=false` blind spot
+    // (`relay/client.rs:391`).
+    if !matches!(first, WgAction::Error(_)) {
+        sessions.note_inbound_data_frame(now_micros());
+    }
+    apply_wg_action(socket, relay, via_direct, tun, sessions, session, first).await;
 
     // boringtun documents that after `WriteToNetwork`, the caller
     // should keep calling `decapsulate` with an empty datagram until
@@ -311,7 +334,7 @@ pub(crate) async fn process_inbound_datagram(
         if matches!(next, WgAction::Nothing) {
             break;
         }
-        apply_wg_action(socket, relay, via_direct, tun, session, next).await;
+        apply_wg_action(socket, relay, via_direct, tun, sessions, session, next).await;
     }
 }
 
@@ -320,6 +343,7 @@ async fn apply_wg_action(
     relay: Option<&RelayHandle>,
     via_direct: bool,
     tun: &Arc<dyn TunDevice>,
+    sessions: &SessionTable,
     session: &Arc<PeerSession>,
     action: WgAction,
 ) {
@@ -334,7 +358,7 @@ async fn apply_wg_action(
             // handshake can cross directly even when the return path is
             // blocked, so it stays on the relay floor until DATA proves
             // both directions.
-            send_wire(socket, relay, session, bytes).await;
+            send_wire(socket, relay, sessions, session, bytes).await;
         }
         WgAction::DeliverToTun(bytes) => {
             // spec §5.5 RX enforcement: boringtun decapsulated this
@@ -433,7 +457,7 @@ pub(crate) async fn tun_read_loop(
                             endpoint = ?session.endpoint(),
                             "tun_read: encapsulating + sending"
                         );
-                        encapsulate_and_send(&socket, sessions.relay(), &session, packet).await;
+                        encapsulate_and_send(&socket, sessions.relay(), &sessions, &session, packet).await;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "tun_read: error");
@@ -448,6 +472,7 @@ pub(crate) async fn tun_read_loop(
 async fn encapsulate_and_send(
     socket: &UdpSocket,
     relay: Option<&RelayHandle>,
+    sessions: &SessionTable,
     session: &Arc<PeerSession>,
     packet: &[u8],
 ) {
@@ -468,7 +493,7 @@ async fn encapsulate_and_send(
             // Route through the single TX chokepoint: confirmed-direct →
             // UDP, else relay floor, else (no relay) best-effort candidate
             // endpoint, else drop.
-            send_wire(socket, relay, session, bytes).await;
+            send_wire(socket, relay, sessions, session, bytes).await;
         }
         WgAction::Nothing => {
             // boringtun queued the packet behind a handshake — it'll
@@ -549,7 +574,7 @@ pub(crate) async fn timer_loop(
                         // Timer-driven WG output (rekey / keepalive) rides
                         // the same chokepoint: confirmed-direct → UDP, else
                         // relay floor, else best-effort candidate, else drop.
-                        send_wire(&socket, sessions.relay(), &session, bytes).await;
+                        send_wire(&socket, sessions.relay(), &sessions, &session, bytes).await;
                     }
                 }
             }
@@ -752,7 +777,7 @@ mod tests {
         // An inner IPv6 packet destined for the peer triggers a handshake.
         let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
 
-        encapsulate_and_send(&socket, table.relay(), &session, &packet).await;
+        encapsulate_and_send(&socket, table.relay(), &table, &session, &packet).await;
 
         let out = rx.recv().await.expect("packet relayed when no endpoint");
         assert_eq!(
@@ -800,7 +825,7 @@ mod tests {
         let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
 
-        encapsulate_and_send(&sender, table.relay(), &session, &packet).await;
+        encapsulate_and_send(&sender, table.relay(), &table, &session, &packet).await;
 
         // (1) Floor preserved: the frame still goes over the RELAY so a
         // black-hole candidate never drops it.
@@ -848,8 +873,8 @@ mod tests {
         let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
 
         // Two sends well within the 1s probe interval.
-        send_wire(&sender, table.relay(), &session, b"first".to_vec()).await;
-        send_wire(&sender, table.relay(), &session, b"second".to_vec()).await;
+        send_wire(&sender, table.relay(), &table, &session, b"first".to_vec()).await;
+        send_wire(&sender, table.relay(), &table, &session, b"second".to_vec()).await;
 
         // The relay floor carried BOTH frames.
         let a = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -896,7 +921,7 @@ mod tests {
         );
         let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
 
-        send_wire(&sender, table.relay(), &session, b"x".to_vec()).await;
+        send_wire(&sender, table.relay(), &table, &session, b"x".to_vec()).await;
 
         // Relayed (the floor) ...
         let out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -933,7 +958,7 @@ mod tests {
         let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
 
-        encapsulate_and_send(&sender, table.relay(), &session, &packet).await;
+        encapsulate_and_send(&sender, table.relay(), &table, &session, &packet).await;
 
         // The datagram went to UDP, not the relay.
         let mut buf = vec![0u8; MAX_UDP_FRAME];
@@ -990,6 +1015,7 @@ mod tests {
             None,
             false,
             &tun,
+            &table,
             &session,
             WgAction::DeliverToTun(inner.clone()),
         )
@@ -1005,6 +1031,7 @@ mod tests {
             None,
             true,
             &tun,
+            &table,
             &session,
             WgAction::SendToPeer(vec![1, 2, 3]),
         )
@@ -1020,6 +1047,7 @@ mod tests {
             None,
             true,
             &tun,
+            &table,
             &session,
             WgAction::DeliverToTun(inner),
         )
@@ -1040,7 +1068,7 @@ mod tests {
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
         // No relay handle (table.relay() == None) → drop, must not panic.
-        encapsulate_and_send(&socket, table.relay(), &session, &packet).await;
+        encapsulate_and_send(&socket, table.relay(), &table, &session, &packet).await;
     }
 
     // ---- per-app-ULA routing: TX lookup + RX source check ----
@@ -1108,5 +1136,75 @@ mod tests {
         // After hosting, the same response passes.
         t.reconcile_app_routes(host, &[app]);
         assert!(inner_source_allowed(&session, &ipv6_packet_from(app)));
+    }
+
+    // ---- Track K: data-plane liveness refresh ----
+
+    /// Build a real WG datagram that `session`'s Tunn will decapsulate as a
+    /// NON-error frame (a handshake-init from the matched peer Tunn). The peer
+    /// Tunn is the mirror of the one `upsert_peer` built: our local static is
+    /// `[9u8;32]` (so the peer's REMOTE pubkey is `PublicKey::from([9u8;32])`),
+    /// and the peer's own static is `[3u8;32]` (matching the `wg_public_key`
+    /// `upsert_peer` advertised). The init decapsulates without error and the
+    /// liveness clock refreshes.
+    fn make_valid_wg_datagram_for(_session: &Arc<PeerSession>) -> Vec<u8> {
+        use boringtun::noise::{Tunn, TunnResult};
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let peer_static = StaticSecret::from([3u8; 32]);
+        let our_pub = PublicKey::from(&StaticSecret::from([9u8; 32]));
+        let mut peer_tunn = Tunn::new(peer_static, our_pub, None, None, 99, None);
+        let mut out = vec![0u8; MAX_UDP_FRAME];
+        // An empty encapsulate triggers a handshake-init emission.
+        match peer_tunn.encapsulate(&[], &mut out) {
+            TunnResult::WriteToNetwork(b) => b.to_vec(),
+            other => panic!("expected handshake-init, got {other:?}"),
+        }
+    }
+
+    /// KEYSTONE (Track K): an inbound decap over the RELAY path
+    /// (`via_direct = false`) MUST refresh the table-global
+    /// `last_inbound_data_frame_ts` — fixing the `via_direct=false` blind spot
+    /// (`relay/client.rs:391`) where relayed RX never touched any liveness
+    /// clock. The session's DIRECT clock must NOT confirm (a relayed frame
+    /// proves nothing about the direct path).
+    #[tokio::test]
+    async fn relay_decap_refreshes_table_liveness_not_direct() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tun: Arc<dyn TunDevice> = Arc::new(NoopTun);
+        let table = SessionTable::new();
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some("127.0.0.1:51820"));
+
+        let datagram = make_valid_wg_datagram_for(&session);
+
+        assert_eq!(table.last_inbound_data_frame_ts(), 0, "clock starts at 0");
+        // via_direct = false → the RELAY path.
+        process_inbound_datagram(&socket, None, false, &tun, &table, &session, &datagram).await;
+
+        assert!(
+            table.last_inbound_data_frame_ts() > 0,
+            "a relay decap must refresh the table-global liveness clock"
+        );
+        assert!(
+            !session.direct_confirmed(),
+            "a relayed frame must NEVER confirm the direct path"
+        );
+    }
+
+    /// A `send_wire` attempt stamps the table-global `last_send_attempt_ts`
+    /// (the idle-gate for `dataplane_healthy`): before any send the clock is
+    /// `0`; after a relayed send it is non-zero.
+    #[tokio::test]
+    async fn send_wire_stamps_send_attempt_clock() {
+        let (relay, mut _rx) = crate::relay::RelayHandle::new(false);
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", None); // passive → relay
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        assert_eq!(table.last_send_attempt_ts(), 0, "no send yet");
+        send_wire(&socket, table.relay(), &table, &session, b"frame".to_vec()).await;
+        assert!(
+            table.last_send_attempt_ts() > 0,
+            "send_wire must stamp the send-attempt clock"
+        );
     }
 }

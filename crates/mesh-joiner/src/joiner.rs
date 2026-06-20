@@ -47,6 +47,16 @@ const MESH_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// unavailable or already port-forwarded to a different external port.
 pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
 
+/// Track K data-plane RX-silence threshold (micros).
+///
+/// How long the table-global `last_inbound_data_frame_ts` may go stale (WHILE
+/// this node is actively sending to at least one peer) before
+/// [`Joiner::dataplane_healthy`] reports the data plane dead. 90s must
+/// comfortably exceed the ~20s heartbeat cadence + a realistic WAN stall (MSI
+/// is WAN-limited and flaps) so a transient hiccup never trips it; Track B
+/// pairs it with a 120s systemd watchdog (spec §8).
+pub const DATAPLANE_RX_SILENCE_THRESHOLD_MICROS: i64 = 90_000_000;
+
 /// Handle to a running joiner.
 ///
 /// Drop = abrupt shutdown (background tasks abort, TUN device closes,
@@ -402,6 +412,20 @@ impl Joiner {
     #[must_use]
     pub fn peer_paths(&self) -> Vec<PeerPath> {
         peer_paths_from_sessions(&self.sessions, now_micros())
+    }
+
+    /// Track K keystone accessor: is THIS node's WG data plane alive right
+    /// now? `false` only when this node is demonstrably a black hole — it has
+    /// at least one peer, has SENT since the last inbound frame, and received
+    /// no valid decap (direct OR relay) for longer than
+    /// [`DATAPLANE_RX_SILENCE_THRESHOLD_MICROS`]. An idle / peerless node is
+    /// always healthy (fail-open, spec §7). Read-only, lock-free, cheap — safe
+    /// to poll from a watchdog (Track B) or the OTA confirm loop (Track D).
+    /// Surfaced on the heartbeat and via the supervisor accessor (Track K3).
+    #[must_use]
+    pub fn dataplane_healthy(&self, now_micros: i64) -> bool {
+        self.sessions
+            .dataplane_healthy(now_micros, DATAPLANE_RX_SILENCE_THRESHOLD_MICROS)
     }
 
     /// Gracefully deregister and shut down background tasks. Best

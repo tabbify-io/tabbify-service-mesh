@@ -393,6 +393,7 @@ async fn handle_inbound(task: &RelayTask, buf: &[u8]) {
         task.sessions.relay(),
         false,
         &task.tun,
+        &task.sessions,
         &session,
         payload,
     )

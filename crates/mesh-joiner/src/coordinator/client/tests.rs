@@ -83,6 +83,7 @@ fn relay_only_round_trips_and_defaults_false() {
         mesh_version: None,
         relay_only: true,
         peer_paths: vec![],
+        dataplane_healthy: true,
     };
     let hv = serde_json::to_value(&hb).unwrap();
     assert_eq!(hv["relay_only"], true);
@@ -94,6 +95,36 @@ fn relay_only_round_trips_and_defaults_false() {
     // Back-compat: a heartbeat with no `peer_paths` key parses to an empty
     // edge set (connectivity visibility — old joiner / old coordinator).
     assert!(legacy_hb.peer_paths.is_empty());
+    // Track K: a legacy heartbeat with no `dataplane_healthy` key defaults to
+    // `true` (fail-open — absence is read as healthy, never a black hole).
+    assert!(legacy_hb.dataplane_healthy);
+}
+
+/// Track K: `HeartbeatRequest.dataplane_healthy` round-trips, and a legacy
+/// body that omits it deserializes to the `#[serde(default)]` value (`true`).
+#[test]
+fn heartbeat_dataplane_healthy_round_trips_and_defaults() {
+    let hb = HeartbeatRequest {
+        peer_id: Uuid::nil(),
+        wg_listen_port: Some(51820),
+        hosted_app_ulas: vec![],
+        software_version: None,
+        mesh_version: None,
+        relay_only: true,
+        peer_paths: vec![],
+        dataplane_healthy: false,
+    };
+    let json = serde_json::to_string(&hb).expect("serialize");
+    let back: HeartbeatRequest = serde_json::from_str(&json).expect("round-trip");
+    assert!(!back.dataplane_healthy, "round-trips the reported value");
+
+    let legacy: HeartbeatRequest =
+        serde_json::from_str(r#"{"peer_id":"00000000-0000-0000-0000-000000000000"}"#)
+            .expect("legacy parse");
+    assert!(
+        legacy.dataplane_healthy,
+        "absent dataplane_healthy defaults to true (fail-open)"
+    );
 }
 
 #[tokio::test]
@@ -571,7 +602,7 @@ async fn heartbeat_returns_roster_snapshot() {
         .await;
     let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
     let resp = client
-        .heartbeat(Uuid::nil(), Some(51820), &[], None, None, false, Vec::new())
+        .heartbeat(Uuid::nil(), Some(51820), &[], None, None, false, Vec::new(), true)
         .await
         .unwrap();
     assert!(resp.peers.is_empty());
@@ -608,6 +639,7 @@ async fn heartbeat_sends_hosted_app_ulas() {
             None,
             false,
             Vec::new(),
+            true,
         )
         .await
         .expect("heartbeat with hosted app-ULAs should match the body");
@@ -625,6 +657,7 @@ async fn heartbeat_omits_empty_hosted_app_ulas() {
         mesh_version: None,
         relay_only: false,
         peer_paths: vec![],
+        dataplane_healthy: true,
     })
     .unwrap();
     assert!(

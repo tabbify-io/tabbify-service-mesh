@@ -24,7 +24,7 @@ use rand_core::{OsRng, RngCore};
 use std::collections::HashSet;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -59,6 +59,36 @@ pub struct SessionTable {
     /// default) preserves the pre-relay drop behaviour — used by tests and
     /// by a joiner started with `--no-relay`.
     relay: Option<RelayHandle>,
+    /// Unix-micros of the LAST successful WG decap from ANY peer over ANY
+    /// path — direct UDP **or** relay (the keystone, spec §2/§5 Track K). A
+    /// black-hole node (control-plane heartbeat alive, WG decap-RX zero) has a
+    /// stale value here while everything else stays green; that is the only
+    /// signal that distinguishes "alive" from "data-plane dead". Refreshed in
+    /// `process_inbound_datagram` for BOTH paths — fixing the `via_direct=false`
+    /// relay blind spot (`relay/client.rs:391`) where relayed RX never touched
+    /// any liveness clock. `Arc<AtomicI64>` so every cheap-clone of the table
+    /// (udp/relay/timer loops) refreshes the SAME process-global value. `0` =
+    /// "never decapsulated a frame".
+    last_inbound_data_frame_ts: Arc<AtomicI64>,
+    /// Unix-micros of the LAST `send_wire` attempt to ANY peer. Pairs with
+    /// `last_inbound_data_frame_ts` to gate `dataplane_healthy`: a node that
+    /// has NOT tried to send since the last sample is idle and must never be
+    /// judged a black hole (no TX ⇒ no expectation of RX). `0` = "never sent".
+    last_send_attempt_ts: Arc<AtomicI64>,
+}
+
+/// Monotonic relaxed store: set `clock` to `now` only if `now` is later than
+/// the current value, so an out-of-order stamp from a concurrent loop never
+/// rewinds a liveness clock. Relaxed throughout — the clocks gate a
+/// seconds-scale staleness check, so losing one update under a race is inert.
+fn store_max(clock: &AtomicI64, now: i64) {
+    let mut cur = clock.load(Ordering::Relaxed);
+    while now > cur {
+        match clock.compare_exchange_weak(cur, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
 }
 
 impl std::fmt::Debug for SessionTable {
@@ -73,6 +103,14 @@ impl std::fmt::Debug for SessionTable {
                 &self.route_sink.as_ref().map(|_| "<RouteSink>"),
             )
             .field("relay", &self.relay.as_ref().map(|_| "<RelayHandle>"))
+            .field(
+                "last_inbound_data_frame_ts",
+                &self.last_inbound_data_frame_ts.load(Ordering::Relaxed),
+            )
+            .field(
+                "last_send_attempt_ts",
+                &self.last_send_attempt_ts.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -122,6 +160,73 @@ impl SessionTable {
     #[must_use]
     pub const fn relay(&self) -> Option<&RelayHandle> {
         self.relay.as_ref()
+    }
+
+    /// Refresh the data-plane liveness clock: stamp `now_micros` as the time
+    /// of the last successful inbound WG decap, MONOTONICALLY (an out-of-order
+    /// stamp from a concurrent loop never rewinds it). Called from the WG RX
+    /// seam for BOTH direct UDP and relay decap (Track K keystone) — a relayed
+    /// frame must NOT confirm a DIRECT path (that stays `via_direct`-gated on
+    /// the session) but DOES prove the data plane is alive, so it refreshes
+    /// THIS table-global clock. A relaxed CAS-free max is fine: the worst race
+    /// loses one stamp of granularity, which is inert against the seconds-scale
+    /// staleness threshold.
+    pub fn note_inbound_data_frame(&self, now_micros: i64) {
+        store_max(&self.last_inbound_data_frame_ts, now_micros);
+    }
+
+    /// Stamp `now_micros` as the time of the last `send_wire` attempt
+    /// (monotonic, same rationale as `note_inbound_data_frame`). Gates the
+    /// idle-is-healthy rule in `dataplane_healthy`.
+    pub fn note_send_attempt(&self, now_micros: i64) {
+        store_max(&self.last_send_attempt_ts, now_micros);
+    }
+
+    /// Unix-micros of the last successful inbound WG decap (any path). `0`
+    /// means none yet. Read by `dataplane_healthy` and the diagnostics
+    /// surface.
+    #[must_use]
+    pub fn last_inbound_data_frame_ts(&self) -> i64 {
+        self.last_inbound_data_frame_ts.load(Ordering::Relaxed)
+    }
+
+    /// Unix-micros of the last `send_wire` attempt. `0` means none yet.
+    #[must_use]
+    pub fn last_send_attempt_ts(&self) -> i64 {
+        self.last_send_attempt_ts.load(Ordering::Relaxed)
+    }
+
+    /// Track K data-plane liveness decision (pure; `now`/`threshold` injected
+    /// for testability). Returns `true` (healthy) unless this node is
+    /// DEMONSTRABLY a black hole:
+    ///
+    /// * **No peers** ⇒ healthy (nothing to be dead toward).
+    /// * **Idle** (we have NOT sent since the last inbound frame, i.e.
+    ///   `last_send_attempt_ts <= last_inbound_data_frame_ts`) ⇒ healthy. A
+    ///   quiet node that isn't transmitting has no reason to expect RX, so it
+    ///   must never be judged dead — fail-open (spec §7) so Track B's watchdog
+    ///   never thrashes an idle worker.
+    /// * **Sending but RX stale** (we sent after the last inbound AND that
+    ///   inbound is older than `threshold_micros`) ⇒ UNHEALTHY. This is the
+    ///   MSI black-hole signature: frames go out (`send_wire`), zero return
+    ///   decap.
+    ///
+    /// Read-only: never mutates any state. A relaxed read of each clock is
+    /// fine — a one-tick-stale value at worst shifts the verdict by one sample.
+    #[must_use]
+    pub fn dataplane_healthy(&self, now_micros: i64, threshold_micros: i64) -> bool {
+        // No peers → nothing to be a black hole toward.
+        if self.is_empty() {
+            return true;
+        }
+        let last_rx = self.last_inbound_data_frame_ts();
+        let last_send = self.last_send_attempt_ts();
+        // Idle: no send since the last inbound (or never sent) → healthy.
+        if last_send <= last_rx {
+            return true;
+        }
+        // Sending: healthy iff the last inbound is within the freshness window.
+        now_micros.saturating_sub(last_rx) < threshold_micros
     }
 
     /// Number of registered sessions.
@@ -512,5 +617,136 @@ impl SessionTable {
         self.by_endpoint.clear();
         self.by_pubkey.clear();
         self.app_routes.clear();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod liveness_tests {
+    use super::*;
+
+    /// THRESHOLD used by the table-level tests (mirrors the joiner's
+    /// `DATAPLANE_RX_SILENCE_THRESHOLD_MICROS`): 90s of RX silence.
+    const TH: i64 = 90_000_000;
+
+    /// A fresh table has never seen an inbound data frame nor a send attempt:
+    /// both clocks start at `0` (the "never" sentinel).
+    #[test]
+    fn liveness_clocks_default_to_zero() {
+        let t = SessionTable::new();
+        assert_eq!(t.last_inbound_data_frame_ts(), 0, "no inbound yet");
+        assert_eq!(t.last_send_attempt_ts(), 0, "no send yet");
+    }
+
+    /// `note_inbound_data_frame` advances the inbound clock to the stamped
+    /// time; a LATER stamp moves it forward; an EARLIER stamp never regresses
+    /// it (monotonic — out-of-order decap on two loops must not rewind the
+    /// freshness signal).
+    #[test]
+    fn note_inbound_data_frame_is_monotonic() {
+        let t = SessionTable::new();
+        t.note_inbound_data_frame(1_000);
+        assert_eq!(t.last_inbound_data_frame_ts(), 1_000);
+        t.note_inbound_data_frame(5_000);
+        assert_eq!(t.last_inbound_data_frame_ts(), 5_000, "advances forward");
+        t.note_inbound_data_frame(2_000);
+        assert_eq!(
+            t.last_inbound_data_frame_ts(),
+            5_000,
+            "an earlier stamp must not rewind the clock"
+        );
+    }
+
+    /// `note_send_attempt` advances the send clock the same monotonic way.
+    #[test]
+    fn note_send_attempt_is_monotonic() {
+        let t = SessionTable::new();
+        t.note_send_attempt(3_000);
+        assert_eq!(t.last_send_attempt_ts(), 3_000);
+        t.note_send_attempt(1_000);
+        assert_eq!(t.last_send_attempt_ts(), 3_000, "no rewind");
+    }
+
+    /// The clocks are SHARED across clones (the cheap-clone `SessionTable`
+    /// hands the SAME `Arc<AtomicI64>` to every loop): a stamp on one clone is
+    /// visible through another. This is what makes a single process-global
+    /// signal possible across the udp/relay/timer loops.
+    #[test]
+    fn liveness_clocks_shared_across_clones() {
+        let t = SessionTable::new();
+        let cloned = t.clone();
+        cloned.note_inbound_data_frame(9_000);
+        assert_eq!(
+            t.last_inbound_data_frame_ts(),
+            9_000,
+            "a stamp on a clone is visible through the original"
+        );
+    }
+
+    /// Build a table with one peer session so `len() >= 1`.
+    fn table_with_one_peer() -> SessionTable {
+        let me = StaticSecret::from([9u8; 32]);
+        let info = crate::peer::PeerInfo {
+            peer_id: uuid::Uuid::nil(),
+            wg_public_key: *PublicKey::from(&StaticSecret::from([3u8; 32])).as_bytes(),
+            ula: "fd5a:1f00:1::1".parse().unwrap(),
+            listen_endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+            display_name: "peer".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            software_version: None,
+            mesh_version: None,
+            joined_at_micros: 0,
+        };
+        let t = SessionTable::new();
+        t.upsert(&me, &info);
+        t
+    }
+
+    /// A node with NO peers is always healthy — there is nothing to be a black
+    /// hole toward (fail-open).
+    #[test]
+    fn dataplane_healthy_when_no_peers() {
+        let t = SessionTable::new();
+        // Even with a stale (or zero) RX clock and a recent send, no peers ⇒ healthy.
+        t.note_send_attempt(1_000_000_000);
+        assert!(t.dataplane_healthy(1_000_000_000 + TH * 2, TH));
+    }
+
+    /// A node with peers that has NOT sent since the last inbound sample is
+    /// IDLE — healthy regardless of RX age (no TX ⇒ no RX expectation).
+    #[test]
+    fn dataplane_healthy_when_idle_no_send_since_rx() {
+        let t = table_with_one_peer();
+        // Last inbound at t=10s; NO send after it. Now is far past threshold.
+        t.note_inbound_data_frame(10_000_000);
+        // send clock <= inbound clock ⇒ idle.
+        assert!(
+            t.dataplane_healthy(10_000_000 + TH * 5, TH),
+            "an idle node (no send since last RX) is never a black hole"
+        );
+    }
+
+    /// THE black-hole case: peers present, WE SENT after the last inbound, and
+    /// the inbound clock is older than THRESHOLD ⇒ UNHEALTHY (data-plane dead).
+    #[test]
+    fn dataplane_unhealthy_when_sending_but_rx_stale() {
+        let t = table_with_one_peer();
+        t.note_inbound_data_frame(10_000_000); // last RX at 10s
+        t.note_send_attempt(20_000_000); // we sent at 20s (after RX)
+        // Now = 10s + threshold + 1µs ⇒ RX age exceeds threshold while sending.
+        assert!(
+            !t.dataplane_healthy(10_000_000 + TH + 1, TH),
+            "sending peers with stale RX is a black hole"
+        );
+    }
+
+    /// Sending AND fresh RX ⇒ healthy (the steady state).
+    #[test]
+    fn dataplane_healthy_when_sending_and_rx_fresh() {
+        let t = table_with_one_peer();
+        t.note_inbound_data_frame(100_000_000);
+        t.note_send_attempt(100_000_000);
+        assert!(t.dataplane_healthy(100_000_000 + TH / 2, TH));
     }
 }

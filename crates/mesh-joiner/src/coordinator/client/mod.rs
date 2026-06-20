@@ -193,6 +193,23 @@ pub struct HeartbeatRequest {
     /// the coordinator treats absence as "no edges → unknown".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peer_paths: Vec<PeerPath>,
+    /// Track K keystone: this reporter's live WG data-plane health
+    /// (`Joiner::dataplane_healthy`). `false` ⇒ this node is a black hole
+    /// (control-plane heartbeat alive, WG decap-RX dead). The coordinator
+    /// surfaces it for the visibility pill (Track V) and the OTA data-plane
+    /// gate reads its own local value (Track D). `#[serde(default = "..")]` to
+    /// `true` so an older joiner (no field) and an older coordinator (ignores
+    /// it) interop — absence is read as "healthy", never as a black hole, so a
+    /// new coordinator never evicts a legacy peer for a missing field.
+    #[serde(default = "default_dataplane_healthy")]
+    pub dataplane_healthy: bool,
+}
+
+/// serde default for [`HeartbeatRequest::dataplane_healthy`]: `true`
+/// (fail-open — an absent field means a legacy reporter that can't report, and
+/// it must be assumed healthy, never a black hole).
+const fn default_dataplane_healthy() -> bool {
+    true
 }
 
 /// Body of the heartbeat response. The coordinator returns the current
@@ -418,6 +435,7 @@ impl CoordinatorClient {
         mesh_version: Option<String>,
         relay_only: bool,
         peer_paths: Vec<PeerPath>,
+        dataplane_healthy: bool,
     ) -> Result<HeartbeatResponse> {
         let url = format!("{}/v1/mesh/heartbeat", self.base_url);
         let body = HeartbeatRequest {
@@ -428,6 +446,7 @@ impl CoordinatorClient {
             mesh_version,
             relay_only,
             peer_paths,
+            dataplane_healthy,
         };
         let resp = self
             .http
