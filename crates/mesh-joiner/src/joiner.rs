@@ -268,6 +268,18 @@ impl Joiner {
         let hosted_app_ulas: Arc<dashmap::DashMap<Ipv6Addr, ()>> = Arc::default();
         let shared_peer_id: SharedPeerId = Arc::new(tokio::sync::RwLock::new(peer_id));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Track C: build the signed-command gate + sink. `Joiner::join`
+        // (this plain entry point) wires a FAIL-CLOSED gate (no super-admin
+        // pubkey → every command rejected) + a no-op sink, so a host that does
+        // not opt into remote commands never acts. A host that wants remote
+        // restart calls `Joiner::join_with_commands` with the real pubkey +
+        // sink (Track C C9 / supervisor wiring).
+        let command_gate = crate::coordinator::command_gate::CommandGate::new(
+            None,
+            &default_command_nonce_path(&config),
+        );
+        let command_sink: Arc<dyn crate::coordinator::command_exec::CommandSink> =
+            Arc::new(crate::coordinator::command_exec::NoopCommandSink);
         let mut tasks = spawn_background_tasks(SpawnContext {
             socket: socket.clone(),
             sessions: sessions.clone(),
@@ -287,6 +299,8 @@ impl Joiner {
             coordinator_url: config.coordinator_url.clone(),
             my_pubkey: *keypair.public.as_bytes(),
             insecure_no_mtls: config.insecure_no_mtls,
+            command_gate,
+            command_sink,
             shutdown_rx,
         });
 
@@ -536,6 +550,12 @@ struct SpawnContext {
     /// `true` for a plaintext (`--insecure-no-mtls`) coordinator. The relay
     /// task only connects under insecure mode (wss/mTLS not yet built).
     insecure_no_mtls: bool,
+    /// Track C: verify + replay-guard gate for incoming signed commands. A
+    /// fail-closed gate (no super-admin pubkey) rejects every command — a host
+    /// that does not configure remote commands simply never acts.
+    command_gate: crate::coordinator::command_gate::CommandGate,
+    /// Track C: host-side process-effects sink (`RestartJoiner` / `RebootHost`).
+    command_sink: Arc<dyn crate::coordinator::command_exec::CommandSink>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -561,6 +581,8 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         coordinator_url,
         my_pubkey,
         insecure_no_mtls,
+        command_gate,
+        command_sink,
         shutdown_rx,
     } = ctx;
     let mut tasks: Vec<JoinHandle<()>> = Vec::with_capacity(8);
@@ -657,22 +679,22 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
     // Heartbeat — the last task, so it moves the remaining handles. It
     // reads `hosted_app_ulas` each tick to advertise our current hosted
     // set to the coordinator (per-app-ULA routing).
-    tasks.push(tokio::spawn(async move {
-        heartbeat::run(heartbeat::HeartbeatTask {
-            client,
-            sessions,
-            our_private,
-            peer_id,
-            reregister,
-            wg_listen_port,
-            hosted_app_ulas,
-            software_version,
-            mesh_version,
-            interval: heartbeat_interval,
-            shutdown: shutdown_rx,
-        })
-        .await;
-    }));
+    let heartbeat_task = heartbeat::HeartbeatTask {
+        client,
+        sessions,
+        our_private,
+        peer_id,
+        reregister,
+        wg_listen_port,
+        hosted_app_ulas,
+        software_version,
+        mesh_version,
+        interval: heartbeat_interval,
+        command_gate,
+        command_sink,
+        shutdown: shutdown_rx,
+    };
+    tasks.push(tokio::spawn(heartbeat::run(heartbeat_task)));
 
     tasks
 }
@@ -899,6 +921,25 @@ fn default_keypair_path() -> std::path::PathBuf {
     std::path::PathBuf::from(home)
         .join(".tabbify-mesh")
         .join("keypair")
+}
+
+/// Default path for the Track-C executed-nonce replay-guard sidecar. Lives in
+/// the SAME directory as the persisted identity (so it survives restarts the
+/// same way), falling back to `<keypair-dir>/mesh-command-nonces.json` when no
+/// identity is persisted. The fail-closed `Joiner::join` gate never writes it
+/// (no super-admin pubkey ⇒ no `mark_executed`), so this is only meaningful
+/// once `Joiner::join_with_commands` supplies a real pubkey.
+fn default_command_nonce_path(config: &JoinConfig) -> std::path::PathBuf {
+    let dir = config
+        .identity_path
+        .as_ref()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| {
+            default_keypair_path()
+                .parent()
+                .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf)
+        });
+    dir.join("mesh-command-nonces.json")
 }
 
 /// Spawn the host-integration healing loops onto `tasks`.

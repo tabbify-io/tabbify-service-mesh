@@ -177,6 +177,25 @@ impl PeerSession {
         self.allowed_ips.write().insert(addr)
     }
 
+    /// Force a fresh WG handshake on THIS session (Track C `ResetWg`).
+    ///
+    /// Re-arms the boringtun `Tunn` in place via [`Tunn::set_static_private`],
+    /// which CLEARS every established noise session and resets the handshake
+    /// state so the next outbound frame re-initiates the handshake — clearing a
+    /// half-open / stale session WITHOUT a process restart. The peer pubkey,
+    /// endpoint, allowed-source set, and the `direct_confirmed` flag are all
+    /// untouched, so the relay floor and any confirmed-direct path are
+    /// preserved exactly (a relay-only peer simply re-handshakes over the
+    /// relay). `our_private` is this node's own X25519 secret — the same key
+    /// the session was built with at `upsert` time.
+    pub async fn reset_handshake(&self, our_private: &x25519_dalek::StaticSecret) {
+        let our_public = x25519_dalek::PublicKey::from(our_private);
+        let mut tunn = self.tunn.lock().await;
+        // `None` rate-limiter → boringtun keeps the existing default limiter
+        // semantics (rate-limited like a fresh `Tunn::new` with `None`).
+        tunn.set_static_private(our_private.clone(), our_public, None);
+    }
+
     /// Remove `addr` from this peer's allowed-source set. Used when the
     /// hosting peer drops an app-ULA. Never removes the peer's own ULA
     /// (callers only pass app-ULAs). Returns `true` if it was present.

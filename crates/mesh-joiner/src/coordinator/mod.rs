@@ -10,6 +10,7 @@
 
 pub mod client;
 pub mod command;
+pub mod command_exec;
 pub mod command_gate;
 pub mod heartbeat;
 pub mod peer_sync;

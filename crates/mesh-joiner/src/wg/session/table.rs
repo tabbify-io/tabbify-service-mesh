@@ -618,6 +618,30 @@ impl SessionTable {
         self.by_pubkey.clear();
         self.app_routes.clear();
     }
+
+    /// Force a fresh WG handshake on EVERY live session (Track C `ResetWg`).
+    ///
+    /// Re-arms each peer's `Tunn` ([`PeerSession::reset_handshake`]) so the next
+    /// outbound frame re-initiates the handshake — clears half-open / stale
+    /// sessions WITHOUT a process restart. Endpoints, allowed-source sets, the
+    /// routing indexes, and the relay floor are ALL preserved: a relay-only peer
+    /// simply re-handshakes over the relay (spec §7 — no verb may flip a peer to
+    /// direct). `our_private` is this node's own X25519 secret (the same key the
+    /// sessions were built with). Snapshots the session set first so a
+    /// concurrent reconcile mutation never deadlocks against the per-`Tunn`
+    /// async lock.
+    pub async fn force_rehandshake_all(&self, our_private: &StaticSecret) {
+        let sessions: Vec<Arc<PeerSession>> =
+            self.by_ula.iter().map(|kv| kv.value().clone()).collect();
+        for session in sessions {
+            session.reset_handshake(our_private).await;
+            tracing::info!(
+                peer_id = %session.peer_id,
+                ula = %session.ula,
+                "ResetWg: re-armed WG handshake (relay floor preserved)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

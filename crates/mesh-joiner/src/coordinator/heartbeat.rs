@@ -32,6 +32,8 @@
 //! `tokio-util` just for one token.
 
 use crate::coordinator::client::{CoordinatorClient, RegisterResponse, remote_to_info};
+use crate::coordinator::command_exec::CommandSink;
+use crate::coordinator::command_gate::CommandGate;
 use crate::error::JoinerError;
 use crate::wg::session::SessionTable;
 use dashmap::DashMap;
@@ -125,6 +127,13 @@ pub struct HeartbeatTask {
     pub mesh_version: Option<String>,
     /// Heartbeat interval.
     pub interval: Duration,
+    /// Track C: verify + replay-guard gate for incoming signed commands. A
+    /// fail-closed gate (no super-admin pubkey) rejects every command, so a
+    /// host that does not configure remote commands simply never acts.
+    pub command_gate: CommandGate,
+    /// Track C: host-side process-effects sink (`RestartJoiner` / `RebootHost`).
+    /// A `NoopCommandSink` for a host that does not wire remote commands.
+    pub command_sink: Arc<dyn CommandSink>,
     /// Cancellation signal.
     pub shutdown: watch::Receiver<bool>,
 }
@@ -156,6 +165,15 @@ pub struct TickCtx<'a> {
     /// next successful heartbeat. Stops a thundering herd of re-registers
     /// while the coordinator is still bringing its roster back.
     pub handling_roster_loss: &'a mut bool,
+    /// Track C: verify + replay-guard gate (mutated — `mark_executed`).
+    pub command_gate: &'a mut CommandGate,
+    /// Track C: host-side process-effects sink.
+    pub command_sink: &'a dyn CommandSink,
+    /// Track C: acks to send on the NEXT heartbeat. `tick_once` first sends the
+    /// buffered acks (commands executed LAST tick), then refills the buffer with
+    /// the acks for the commands THIS tick's response carried — the at-least-once
+    /// heartbeat carrier (≤20s latency is fine for a restart, spec §5).
+    pub pending_acks: &'a mut Vec<String>,
 }
 
 /// Run the heartbeat loop until `shutdown` flips to `true`.
@@ -174,6 +192,8 @@ pub async fn run(task: HeartbeatTask) {
         software_version,
         mesh_version,
         interval,
+        mut command_gate,
+        command_sink,
         mut shutdown,
     } = task;
     let mut ticker = tokio::time::interval(interval);
@@ -186,6 +206,9 @@ pub async fn run(task: HeartbeatTask) {
     // transition rather than on every tick while the coordinator is
     // still re-learning us.
     let mut handling_roster_loss = false;
+    // Track C: acks for commands executed on the PREVIOUS tick, carried on the
+    // next heartbeat request (the at-least-once carrier).
+    let mut pending_acks: Vec<String> = Vec::new();
 
     loop {
         tokio::select! {
@@ -215,6 +238,9 @@ pub async fn run(task: HeartbeatTask) {
                     software_version: software_version.clone(),
                     mesh_version: mesh_version.clone(),
                     handling_roster_loss: &mut handling_roster_loss,
+                    command_gate: &mut command_gate,
+                    command_sink: command_sink.as_ref(),
+                    pending_acks: &mut pending_acks,
                 })
                 .await;
             }
@@ -247,6 +273,9 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
         software_version,
         mesh_version,
         handling_roster_loss,
+        command_gate,
+        command_sink,
+        pending_acks,
     } = ctx;
 
     // Advertise our CURRENT hosted app-ULA set so the coordinator replaces
@@ -267,6 +296,11 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
         crate::joiner::DATAPLANE_RX_SILENCE_THRESHOLD_MICROS,
     );
     let current_id = *peer_id.read().await;
+    // Track C: carry the acks for commands executed on the PREVIOUS tick. Taken
+    // (drained) before the send — once the coordinator sees them it removes them
+    // from the pending queue; if the request fails the acks are re-buffered below
+    // so the at-least-once carrier keeps trying.
+    let acks_to_send = std::mem::take(pending_acks);
     match client
         .heartbeat(
             current_id,
@@ -277,9 +311,7 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
             reregister.relay_only,
             peer_paths,
             dataplane_healthy,
-            // Track C: executed-command acks. Wired to the real ack list in C7
-            // (the command-exec integration); empty until then.
-            &[],
+            &acks_to_send,
         )
         .await
     {
@@ -288,6 +320,24 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
             // FUTURE 404 transition is handled again.
             *handling_roster_loss = false;
             reconcile_roster(sessions, our_private, &resp.peers).await;
+            // Track C: execute any signed commands the response carried AFTER
+            // reconcile (a RestartJoiner/ResetWg acts on the freshly-reconciled
+            // session table). The returned acks ride the NEXT heartbeat. A
+            // fail-closed gate (no super-admin pubkey) rejects everything, so a
+            // host without remote-command wiring is a no-op here.
+            if !resp.pending_commands.is_empty() {
+                let acks = crate::coordinator::command_exec::process_commands(
+                    &resp.pending_commands,
+                    command_gate,
+                    command_sink,
+                    sessions,
+                    our_private,
+                    reregister.relay_only,
+                    crate::wg::loops::now_micros(),
+                )
+                .await;
+                *pending_acks = acks;
+            }
         }
         Err(JoinerError::HttpStatus { status: 404, body }) => {
             // The coordinator no longer knows this peer_id — its roster
@@ -318,6 +368,16 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
             .await;
         }
         Err(e) => {
+            // Track C: the heartbeat that would have carried our acks failed
+            // (transient transport error, same peer_id). Re-buffer them so the
+            // at-least-once carrier retries the ack on the next tick rather than
+            // dropping it (which would let the coordinator re-deliver an
+            // already-executed verb). The 404 arm above deliberately does NOT
+            // re-buffer: a re-register mints a fresh, empty queue, so stale acks
+            // for the old peer_id are correctly discarded.
+            if !acks_to_send.is_empty() {
+                *pending_acks = acks_to_send;
+            }
             tracing::warn!(
                 peer_id = %current_id,
                 error = %e,
@@ -560,6 +620,19 @@ mod tests {
         B64.encode(public.as_bytes())
     }
 
+    /// A fail-closed command gate (no super-admin pubkey → rejects every
+    /// command) backed by a throwaway nonce sidecar — Track-C wiring for the
+    /// heartbeat-loop tests that don't exercise commands.
+    fn noop_command_gate() -> (tempfile::TempDir, CommandGate) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gate = CommandGate::new(None, &dir.path().join("nonces.json"));
+        (dir, gate)
+    }
+
+    fn noop_command_sink() -> std::sync::Arc<crate::coordinator::command_exec::NoopCommandSink> {
+        std::sync::Arc::new(crate::coordinator::command_exec::NoopCommandSink)
+    }
+
     fn remote(ula: &str, n: u8) -> RemotePeer {
         RemotePeer {
             peer_id: Uuid::nil(),
@@ -612,6 +685,127 @@ mod tests {
             app_uuid: None,
             relay_only: false,
         }
+    }
+
+    /// Track C end-to-end (joiner side): tick 1's heartbeat response carries a
+    /// signed `RestartJoiner`; the gate accepts it, the sink fires, and tick 2's
+    /// heartbeat REQUEST carries the `executed_command_ids` ack. A wiremock
+    /// `body_partial_json` matcher mounted with `.expect(1)` proves the ack rode
+    /// the next request (verified on server drop).
+    #[tokio::test]
+    async fn tick_executes_command_and_acks_on_next_request() {
+        use crate::coordinator::command::{CommandVerb, NodeCommand};
+        use crate::coordinator::command_exec::CommandSink;
+        use ed25519_dalek::SigningKey;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::body_partial_json;
+
+        #[derive(Default)]
+        struct CountingSink {
+            restarts: AtomicUsize,
+        }
+        impl CommandSink for CountingSink {
+            fn restart_joiner(&self) {
+                self.restarts.fetch_add(1, Ordering::SeqCst);
+            }
+            fn reboot_host(&self) {}
+        }
+
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let command_id = Uuid::now_v7();
+        let signed = NodeCommand::new(
+            command_id,
+            CommandVerb::RestartJoiner,
+            Uuid::nil().to_string(),
+            "n-tickC".to_owned(),
+            1,
+            i64::MAX,
+        )
+        .signed_by(&sk);
+
+        let server = MockServer::start().await;
+        // Tick 1: a heartbeat with NO acks → respond with the signed command.
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/heartbeat"))
+            .and(body_partial_json(
+                serde_json::json!({ "executed_command_ids": [command_id.to_string()] }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "peers": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Default heartbeat response (tick 1 + any request without the ack):
+        // carry the pending command so the joiner executes it this tick.
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "peers": [],
+                "pending_commands": [serde_json::to_value(&signed).unwrap()]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        let sessions = SessionTable::new();
+        let me = StaticSecret::from([0xAA; 32]);
+        let peer_id: SharedPeerId = Arc::new(RwLock::new(Uuid::nil()));
+        let hosted: DashMap<Ipv6Addr, ()> = DashMap::new();
+        let inputs = reregister_inputs();
+        let mut handling_roster_loss = false;
+        let nonce_dir = tempfile::tempdir().unwrap();
+        let mut command_gate = CommandGate::new(
+            Some(sk.verifying_key().to_bytes()),
+            &nonce_dir.path().join("nonces.json"),
+        );
+        let sink = Arc::new(CountingSink::default());
+        let command_sink: Arc<dyn CommandSink> = sink.clone();
+        let mut pending_acks: Vec<String> = Vec::new();
+
+        // Tick 1: executes the command, buffers the ack.
+        tick_once(TickCtx {
+            client: &client,
+            sessions: &sessions,
+            our_private: &me,
+            peer_id: &peer_id,
+            reregister: &inputs,
+            wg_listen_port: 51820,
+            hosted_app_ulas: &hosted,
+            software_version: None,
+            mesh_version: None,
+            handling_roster_loss: &mut handling_roster_loss,
+            command_gate: &mut command_gate,
+            command_sink: command_sink.as_ref(),
+            pending_acks: &mut pending_acks,
+        })
+        .await;
+        assert_eq!(sink.restarts.load(Ordering::SeqCst), 1, "command executed");
+        assert_eq!(
+            pending_acks,
+            vec![command_id.to_string()],
+            "ack buffered for the next tick"
+        );
+
+        // Tick 2: sends the buffered ack — the `.expect(1)` ack mock matches.
+        tick_once(TickCtx {
+            client: &client,
+            sessions: &sessions,
+            our_private: &me,
+            peer_id: &peer_id,
+            reregister: &inputs,
+            wg_listen_port: 51820,
+            hosted_app_ulas: &hosted,
+            software_version: None,
+            mesh_version: None,
+            handling_roster_loss: &mut handling_roster_loss,
+            command_gate: &mut command_gate,
+            command_sink: command_sink.as_ref(),
+            pending_acks: &mut pending_acks,
+        })
+        .await;
+        // The ack-matching mock (`.expect(1)`) is verified on drop.
+        drop(server);
     }
 
     /// `reconcile_roster` must add peers that the coordinator advertises
@@ -736,6 +930,9 @@ mod tests {
         let hosted: DashMap<Ipv6Addr, ()> = DashMap::new();
         let inputs = reregister_inputs();
         let mut handling_roster_loss = false;
+        let (_nonce_dir, mut command_gate) = noop_command_gate();
+        let command_sink = noop_command_sink();
+        let mut pending_acks: Vec<String> = Vec::new();
 
         // Drive a single tick: heartbeat -> 404 -> re-register -> reconcile.
         tick_once(TickCtx {
@@ -749,6 +946,9 @@ mod tests {
             software_version: None,
             mesh_version: None,
             handling_roster_loss: &mut handling_roster_loss,
+            command_gate: &mut command_gate,
+            command_sink: command_sink.as_ref(),
+            pending_acks: &mut pending_acks,
         })
         .await;
 
@@ -811,6 +1011,9 @@ mod tests {
         // Guard already set — simulates a re-register in flight from a
         // prior tick.
         let mut handling_roster_loss = true;
+        let (_nonce_dir, mut command_gate) = noop_command_gate();
+        let command_sink = noop_command_sink();
+        let mut pending_acks: Vec<String> = Vec::new();
 
         tick_once(TickCtx {
             client: &client,
@@ -823,6 +1026,9 @@ mod tests {
             software_version: None,
             mesh_version: None,
             handling_roster_loss: &mut handling_roster_loss,
+            command_gate: &mut command_gate,
+            command_sink: command_sink.as_ref(),
+            pending_acks: &mut pending_acks,
         })
         .await;
 
@@ -861,6 +1067,9 @@ mod tests {
         let hosted: DashMap<Ipv6Addr, ()> = DashMap::new();
         let inputs = reregister_inputs();
         let mut handling_roster_loss = false;
+        let (_nonce_dir, mut command_gate) = noop_command_gate();
+        let command_sink = noop_command_sink();
+        let mut pending_acks: Vec<String> = Vec::new();
 
         tick_once(TickCtx {
             client: &client,
@@ -873,6 +1082,9 @@ mod tests {
             software_version: None,
             mesh_version: None,
             handling_roster_loss: &mut handling_roster_loss,
+            command_gate: &mut command_gate,
+            command_sink: command_sink.as_ref(),
+            pending_acks: &mut pending_acks,
         })
         .await;
 
@@ -1006,6 +1218,9 @@ mod tests {
             ..reregister_inputs()
         };
         let mut handling_roster_loss = false;
+        let (_nonce_dir, mut command_gate) = noop_command_gate();
+        let command_sink = noop_command_sink();
+        let mut pending_acks: Vec<String> = Vec::new();
 
         tick_once(TickCtx {
             client: &client,
@@ -1018,6 +1233,9 @@ mod tests {
             software_version: None,
             mesh_version: None,
             handling_roster_loss: &mut handling_roster_loss,
+            command_gate: &mut command_gate,
+            command_sink: command_sink.as_ref(),
+            pending_acks: &mut pending_acks,
         })
         .await;
 
