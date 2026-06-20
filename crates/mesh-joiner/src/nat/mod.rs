@@ -7,3 +7,4 @@
 //! detection, retry strategy) is the only deferred part.
 
 pub mod holepunch;
+pub mod stun;
