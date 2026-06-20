@@ -127,19 +127,32 @@ async fn send_wire(
         //     never probes, so its peers never `learn_endpoint` for it and
         //     never probe it back (the coordinator already advertises no
         //     endpoint for relay_only peers).
+        //   * NOT in back-off — A-c hysteresis: a candidate that has failed N
+        //     consecutive probe intervals is suppressed on an exponential,
+        //     capped schedule (`direct_suppressed`), so a black-hole candidate
+        //     costs ~1 probe per growing window instead of 1/s forever.
         //   * rate-limited per session — at most one probe per
         //     `DIRECT_PROBE_INTERVAL_MICROS`, so a permanent black-hole
         //     candidate costs ~1 pkt/s, not a full-rate duplicate stream.
         // Probe FIRST (borrow) so the relay enqueue below can MOVE `bytes`
         // without a clone.
+        let now = now_micros();
         if !relay.relay_only()
+            && !session.direct_suppressed(now)
             && let Some(endpoint) = session.endpoint()
-            && session.should_probe_direct(now_micros(), DIRECT_PROBE_INTERVAL_MICROS)
+            && session.should_probe_direct(now, DIRECT_PROBE_INTERVAL_MICROS)
         {
             tracing::debug!(peer = %session.peer_id, %endpoint, len = bytes.len(), "send_wire: direct probe (unconfirmed) + relay");
             if let Err(e) = socket.send_to(&bytes, endpoint).await {
                 tracing::debug!(error = %e, %endpoint, "udp direct-probe send failed");
             }
+            // The probe is our only failure signal without a separate ACK:
+            // count this elapsed-interval-still-unconfirmed probe as one failed
+            // direct handshake, advancing the back-off. A real direct DATA
+            // delivery calls `note_direct_rx`/`confirm_direct`, which RESETS the
+            // count — so a working path never accrues a penalty, while a
+            // black-hole candidate backs off exponentially.
+            session.note_handshake_failure(now);
         } else {
             tracing::debug!(peer = %session.peer_id, len = bytes.len(), "send_wire: relay");
         }
@@ -940,6 +953,74 @@ mod tests {
             probe.is_err(),
             "a relay_only node must not probe the candidate endpoint"
         );
+    }
+
+    /// A-c hysteresis: after enough un-answered probe intervals the candidate
+    /// is SUPPRESSED — `send_wire` stops probing it (relay floor still carries
+    /// every frame). This is the bounded-probe replacement for the 1/s
+    /// forever-probe: a black-hole candidate costs ~1 probe per (growing)
+    /// back-off window, not 1/s forever.
+    #[tokio::test]
+    async fn unconfirmed_probe_suppressed_after_repeated_failures() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new(false);
+        let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst = receiver.local_addr().unwrap();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
+        let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        // Drive the candidate into a deep back-off by directly recording
+        // several failures (a fresh probe interval that never confirms). Stamp
+        // each failure at "now" so the resulting back-off deadline is in the
+        // future relative to the `now_micros()` the probe gate reads. Enough
+        // failures saturate the window at the cap (5 min), comfortably past the
+        // tiny gap between these calls and the gate's clock read.
+        let base = now_micros();
+        for _ in 0..12 {
+            session.note_handshake_failure(base);
+        }
+        assert!(
+            session.direct_suppressed(now_micros()),
+            "after repeated failures the candidate is suppressed now"
+        );
+
+        // A send while suppressed must NOT probe the candidate (relay only).
+        send_wire(&sender, table.relay(), &table, &session, b"x".to_vec()).await;
+        let relayed = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("frame still relayed (the floor)")
+            .expect("relay channel");
+        assert_eq!(relayed.payload, b"x");
+
+        let mut buf = vec![0u8; MAX_UDP_FRAME];
+        let probe =
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf)).await;
+        assert!(
+            probe.is_err(),
+            "a suppressed candidate must not be probed while in back-off"
+        );
+    }
+
+    /// A confirmed-direct delivery RESETS the back-off: even after failures, a
+    /// real inbound datagram (`note_direct_rx`) clears suppression so the path
+    /// is usable again. Guards against a working path being stuck suppressed.
+    #[tokio::test]
+    async fn confirmed_rx_clears_probe_suppression() {
+        let session = {
+            let table = SessionTable::new();
+            upsert_peer(&table, "fd5a:1f00:1::1", Some("127.0.0.1:51820"))
+        };
+        for n in 1..=4 {
+            session.note_handshake_failure(i64::from(n) * 1_000_000);
+        }
+        assert!(session.direct_suppressed(5_000_000));
+        // A valid inbound datagram lands.
+        session.note_direct_rx(6_000_000);
+        assert!(
+            !session.direct_suppressed(6_000_000),
+            "a valid inbound rx must clear the probe suppression"
+        );
+        assert_eq!(session.failed_handshake_count(), 0);
     }
 
     /// Once the direct path is CONFIRMED (a decrypted data packet arrived
