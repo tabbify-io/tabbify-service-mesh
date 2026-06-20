@@ -268,6 +268,12 @@ pub struct HeartbeatRequest {
     /// joiners, which the coordinator reads as "no edges → unknown".
     #[serde(default)]
     pub peer_paths: Vec<PeerPathDto>,
+    /// Track C: command ids the node executed since its last heartbeat. The
+    /// coordinator removes each from the peer's pending queue (ack) so the
+    /// at-least-once carrier never re-delivers an already-run verb.
+    /// `#[serde(default)]` → empty for older joiners.
+    #[serde(default)]
+    pub executed_command_ids: Vec<String>,
 }
 
 /// Body of `POST /v1/mesh/heartbeat` response.
@@ -283,6 +289,13 @@ pub struct HeartbeatResponse {
     /// semantics as [`RegisterResponse::observed_endpoint`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_endpoint: Option<String>,
+    /// Track C remote-restart: signed commands the super-admin queued for this
+    /// peer, drained on this heartbeat. The node verifies each end-to-end,
+    /// executes it, and acks via `executed_command_ids` next tick.
+    /// `#[serde(default)]` + `skip_serializing_if` → omitted from the wire when
+    /// empty, so the common no-command heartbeat is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_commands: Vec<crate::roster::coordinator::command_queue::NodeCommandDto>,
 }
 
 /// Body of `POST /v1/mesh/deregister`.

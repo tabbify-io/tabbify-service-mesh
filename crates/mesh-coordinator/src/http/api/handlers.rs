@@ -169,6 +169,8 @@ pub async fn heartbeat_handler(
     // the heartbeat call below — they are stored separately (connectivity
     // visibility), not threaded through the heartbeat event.
     let peer_paths = req.peer_paths;
+    // Track C: capture the node's executed-command acks before `req` is moved.
+    let executed = req.executed_command_ids;
     match coordinator
         .heartbeat(
             peer_id,
@@ -186,6 +188,11 @@ pub async fn heartbeat_handler(
             // only on a successful heartbeat (the entry exists), mirroring the
             // wholesale-replace the heartbeat does for hosted_app_ulas.
             coordinator.record_peer_paths(entry.peer_id, &peer_paths);
+            // Track C: ack any command the node reported executed, THEN drain
+            // the remaining queue into this response. Ack-before-drain so a
+            // command acked this tick is removed before we snapshot.
+            coordinator.ack_commands(entry.peer_id, &executed);
+            let pending_commands = coordinator.drain_commands(entry.peer_id);
             // Filter the self-heal roster the same way as register: a peer
             // only re-learns the peers it is policy-permitted to reach.
             let body = HeartbeatResponse {
@@ -194,6 +201,7 @@ pub async fn heartbeat_handler(
                 // (possibly refreshed) reflexive endpoint we now store.
                 observed_ip: observed_addr.map(|a| a.ip().to_string()),
                 observed_endpoint: entry.listen_endpoint.clone(),
+                pending_commands,
             };
             (StatusCode::OK, Json(body)).into_response()
         }

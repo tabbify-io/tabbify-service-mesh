@@ -3,7 +3,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use super::dto::{HeartbeatRequest, PeerPathDto, RegisterRequest};
-use super::handlers::topology_handler;
+use super::handlers::{heartbeat_handler, topology_handler};
 use super::stream::ViewerFilter;
 use crate::http::sse::PeerEvent;
 use crate::publisher::EventPublisher;
@@ -236,6 +236,77 @@ fn machine_req(seed: u8, name: &str) -> RegisterRequest {
         mesh_version: None,
         relay_only: false,
     }
+}
+
+/// Drive `heartbeat_handler` directly (no make-service wrapper → `connect_info`
+/// is `None`) for `peer`, carrying `executed_command_ids = acked`, and parse the
+/// response JSON. `HeartbeatResponse` is Serialize-only (a wire response), so
+/// the test reads the JSON shape directly. Used by the Track-C test.
+async fn call_heartbeat(
+    coord: &Coordinator,
+    peer: Uuid,
+    acked: &[String],
+) -> serde_json::Value {
+    let req = HeartbeatRequest {
+        peer_id: peer.to_string(),
+        wg_listen_port: None,
+        hosted_app_ulas: vec![],
+        software_version: None,
+        mesh_version: None,
+        relay_only: false,
+        peer_paths: vec![],
+        executed_command_ids: acked.to_vec(),
+    };
+    let resp = heartbeat_handler(State(coord.clone()), None, axum::Json(req)).await;
+    assert_eq!(resp.status(), 200, "heartbeat must be 200");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    serde_json::from_slice(&bytes).expect("parse heartbeat response")
+}
+
+/// A heartbeat for a peer with a queued command returns it in
+/// `pending_commands`; the drain empties the queue, and the node's ack on the
+/// next heartbeat is idempotent (at-least-once + idempotent — Track C).
+#[tokio::test]
+async fn heartbeat_carries_pending_commands_and_acks_clear_them() {
+    use crate::roster::coordinator::command_queue::NodeCommandDto;
+    let coord = test_coordinator();
+    let (entry, _) = coord
+        .register(machine_req(7, "worker"))
+        .await
+        .expect("register");
+    let peer = entry.peer_id;
+
+    coord.enqueue_command(
+        peer,
+        NodeCommandDto {
+            command_id: "cmd-1".to_owned(),
+            verb: "restart_joiner".to_owned(),
+            peer_id: peer.to_string(),
+            nonce: "n1".to_owned(),
+            issued_at: 1,
+            expiry: i64::MAX,
+            signature: "ab".to_owned(),
+        },
+    );
+
+    // Tick 1: heartbeat with no acks → response carries the command (and the
+    // drain empties the queue).
+    let resp1 = call_heartbeat(&coord, peer, &[]).await;
+    let pending1 = resp1["pending_commands"].as_array().expect("pending array");
+    assert_eq!(pending1.len(), 1);
+    assert_eq!(pending1[0]["command_id"], "cmd-1");
+
+    // Tick 2: ack the executed command — idempotent (the queue was already
+    // drained), and no command is re-delivered. `pending_commands` is omitted
+    // from the wire when empty (skip_serializing_if), so absence == empty.
+    let resp2 = call_heartbeat(&coord, peer, &["cmd-1".to_owned()]).await;
+    let pending2 = resp2
+        .get("pending_commands")
+        .and_then(|v| v.as_array())
+        .map_or(0, std::vec::Vec::len);
+    assert_eq!(pending2, 0);
 }
 
 /// `GET /v1/mesh/topology` (driven through [`topology_handler`]) returns
