@@ -29,6 +29,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         join_token,
         listen_port,
         tun_name,
+        identity_path,
         heartbeat_interval,
         advertise_endpoint,
         tls_cert,
@@ -58,6 +59,11 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         // joiner's `$HOME/.tabbify-mesh/keypair` default so smoke tests
         // and ad-hoc runs persist a stable identity across restarts.
         keypair_path: None,
+        // `--identity-path` (sticky keypair + ULA in one JSON). When set it
+        // takes PRECEDENCE over the keypair-only default: the joiner's
+        // `resolve_identity` uses the identity file and re-requests the same
+        // mesh ULA across restarts (the lifeline-joiner sticky-address path).
+        identity_path,
         tls_cert,
         tls_key,
         tls_ca,

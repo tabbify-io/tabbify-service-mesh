@@ -86,6 +86,16 @@ pub struct JoinArgs {
     #[arg(long)]
     pub tun_name: Option<String>,
 
+    /// Path to a persistent IDENTITY file (keypair + sticky ULA in one JSON,
+    /// see [`tabbify_mesh_joiner`]'s `persistent_identity`). When set, this
+    /// standalone joiner hosts a STICKY identity: it reuses the same keypair AND
+    /// re-requests the same mesh ULA across restarts — what a long-lived
+    /// lifeline joiner needs so its address is stable. Takes PRECEDENCE over the
+    /// keypair-only default: when `--identity-path` is given the joiner ignores
+    /// the `$HOME/.tabbify-mesh/keypair` fallback entirely.
+    #[arg(long)]
+    pub identity_path: Option<PathBuf>,
+
     /// Heartbeat interval (seconds).
     #[arg(long, default_value_t = 20)]
     pub heartbeat_interval: u64,
@@ -208,4 +218,49 @@ pub struct LeaveArgs {
     /// `http://127.0.0.1:8888`.
     #[arg(long, env = "TABBIFY_MESH_COORDINATOR")]
     pub coordinator: Option<String>,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Parse a `join` invocation through the real top-level [`Cli`] (the actual
+    /// entrypoint) and return the inner [`JoinArgs`]. `argv` is the args AFTER
+    /// the binary name (e.g. `["join", "--name", "x", …]`).
+    fn parse_join(argv: &[&str]) -> JoinArgs {
+        let mut full = vec!["tabbify-mesh"];
+        full.extend_from_slice(argv);
+        match Cli::parse_from(full).cmd {
+            Cmd::Join(join_args) => *join_args,
+            other => panic!("expected Cmd::Join, got {other:?}"),
+        }
+    }
+
+    /// `--identity-path` parses into `JoinArgs::identity_path`.
+    #[test]
+    fn join_parses_identity_path() {
+        let args = parse_join(&[
+            "join",
+            "--coordinator",
+            "http://u",
+            "--name",
+            "lifeline",
+            "--identity-path",
+            "/x/id.json",
+        ]);
+        assert_eq!(
+            args.identity_path,
+            Some(PathBuf::from("/x/id.json")),
+            "--identity-path must populate JoinArgs::identity_path"
+        );
+    }
+
+    /// Omitting `--identity-path` leaves it `None` (the keypair-only default).
+    #[test]
+    fn join_identity_path_defaults_none() {
+        let args = parse_join(&["join", "--coordinator", "http://u", "--name", "x"]);
+        assert_eq!(args.identity_path, None);
+    }
 }
