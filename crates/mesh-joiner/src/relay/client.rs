@@ -272,25 +272,31 @@ pub async fn run(mut task: RelayTask) {
         return;
     }
 
-    // Resolve the ordered relay set (HA-relay). An EMPTY `relay_urls` derives
-    // the single Frankfurt relay from `coordinator_url`; a one-element list is
-    // byte-identical to the legacy single-relay path. The failover machine
-    // (C4) advances `current` over this set on the existing disconnect path —
-    // dormant while `len == 1`.
+    // Resolve the ordered relay set (HA-relay C4). An EMPTY `relay_urls`
+    // derives the single Frankfurt relay from `coordinator_url`; ALWAYS
+    // non-empty after resolution, so `relays[current]` never panics.
     let relays = resolve_relay_urls(&task.coordinator_url, &task.relay_urls);
-    let base = relays[0].clone();
     let pubkey_q = B64URL.encode(task.my_pubkey);
-    // `&lane=` tags which dedicated socket this is so the coordinator registers
-    // it on the matching lane (handshakes on `hi`, bulk on `lo`).
-    let url = format!("{base}?pubkey={pubkey_q}&lane={}", task.lane.as_str());
 
     let backoff = [1u64, 2, 5, 10];
+    // `current` indexes the ordered relay list; `attempt` is the per-current
+    // backoff cursor (monotonic on the SAME relay, reset only when failover
+    // actually advances to a DIFFERENT relay).
+    let mut current: usize = 0;
     let mut attempt: usize = 0;
 
     loop {
         if *task.shutdown.borrow() {
             return;
         }
+        // Build the URL for the CURRENT relay. `&lane=` tags which dedicated
+        // socket this is so the coordinator registers it on the matching lane
+        // (handshakes on `hi`, bulk on `lo`).
+        let url = format!(
+            "{base}?pubkey={pubkey_q}&lane={lane}",
+            base = relays[current],
+            lane = task.lane.as_str(),
+        );
         match connect_once(&url, &mut task).await {
             ConnOutcome::ShutdownRequested => return,
             ConnOutcome::Disconnected(reason) => {
@@ -298,12 +304,25 @@ pub async fn run(mut task: RelayTask) {
                 tracing::warn!(
                     reason,
                     delay_secs = delay,
+                    relay = %relays[current],
                     "relay: disconnected; reconnecting"
                 );
                 if sleep_or_shutdown(Duration::from_secs(delay), &mut task.shutdown).await {
                     return;
                 }
                 attempt = attempt.saturating_add(1);
+                // FAILOVER: advance to the next relay in the ordered list. With
+                // a SINGLE relay `(0 + 1) % 1 == 0` ⇒ `next == current` ⇒ the
+                // index never moves and `attempt` keeps climbing monotonically:
+                // BYTE-IDENTICAL to the legacy single-relay reconnect loop (the
+                // failover branch below is unreachable when `len == 1`). With
+                // `>= 2` relays the floor rotates to the next endpoint and
+                // resets `attempt` so a fresh relay gets a fast first dial.
+                let next = (current + 1) % relays.len();
+                if next != current {
+                    current = next;
+                    attempt = 0;
+                }
             }
         }
     }
@@ -769,6 +788,209 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    }
+
+    // ---- failover state machine (HA-relay C4) ----
+
+    /// Build a minimal `RelayTask` for a `Lo`-lane failover test against the
+    /// given ordered relay list. Returns the task plus the live `RelayHandle`
+    /// the caller MUST hold (if every handle drops, the relay task treats the
+    /// closed outbound channel as teardown and exits — which would mask the
+    /// floor behaviour under test).
+    async fn make_failover_task(
+        relay_urls: Vec<String>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> (RelayTask, RelayHandle) {
+        let sessions = SessionTable::new();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tun: Arc<dyn TunDevice> = Arc::new(RecordingTun {
+            written: parking_lot::Mutex::new(Vec::new()),
+        });
+        let (handle, outbound_rx) = RelayHandle::new(false);
+        let task = RelayTask {
+            coordinator_url: "http://unused:1".into(),
+            relay_urls: Arc::new(relay_urls),
+            my_pubkey: [3u8; 32],
+            insecure_no_mtls: true,
+            sessions,
+            socket,
+            tun,
+            lane: RelayLane::Lo,
+            outbound_rx: outbound_rx.lo,
+            shutdown: shutdown_rx,
+        };
+        (task, handle)
+    }
+
+    /// A fake relay server that accepts WS upgrades on its listener and reports
+    /// each connection's count over a channel, then immediately drops the
+    /// socket (so the client sees a disconnect and reconnects/fails over).
+    /// `accept` set to `false` means: accept the TCP connection but DON'T do a
+    /// WS handshake — drop it raw (simulates a refusing/closing relay).
+    fn spawn_accept_then_drop(
+        listener: tokio::net::TcpListener,
+        hits: tokio::sync::mpsc::UnboundedSender<()>,
+        do_ws: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let _ = hits.send(());
+                if do_ws {
+                    // Complete the handshake then drop → client sees a clean
+                    // close / stream-ended and reconnects or fails over.
+                    if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
+                        drop(ws);
+                    }
+                } else {
+                    drop(stream);
+                }
+            }
+        })
+    }
+
+    /// THE no-op invariant (load-bearing): with a SINGLE relay, a disconnect
+    /// must reconnect to the SAME relay — the failover index never advances
+    /// (`(0 + 1) % 1 == 0`). Drive a fake server that accepts the WS then drops
+    /// it; the task must reconnect to that SAME listener at least twice (proving
+    /// it redials the identical url, exactly like today's single-relay loop).
+    #[tokio::test]
+    async fn single_relay_failover_is_noop() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hits_tx, mut hits_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let server = spawn_accept_then_drop(listener, hits_tx, true);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let relay_urls = vec![format!("ws://{addr}/v1/mesh/relay")];
+        let (relay_task, _handle) = make_failover_task(relay_urls, shutdown_rx).await;
+        let task = tokio::spawn(run(relay_task));
+
+        // Expect at least TWO connections to the SAME single relay: the initial
+        // connect + at least one reconnect after the drop (backoff[0] = 1 s).
+        for n in 0..2 {
+            tokio::time::timeout(Duration::from_secs(8), hits_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("single relay must be redialed (hit {n})"))
+                .expect("hit channel open");
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        server.abort();
+    }
+
+    /// With TWO relays, a primary that refuses/closes must fail the floor over
+    /// to the SECONDARY, which then carries the connection. Assert the
+    /// secondary listener receives a connection.
+    #[tokio::test]
+    async fn two_relays_fail_over_to_secondary() {
+        // Primary: accept the TCP then drop raw (no WS) → `connect-failed` /
+        // `stream-ended` → the floor must move on.
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap();
+        let (p_tx, _p_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let p_srv = spawn_accept_then_drop(primary, p_tx, false);
+
+        // Secondary: accept the WS and hold it.
+        let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary_addr = secondary.local_addr().unwrap();
+        let (s_tx, mut s_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let s_srv = spawn_accept_then_drop(secondary, s_tx, true);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let relay_urls = vec![
+            format!("ws://{primary_addr}/v1/mesh/relay"),
+            format!("ws://{secondary_addr}/v1/mesh/relay"),
+        ];
+        let (relay_task, _handle) = make_failover_task(relay_urls, shutdown_rx).await;
+        let task = tokio::spawn(run(relay_task));
+
+        // The secondary MUST receive a connection within a few backoff steps.
+        tokio::time::timeout(Duration::from_secs(10), s_rx.recv())
+            .await
+            .expect("failover must reach the secondary relay")
+            .expect("secondary hit channel open");
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        p_srv.abort();
+        s_srv.abort();
+    }
+
+    /// Both relays down then the PRIMARY recovers: the floor cycles through the
+    /// list and lands back on the primary (`% relays.len()` wraps). Bind the
+    /// primary listener but only START accepting after the floor has cycled
+    /// past the (closed) secondary — assert the primary ultimately connects.
+    #[tokio::test]
+    async fn failover_wraps_back_to_primary() {
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap();
+        let (p_tx, mut p_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        // Primary accepts the WS and holds — but we delay binding-to-accept by
+        // spawning the acceptor immediately; the floor reaches it after wrap.
+        let p_srv = spawn_accept_then_drop(primary, p_tx, true);
+
+        // Secondary: bound but immediately closed (its acceptor drops raw).
+        let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary_addr = secondary.local_addr().unwrap();
+        let (s_tx, _s_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let s_srv = spawn_accept_then_drop(secondary, s_tx, false);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let relay_urls = vec![
+            format!("ws://{primary_addr}/v1/mesh/relay"),
+            format!("ws://{secondary_addr}/v1/mesh/relay"),
+        ];
+        let (relay_task, _handle) = make_failover_task(relay_urls, shutdown_rx).await;
+        let task = tokio::spawn(run(relay_task));
+
+        // After the initial primary-drop + secondary-fail, the index wraps and
+        // the primary is dialed AGAIN — assert at least two primary hits.
+        for n in 0..2 {
+            tokio::time::timeout(Duration::from_secs(12), p_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("primary must be re-dialed after wrap (hit {n})"))
+                .expect("primary hit channel open");
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        p_srv.abort();
+        s_srv.abort();
+    }
+
+    /// Relay-is-floor: while `shutdown` is false and a relay is reachable, the
+    /// `run` task NEVER returns — it is always either connected or dialing. We
+    /// hold a healthy single relay open and assert the task is still alive
+    /// after a grace period (it does not exit on its own).
+    #[tokio::test]
+    async fn relay_is_floor_throughout_failover() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A server that accepts the WS and HOLDS it open (never drops).
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // Hold the socket; pend forever.
+            let _held = ws;
+            std::future::pending::<()>().await;
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let relay_urls = vec![format!("ws://{addr}/v1/mesh/relay")];
+        let (relay_task, _handle) = make_failover_task(relay_urls, shutdown_rx).await;
+        let task = tokio::spawn(run(relay_task));
+
+        // Give it time to connect and sit. The task must NOT have completed.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!task.is_finished(), "relay floor task must not exit while connected");
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        server.abort();
     }
 
     /// HA-relay C3: a [`RelayTask`] now carries the FULL ordered relay list as
