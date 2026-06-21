@@ -2,16 +2,58 @@
 //! mesh, periodically refreshes the local status file, and gracefully
 //! deregisters on Ctrl-C.
 
+use std::net::Ipv6Addr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::cli::JoinArgs;
 use crate::joiner_api::{JoinConfig, Joiner};
 use crate::status_file::{self, StatusSnapshot};
+
+/// One-shot identity record written ONCE on a successful join when
+/// `--status-file <PATH>` is set (the supervisor's lifeline systemd unit
+/// points it at `<dataDir>/data/lifeline-status.json`).
+///
+/// Its sole purpose: after a supervisord crash wedges the in-process joiner,
+/// an operator reads this file to learn the standalone lifeline's node-id and
+/// addresses a Track-C signed restart command to it. Distinct from the
+/// running-daemon [`StatusSnapshot`] in `~/.tabbify-mesh/status.json`: this is
+/// the lifeline's STABLE address-of-record, not a live roster snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifelineStatus {
+    /// Coordinator-assigned peer id of this lifeline joiner (the Track-C target).
+    pub peer_id: Uuid,
+    /// This lifeline's mesh ULA.
+    pub ula: Ipv6Addr,
+    /// Display name advertised by this lifeline joiner.
+    pub name: String,
+}
+
+/// Atomically write `status` to `path` as pretty JSON (tmp file in the same
+/// dir, then rename — mirrors [`status_file::write_to`]). Creates parent dirs.
+///
+/// # Errors
+/// Returns an error if the parent dir cannot be created, the record cannot be
+/// serialized, or either the temp write or the rename fails.
+fn write_lifeline_status(path: &Path, status: &LifelineStatus) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create lifeline-status dir {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(status).context("serialize lifeline status")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
 
 /// Interval at which the daemon refreshes `~/.tabbify-mesh/status.json`.
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -115,6 +157,9 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     let name = args.name.clone();
     let tags = args.tags.clone();
     let super_admin_pubkey = args.super_admin_pubkey.clone();
+    // Lifeline identity record (Track-C address-of-record). Captured before
+    // `build_join_config` consumes `args`; written ONCE after a successful join.
+    let status_file = args.status_file.clone();
     // Track C (standalone lifeline sink): the reboot-guard sidecar lives next to
     // the identity file (the lifeline's data dir) when one is set, else in the
     // default `~/.tabbify-mesh` dir.
@@ -143,6 +188,22 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     println!("ula={my_ula}");
     println!("peers={} (initial snapshot)", initial_peers.len());
     println!("running. Ctrl-C to leave.");
+
+    // Track C: on a SUCCESSFUL join, record this lifeline's identity so an
+    // operator can address a signed restart command to its node-id after a
+    // supervisord crash. FATAL if it fails — the supervisor's lifeline unit
+    // depends on this file existing, so a silent write failure would leave the
+    // recovery lever unaddressable.
+    if let Some(path) = status_file.as_deref() {
+        let status = LifelineStatus {
+            peer_id: my_peer_id,
+            ula: my_ula,
+            name: name.clone(),
+        };
+        write_lifeline_status(path, &status)
+            .with_context(|| format!("write lifeline status file {}", path.display()))?;
+        println!("lifeline status written: {}", path.display());
+    }
 
     // Write the first status snapshot immediately so that `status` /
     // `peers` see a fresh file from the start. NON-FATAL: when multiple
@@ -253,4 +314,77 @@ async fn snapshot_under_lock(
         last_heartbeat_at: Utc::now(),
         pid: std::process::id(),
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn sample_status() -> LifelineStatus {
+        LifelineStatus {
+            peer_id: Uuid::from_u128(0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF),
+            ula: Ipv6Addr::from_str("fd5a:1f00:2:3::1").expect("parse ULA"),
+            name: "lifeline".to_string(),
+        }
+    }
+
+    /// `--status-file` write produces a JSON file whose round-trip equals the
+    /// source record (the post-join lifeline write contract, tested via the
+    /// helper directly with a known `peer_id` / `ula` / `name`).
+    #[test]
+    fn write_lifeline_status_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Nested path proves parent dirs are created (the systemd unit points
+        // at `<dataDir>/data/lifeline-status.json`).
+        let path = dir.path().join("data").join("lifeline-status.json");
+        let status = sample_status();
+
+        write_lifeline_status(&path, &status).expect("write_lifeline_status");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        let loaded: LifelineStatus = serde_json::from_slice(&bytes).expect("parse");
+        assert_eq!(loaded, status);
+    }
+
+    /// The persisted JSON carries exactly the operator-facing fields with their
+    /// expected values — `peer_id`, `ula`, `name`.
+    #[test]
+    fn write_lifeline_status_json_has_expected_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lifeline-status.json");
+        write_lifeline_status(&path, &sample_status()).expect("write");
+
+        let raw = std::fs::read_to_string(&path).expect("read raw");
+        for needle in ["peer_id", "ula", "name"] {
+            assert!(raw.contains(needle), "missing field {needle} in {raw}");
+        }
+        // The joiner peer id + ULA + display name land verbatim (Uuid serializes
+        // hyphenated; Ipv6Addr in its canonical compressed form).
+        assert!(
+            raw.contains("01234567-89ab-cdef-0123-456789abcdef"),
+            "peer_id uuid must be serialized: {raw}"
+        );
+        assert!(raw.contains("fd5a:1f00:2:3::1"), "ula must be serialized: {raw}");
+        assert!(raw.contains("lifeline"), "name must be serialized: {raw}");
+    }
+
+    /// A second write overwrites the file atomically (operator always reads the
+    /// latest identity).
+    #[test]
+    fn write_lifeline_status_overwrites() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lifeline-status.json");
+
+        let mut status = sample_status();
+        write_lifeline_status(&path, &status).expect("first write");
+
+        status.name = "lifeline-renamed".to_string();
+        write_lifeline_status(&path, &status).expect("second write");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        let loaded: LifelineStatus = serde_json::from_slice(&bytes).expect("parse");
+        assert_eq!(loaded.name, "lifeline-renamed");
+    }
 }

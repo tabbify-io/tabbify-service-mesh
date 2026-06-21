@@ -202,6 +202,17 @@ pub struct JoinArgs {
     /// coordinator-reflexive behaviour. Relay always stays the floor regardless.
     #[arg(long, env = "TABBIFY_MESH_STUN_SERVER")]
     pub mesh_stun_server: Option<SocketAddr>,
+
+    /// Path where, on a SUCCESSFUL join, this joiner atomically records its own
+    /// identity as `{ "peer_id", "ula", "name" }` JSON. The supervisor's
+    /// lifeline systemd unit points this at `<dataDir>/data/lifeline-status.json`
+    /// so that — after a supervisord crash wedges the in-process joiner — an
+    /// operator can read the standalone lifeline's node-id from this file and
+    /// address a Track-C signed restart command to it. Unset (default) ⇒ no
+    /// such file is written. This is SEPARATE from the running-daemon status
+    /// snapshot in `~/.tabbify-mesh/status.json`.
+    #[arg(long)]
+    pub status_file: Option<PathBuf>,
 }
 
 /// Arguments for the `peers` subcommand.
@@ -300,5 +311,31 @@ mod tests {
     fn join_super_admin_pubkey_defaults_none() {
         let args = parse_join(&["join", "--coordinator", "http://u", "--name", "x"]);
         assert_eq!(args.super_admin_pubkey, None);
+    }
+
+    /// `--status-file <path>` parses into `JoinArgs::status_file`.
+    #[test]
+    fn join_parses_status_file() {
+        let args = parse_join(&[
+            "join",
+            "--coordinator",
+            "http://u",
+            "--name",
+            "lifeline",
+            "--status-file",
+            "/x/lifeline-status.json",
+        ]);
+        assert_eq!(
+            args.status_file,
+            Some(PathBuf::from("/x/lifeline-status.json")),
+            "--status-file must populate JoinArgs::status_file"
+        );
+    }
+
+    /// Omitting `--status-file` leaves it `None` (no lifeline-status write).
+    #[test]
+    fn join_status_file_defaults_none() {
+        let args = parse_join(&["join", "--coordinator", "http://u", "--name", "x"]);
+        assert_eq!(args.status_file, None);
     }
 }
