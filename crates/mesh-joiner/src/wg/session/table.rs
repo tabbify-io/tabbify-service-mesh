@@ -75,6 +75,75 @@ pub struct SessionTable {
     /// has NOT tried to send since the last sample is idle and must never be
     /// judged a black hole (no TX ⇒ no expectation of RX). `0` = "never sent".
     last_send_attempt_ts: Arc<AtomicI64>,
+    /// Unix-micros of the LAST active IDLE LIVENESS PROBE the timer loop fired
+    /// (B-fix-1). Rate-limits that probe to one frame per
+    /// [`IDLE_PROBE_INTERVAL_MICROS`] so an ambiguously-idle node emits ONE
+    /// keepalive-sized frame per interval (advancing `last_send_attempt_ts`)
+    /// instead of a busy-loop. The probe's ONLY job is to break the fail-open
+    /// idle rule in `dataplane_healthy`: once it advances the send clock past
+    /// the RX clock, the UNCHANGED black-hole verdict can detect a node whose
+    /// data plane is wedged (no real RX in the 90s window) — the 2026-06-21 MSI
+    /// signature where a trickle of relay control frames masked a black hole.
+    /// `0` = "never probed". `Arc<AtomicI64>` like the other clocks so the
+    /// rate-limit is process-global across the cheap-clone table.
+    last_idle_probe_ts: Arc<AtomicI64>,
+}
+
+/// How long a node may be AMBIGUOUSLY IDLE before the active idle liveness
+/// probe starts firing (B-fix-1).
+///
+/// "Ambiguously idle" = peers present, no send since the last inbound, RX clock
+/// not fresh. 45s sits BELOW the 90s `DATAPLANE_RX_SILENCE_THRESHOLD_MICROS` so
+/// the probe has time to advance the send clock and let a genuine black hole
+/// age the RX clock out within one 90s window. Above the ~20s heartbeat /
+/// keepalive cadence so a normally quiet-but-live node (keepalives still
+/// round-tripping) never trips it.
+pub const IDLE_PROBE_AFTER_MICROS: i64 = 45_000_000;
+
+/// Minimum spacing between consecutive active idle liveness probes (B-fix-1).
+///
+/// At most one keepalive-sized frame per 30s — cheap, yet frequent enough that
+/// the send clock stays ahead of the RX clock across the 90s freshness window
+/// once a black hole sets in, so `dataplane_healthy` reliably flips unhealthy.
+pub const IDLE_PROBE_INTERVAL_MICROS: i64 = 30_000_000;
+
+/// Pure trigger for the active idle liveness probe (B-fix-1). Returns `true`
+/// when the node is AMBIGUOUSLY IDLE and should emit ONE keepalive frame to
+/// keep the data-plane liveness signal honest:
+///
+/// * **No peers** ⇒ `false` (nothing to probe toward — mirrors the
+///   `dataplane_healthy` no-peers fail-open).
+/// * **Genuinely fresh RX** (`now - last_rx < after_micros`) ⇒ `false`. The
+///   data plane is demonstrably alive; no probe needed.
+/// * **Already sending after the last RX** (`last_send > last_rx`) ⇒ `false`.
+///   The node is NOT idle — `dataplane_healthy` already owns this case (it can
+///   see the stale RX while sending and flip unhealthy on its own).
+/// * **Ambiguously idle** (peers present AND `last_send <= last_rx` AND
+///   `now - last_rx >= after_micros`) ⇒ `true`. This is the exact fail-open
+///   blind spot: idle (so judged healthy) yet RX is no longer fresh. Emit a
+///   probe so the send clock advances and the black-hole verdict can act.
+///
+/// Pure (`now` / clocks / threshold injected) and read-only, mirroring
+/// [`SessionTable::dataplane_healthy`]; the rate limit lives in
+/// [`SessionTable::should_emit_idle_probe`].
+#[must_use]
+pub const fn idle_probe_due(
+    now_micros: i64,
+    last_rx_micros: i64,
+    last_send_micros: i64,
+    has_peers: bool,
+    after_micros: i64,
+) -> bool {
+    if !has_peers {
+        return false;
+    }
+    // Not idle: a send already followed the last inbound — `dataplane_healthy`
+    // owns this case, no probe needed.
+    if last_send_micros > last_rx_micros {
+        return false;
+    }
+    // Idle: probe only once the RX clock has aged past the ambiguity window.
+    now_micros.saturating_sub(last_rx_micros) >= after_micros
 }
 
 /// Monotonic relaxed store: set `clock` to `now` only if `now` is later than
@@ -110,6 +179,10 @@ impl std::fmt::Debug for SessionTable {
             .field(
                 "last_send_attempt_ts",
                 &self.last_send_attempt_ts.load(Ordering::Relaxed),
+            )
+            .field(
+                "last_idle_probe_ts",
+                &self.last_idle_probe_ts.load(Ordering::Relaxed),
             )
             .finish()
     }
@@ -227,6 +300,55 @@ impl SessionTable {
         }
         // Sending: healthy iff the last inbound is within the freshness window.
         now_micros.saturating_sub(last_rx) < threshold_micros
+    }
+
+    /// Unix-micros of the last active idle liveness probe (B-fix-1). `0` =
+    /// none yet. Diagnostics / tests.
+    #[must_use]
+    pub fn last_idle_probe_ts(&self) -> i64 {
+        self.last_idle_probe_ts.load(Ordering::Relaxed)
+    }
+
+    /// Decide whether the timer loop should fire ONE active idle liveness probe
+    /// THIS tick (B-fix-1), CLAIMING the rate-limit slot when it returns `true`.
+    ///
+    /// Two gates compose:
+    /// 1. [`idle_probe_due`] — the pure ambiguous-idle trigger (peers present,
+    ///    idle, RX aged past `after_micros`).
+    /// 2. A per-table interval limiter (`interval_micros`): at most one probe
+    ///    per window, so an ambiguously-idle node emits ONE keepalive per
+    ///    interval — never a busy-loop. The first ever probe fires immediately
+    ///    (clock starts at `0`); thereafter the slot is claimed by stamping
+    ///    `last_idle_probe_ts` (relaxed CAS-free store, same rationale as the
+    ///    other liveness clocks — a racing double-read at worst emits one extra
+    ///    keepalive, which WG anti-replay / the relay floor make harmless).
+    ///
+    /// Read-then-claim is intentional: the caller emits the probe only when this
+    /// returns `true`, so claiming here keeps the side effect bounded to one
+    /// frame per interval regardless of the 200ms timer cadence.
+    pub fn should_emit_idle_probe(
+        &self,
+        now_micros: i64,
+        after_micros: i64,
+        interval_micros: i64,
+    ) -> bool {
+        if !idle_probe_due(
+            now_micros,
+            self.last_inbound_data_frame_ts(),
+            self.last_send_attempt_ts(),
+            !self.is_empty(),
+            after_micros,
+        ) {
+            return false;
+        }
+        // Rate-limit: claim the slot iff a full interval has elapsed.
+        let last = self.last_idle_probe_ts.load(Ordering::Relaxed);
+        if now_micros.saturating_sub(last) >= interval_micros {
+            self.last_idle_probe_ts.store(now_micros, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// Number of registered sessions.
@@ -423,6 +545,32 @@ impl SessionTable {
     /// poke every `Tunn::update_timers` periodically.
     pub fn snapshot(&self) -> Vec<Arc<PeerSession>> {
         self.by_ula.iter().map(|kv| kv.value().clone()).collect()
+    }
+
+    /// Pick ONE live peer to carry the active idle liveness probe (B-fix-1).
+    /// PREFERS a relay-anchored peer (one whose direct path is NOT confirmed —
+    /// the coordinator-relay is the floor for it, so the probe rides the relay
+    /// the black hole is suspected on) and falls back to any peer; ties broken
+    /// by the lowest ULA so the choice is STABLE across ticks (avoids
+    /// scattering probes). `None` only when the table is empty (the caller has
+    /// already gated on peers-present, so this is essentially infallible there).
+    #[must_use]
+    pub fn idle_probe_target(&self) -> Option<Arc<PeerSession>> {
+        let mut relay_anchored: Option<Arc<PeerSession>> = None;
+        let mut any: Option<Arc<PeerSession>> = None;
+        for kv in self.by_ula.iter() {
+            let session = kv.value();
+            let better = |cur: &Option<Arc<PeerSession>>| {
+                cur.as_ref().is_none_or(|c| session.ula < c.ula)
+            };
+            if !session.direct_confirmed() && better(&relay_anchored) {
+                relay_anchored = Some(session.clone());
+            }
+            if better(&any) {
+                any = Some(session.clone());
+            }
+        }
+        relay_anchored.or(any)
     }
 
     /// Insert or replace a peer's session.
@@ -775,5 +923,204 @@ mod liveness_tests {
         t.note_inbound_data_frame(100_000_000);
         t.note_send_attempt(100_000_000);
         assert!(t.dataplane_healthy(100_000_000 + TH / 2, TH));
+    }
+
+    // ---- B-fix-1: active idle liveness probe trigger ----
+
+    /// Probe-after threshold for the pure-trigger tests (45s, mirrors
+    /// [`IDLE_PROBE_AFTER_MICROS`]).
+    const AFTER: i64 = IDLE_PROBE_AFTER_MICROS;
+
+    /// THE ambiguous-idle case the probe exists for: peers present, NO send
+    /// since the last inbound (idle ⇒ `dataplane_healthy` would fail-OPEN), and
+    /// the RX clock aged PAST the probe-after window. `idle_probe_due` ⇒ true.
+    /// This is the exact 2026-06-21 blind spot — a trickle of relay frames kept
+    /// RX < 90s while no data round-tripped, so the node read healthy forever.
+    #[test]
+    fn idle_probe_due_when_ambiguously_idle_and_rx_aged() {
+        // last_rx at 10s, no later send (last_send <= last_rx), now well past
+        // the 45s ambiguity window.
+        assert!(idle_probe_due(
+            10_000_000 + AFTER + 1,
+            10_000_000, // last_rx
+            10_000_000, // last_send == last_rx ⇒ idle
+            true,       // peers present
+            AFTER,
+        ));
+    }
+
+    /// RX returns FRESH (`now - last_rx < after`) ⇒ NO probe. The data plane is
+    /// demonstrably alive, so the idle probe must not fire — this is the
+    /// "+RX-returns ⇒ healthy" direction (the probe stops once real RX resumes).
+    #[test]
+    fn idle_probe_not_due_when_rx_fresh() {
+        assert!(!idle_probe_due(
+            10_000_000 + AFTER / 2, // RX age < after ⇒ fresh
+            10_000_000,
+            10_000_000,
+            true,
+            AFTER,
+        ));
+    }
+
+    /// Genuinely-fresh RX at the very edge (RX age just under the window) ⇒ no
+    /// probe; the same clocks one tick later (RX age == window) ⇒ probe due.
+    /// Pins the boundary so the 45s threshold is exact.
+    #[test]
+    fn idle_probe_boundary_is_exact() {
+        assert!(
+            !idle_probe_due(10_000_000 + AFTER - 1, 10_000_000, 10_000_000, true, AFTER),
+            "one micro under the window is still fresh ⇒ no probe"
+        );
+        assert!(
+            idle_probe_due(10_000_000 + AFTER, 10_000_000, 10_000_000, true, AFTER),
+            "exactly at the window the probe is due"
+        );
+    }
+
+    /// NOT idle — a send already followed the last inbound (`last_send >
+    /// last_rx`) ⇒ NO probe. `dataplane_healthy` already owns this case (it can
+    /// see the stale RX while sending and flip unhealthy itself), so the probe
+    /// must not double up.
+    #[test]
+    fn idle_probe_not_due_when_already_sending() {
+        assert!(!idle_probe_due(
+            10_000_000 + AFTER * 5,
+            10_000_000, // last_rx
+            20_000_000, // last_send AFTER rx ⇒ not idle
+            true,
+            AFTER,
+        ));
+    }
+
+    /// No peers ⇒ NO probe — mirrors the `dataplane_healthy` no-peers fail-open
+    /// (nothing to probe toward).
+    #[test]
+    fn idle_probe_not_due_without_peers() {
+        assert!(!idle_probe_due(
+            10_000_000 + AFTER * 5,
+            10_000_000,
+            10_000_000,
+            false, // no peers
+            AFTER,
+        ));
+    }
+
+    /// The end-to-end table gate composes the trigger with the per-table
+    /// interval limiter: an ambiguously-idle table emits the FIRST probe
+    /// immediately (clock starts at 0), then SUPPRESSES a second probe within
+    /// `IDLE_PROBE_INTERVAL_MICROS`, then ALLOWS one again past the interval —
+    /// one keepalive per window, never a busy-loop.
+    #[test]
+    fn should_emit_idle_probe_is_rate_limited() {
+        let t = table_with_one_peer();
+        // Drive into ambiguous-idle: an inbound at 10s, no later send.
+        t.note_inbound_data_frame(10_000_000);
+        let base = 10_000_000 + AFTER; // first moment the probe is due
+        assert!(
+            t.should_emit_idle_probe(base, AFTER, IDLE_PROBE_INTERVAL_MICROS),
+            "first probe fires once the ambiguity window is reached"
+        );
+        assert!(
+            !t.should_emit_idle_probe(base + 1, AFTER, IDLE_PROBE_INTERVAL_MICROS),
+            "a second probe within the interval is suppressed"
+        );
+        assert!(
+            t.should_emit_idle_probe(
+                base + IDLE_PROBE_INTERVAL_MICROS,
+                AFTER,
+                IDLE_PROBE_INTERVAL_MICROS
+            ),
+            "a probe fires again once a full interval has elapsed"
+        );
+    }
+
+    /// The gate claims the rate-limit slot ONLY when it actually emits: a
+    /// not-due call (fresh RX) must NOT stamp `last_idle_probe_ts`, so a later
+    /// genuinely-due tick still fires immediately. Guards against a fresh-RX
+    /// tick silently consuming the interval.
+    #[test]
+    fn should_emit_idle_probe_does_not_claim_when_not_due() {
+        let t = table_with_one_peer();
+        t.note_inbound_data_frame(10_000_000);
+        // Fresh RX ⇒ not due ⇒ must not claim the slot.
+        assert!(!t.should_emit_idle_probe(10_000_000 + AFTER / 2, AFTER, IDLE_PROBE_INTERVAL_MICROS));
+        assert_eq!(t.last_idle_probe_ts(), 0, "a not-due call must not stamp");
+        // Now genuinely due → fires immediately (slot was never consumed).
+        assert!(t.should_emit_idle_probe(10_000_000 + AFTER, AFTER, IDLE_PROBE_INTERVAL_MICROS));
+    }
+
+    /// END-TO-END liveness chain (the whole point of B-fix-1): an
+    /// ambiguously-idle node reads HEALTHY under `dataplane_healthy` (the
+    /// fail-open blind spot). After the probe stamps the send clock, the
+    /// UNCHANGED verdict flips UNHEALTHY because RX is still stale — and once
+    /// real RX returns it is healthy again.
+    #[test]
+    fn probe_then_no_rx_makes_dataplane_unhealthy() {
+        let t = table_with_one_peer();
+        t.note_inbound_data_frame(10_000_000); // last RX at 10s, no send after
+        let now = 10_000_000 + TH + 1; // past the 90s RX-silence threshold
+        // BEFORE the probe: idle ⇒ fail-open ⇒ judged HEALTHY despite stale RX.
+        assert!(
+            t.dataplane_healthy(now, TH),
+            "the fail-open idle rule masks the black hole before any probe"
+        );
+        // The probe fires (ambiguous-idle) and stamps the send clock.
+        assert!(t.should_emit_idle_probe(now, AFTER, IDLE_PROBE_INTERVAL_MICROS));
+        t.note_send_attempt(now); // the probe's send_wire would do this
+        // AFTER the probe: sending + stale RX ⇒ UNHEALTHY (black hole exposed).
+        assert!(
+            !t.dataplane_healthy(now, TH),
+            "with the send clock advanced past a stale RX, the verdict flips unhealthy"
+        );
+        // RX RETURNS: a real inbound refreshes the clock ⇒ healthy again.
+        t.note_inbound_data_frame(now);
+        assert!(
+            t.dataplane_healthy(now, TH),
+            "once real RX resumes the node is healthy again"
+        );
+    }
+
+    /// `idle_probe_target` prefers a RELAY-ANCHORED peer (direct NOT confirmed)
+    /// and breaks ties by the lowest ULA so the choice is stable across ticks.
+    #[test]
+    fn idle_probe_target_prefers_relay_anchored_lowest_ula() {
+        let me = StaticSecret::from([9u8; 32]);
+        let mk = |ula: &str, pk: u8| crate::peer::PeerInfo {
+            peer_id: uuid::Uuid::nil(),
+            wg_public_key: *PublicKey::from(&StaticSecret::from([pk; 32])).as_bytes(),
+            ula: ula.parse().unwrap(),
+            listen_endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+            display_name: "peer".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            software_version: None,
+            mesh_version: None,
+            joined_at_micros: 0,
+        };
+        let t = SessionTable::new();
+        t.upsert(&me, &mk("fd5a:1f00:1::3", 3));
+        t.upsert(&me, &mk("fd5a:1f00:1::1", 4));
+        t.upsert(&me, &mk("fd5a:1f00:1::2", 5));
+        // All unconfirmed (relay-anchored) ⇒ lowest ULA wins.
+        let target = t.idle_probe_target().expect("a target exists");
+        let lowest: Ipv6Addr = "fd5a:1f00:1::1".parse().unwrap();
+        assert_eq!(target.ula, lowest);
+        // Confirm the lowest-ULA peer's direct path: it is no longer
+        // relay-anchored, so the next-lowest UNCONFIRMED peer is preferred.
+        target.confirm_direct(1);
+        let next = t.idle_probe_target().expect("a target still exists");
+        let second: Ipv6Addr = "fd5a:1f00:1::2".parse().unwrap();
+        assert_eq!(
+            next.ula, second,
+            "a confirmed-direct peer is skipped in favour of a relay-anchored one"
+        );
+    }
+
+    /// An empty table has no probe target (the caller gates on peers-present,
+    /// but the picker is defensively `None`).
+    #[test]
+    fn idle_probe_target_none_when_empty() {
+        assert!(SessionTable::new().idle_probe_target().is_none());
     }
 }

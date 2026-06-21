@@ -42,7 +42,7 @@ mod tests;
 
 pub use peer_session::PeerSession;
 pub use route_sink::RouteSink;
-pub use table::SessionTable;
+pub use table::{IDLE_PROBE_AFTER_MICROS, IDLE_PROBE_INTERVAL_MICROS, SessionTable, idle_probe_due};
 
 use boringtun::noise::TunnResult;
 

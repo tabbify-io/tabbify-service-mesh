@@ -590,8 +590,74 @@ pub(crate) async fn timer_loop(
                         send_wire(&socket, sessions.relay(), &sessions, &session, bytes).await;
                     }
                 }
+                // B-fix-1: active idle liveness probe. After the per-session
+                // timer pass, if this node is AMBIGUOUSLY IDLE (peers present,
+                // no send since the last inbound, RX aged past
+                // IDLE_PROBE_AFTER_MICROS) emit ONE keepalive-sized frame so the
+                // send clock advances. With the send clock now ahead of a stale
+                // RX clock, the UNCHANGED `dataplane_healthy` verdict can detect
+                // a genuine black hole within the 90s window — closing the
+                // fail-open idle blind spot a trickle of relay control frames
+                // exploited on 2026-06-21. Rate-limited to one frame /
+                // IDLE_PROBE_INTERVAL_MICROS (no busy-loop).
+                maybe_idle_probe(&socket, &sessions, now).await;
             }
         }
+    }
+}
+
+/// Fire ONE active idle liveness probe when warranted (B-fix-1). GATED to a
+/// `relay_only` LOCAL node (Leo's default): a non-`relay_only` node with a live
+/// LAN/direct path keeps its RX clock fresh via WG keepalives, so it is never
+/// ambiguously idle in this sense and must not pay the extra probe. A
+/// `relay_only` node (the MSI black-hole case) rides the relay floor for every
+/// frame, so a trickle of relayed control frames can mask a wedged data plane —
+/// exactly what the probe forces into the open.
+///
+/// When [`SessionTable::should_emit_idle_probe`] claims the rate-limit slot,
+/// pick an anchor peer ([`SessionTable::idle_probe_target`], prefers a
+/// relay-anchored one), force a keepalive-sized frame out of its `Tunn`
+/// (`encapsulate(&[], …)` — the same empty-encapsulate boringtun turns into a
+/// keepalive / handshake-init), and route it through [`send_wire`]. `send_wire`
+/// preserves the relay floor AND stamps `last_send_attempt_ts` — the whole
+/// point of the probe. No-op (no claim, no frame) on a non-`relay_only` node, a
+/// peerless node, a fresh-RX node, or an already-sending node.
+async fn maybe_idle_probe(socket: &UdpSocket, sessions: &SessionTable, now: i64) {
+    // Gate: only a relay_only local node probes (see fn doc). No relay handle
+    // ⇒ direct-only / `--no-relay` ⇒ not the black-hole class this targets.
+    let Some(relay) = sessions.relay() else {
+        return;
+    };
+    if !relay.relay_only() {
+        return;
+    }
+    if !sessions.should_emit_idle_probe(
+        now,
+        crate::wg::session::IDLE_PROBE_AFTER_MICROS,
+        crate::wg::session::IDLE_PROBE_INTERVAL_MICROS,
+    ) {
+        return;
+    }
+    let Some(session) = sessions.idle_probe_target() else {
+        return; // peerless (already gated, but stay defensive)
+    };
+    // Force a keepalive-sized frame: an empty-packet encapsulate yields a WG
+    // keepalive (or a handshake-init if no session is up yet) — small, and the
+    // exact shape the timer's own keepalives take.
+    let action: WgAction = {
+        let mut out = vec![0u8; MAX_UDP_FRAME];
+        let mut tunn = session.tunn.lock().await;
+        classify_tunn_result(tunn.encapsulate(&[], &mut out))
+    };
+    if let WgAction::SendToPeer(bytes) = action {
+        tracing::debug!(
+            peer = %session.peer_id,
+            ula = %session.ula,
+            "idle_probe: emitting keepalive to keep the liveness signal honest (B-fix-1)"
+        );
+        // Rides the relay floor (relay_only ⇒ no direct probe) and stamps
+        // `last_send_attempt_ts`, advancing the send clock past a stale RX.
+        send_wire(socket, sessions.relay(), sessions, &session, bytes).await;
     }
 }
 
@@ -1288,6 +1354,151 @@ mod tests {
         assert!(
             table.last_send_attempt_ts() > 0,
             "send_wire must stamp the send-attempt clock"
+        );
+    }
+
+    // ---- B-fix-1: active idle liveness probe (timer loop seam) ----
+
+    use crate::wg::session::IDLE_PROBE_AFTER_MICROS;
+
+    /// Build a `relay_only` (or not) table with one passive (relay-floored)
+    /// peer that is driven into AMBIGUOUS IDLE: an inbound frame at `rx_at` and
+    /// NO later send. Returns the table + a relay receiver to observe probes.
+    fn ambiguously_idle_table(
+        relay_only: bool,
+        rx_at: i64,
+    ) -> (SessionTable, crate::relay::client::RelayOutboundRx) {
+        let (relay, rx) = crate::relay::RelayHandle::new(relay_only);
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let _session = upsert_peer(&table, "fd5a:1f00:1::1", None); // passive → relay floor
+        table.note_inbound_data_frame(rx_at);
+        (table, rx)
+    }
+
+    /// THE fix, end to end at the timer seam: a `relay_only` node that is
+    /// AMBIGUOUSLY IDLE (peers present, no send since the last inbound, RX aged
+    /// past the window) emits ONE keepalive-sized frame over the relay when
+    /// `maybe_idle_probe` runs — advancing `last_send_attempt_ts` so the
+    /// black-hole verdict can act. The relayed payload is a real WG frame
+    /// (non-empty), and the send clock is stamped.
+    #[tokio::test]
+    async fn relay_only_idle_node_emits_probe() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (table, mut rx) = ambiguously_idle_table(true, 10_000_000);
+        let now = 10_000_000 + IDLE_PROBE_AFTER_MICROS + 1;
+        assert_eq!(table.last_send_attempt_ts(), 0, "idle: no send yet");
+
+        maybe_idle_probe(&socket, &table, now).await;
+
+        let out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("an ambiguously-idle relay_only node must emit a probe")
+            .expect("relay channel delivered the probe");
+        assert!(!out.payload.is_empty(), "the probe is a real WG keepalive/init");
+        assert!(
+            table.last_send_attempt_ts() >= now,
+            "the probe must advance the send clock (the whole point)"
+        );
+    }
+
+    /// NON-`relay_only` node: the active idle probe is GATED OFF (Leo's
+    /// default). A node with a live direct/LAN path keeps its RX clock fresh via
+    /// WG keepalives, so it is never ambiguously idle in this sense and must not
+    /// pay the extra probe. Even when driven into the same idle state, nothing
+    /// is relayed and the send clock stays `0`.
+    #[tokio::test]
+    async fn non_relay_only_idle_node_does_not_probe() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (table, mut rx) = ambiguously_idle_table(false, 10_000_000);
+        let now = 10_000_000 + IDLE_PROBE_AFTER_MICROS + 1;
+
+        maybe_idle_probe(&socket, &table, now).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "a non-relay_only node must never emit the idle probe"
+        );
+        assert_eq!(
+            table.last_send_attempt_ts(),
+            0,
+            "no probe ⇒ the send clock stays untouched"
+        );
+    }
+
+    /// A `relay_only` node with GENUINELY FRESH RX (a real frame round-tripped
+    /// within the window) must NOT probe — the data plane is provably alive.
+    /// This is the "+RX-returns ⇒ no probe" direction at the seam.
+    #[tokio::test]
+    async fn relay_only_fresh_rx_node_does_not_probe() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (table, mut rx) = ambiguously_idle_table(true, 10_000_000);
+        // Now is WITHIN the ambiguity window ⇒ RX is fresh ⇒ no probe.
+        let now = 10_000_000 + IDLE_PROBE_AFTER_MICROS / 2;
+
+        maybe_idle_probe(&socket, &table, now).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "fresh RX ⇒ no idle probe"
+        );
+    }
+
+    /// No busy-loop at the seam: the 200ms timer pumps `maybe_idle_probe` many
+    /// times in quick succession while the node stays idle, but it emits exactly
+    /// ONE probe — the rate limiter (and the now-advanced send clock that ends
+    /// the idle state) suppress every immediate follow-up. This pins the
+    /// "bounded, no unbounded probe" contract. (The interval-elapsed re-arm of
+    /// the pure rate limiter is covered by the table-level
+    /// `should_emit_idle_probe_is_rate_limited`, which injects clocks instead of
+    /// the real wall-clock `send_wire` stamps.)
+    #[tokio::test]
+    async fn idle_probe_no_busy_loop_at_seam() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (table, mut rx) = ambiguously_idle_table(true, 10_000_000);
+        let now = 10_000_000 + IDLE_PROBE_AFTER_MICROS + 1;
+
+        // Pump the seam like the 200ms timer would in a single idle stretch.
+        for i in 0..10 {
+            maybe_idle_probe(&socket, &table, now + i).await;
+        }
+
+        // Exactly ONE frame relayed across all those ticks.
+        let first = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("first probe relayed")
+            .expect("relay channel");
+        assert!(!first.payload.is_empty(), "the probe is a real WG frame");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "repeated idle ticks must not emit a second probe (no busy-loop)"
+        );
+    }
+
+    /// A peerless `relay_only` node never probes (mirrors the no-peers fail-open
+    /// in `dataplane_healthy`): with no sessions there is nothing to probe.
+    #[tokio::test]
+    async fn idle_probe_no_op_without_peers() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (relay, mut rx) = crate::relay::RelayHandle::new(true);
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        // No peers, but force the clocks so the only thing stopping a probe is
+        // peers-present.
+        table.note_inbound_data_frame(10_000_000);
+        let now = 10_000_000 + IDLE_PROBE_AFTER_MICROS + 1;
+
+        maybe_idle_probe(&socket, &table, now).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "a peerless node must not probe"
         );
     }
 }
