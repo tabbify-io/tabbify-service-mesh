@@ -220,6 +220,36 @@ pub fn derive_relay_url(coordinator_url: &str, relay_url: Option<&str>) -> Strin
     format!("{scheme}://{rest}/v1/mesh/relay")
 }
 
+/// Resolve the ORDERED relay endpoint set the connectivity floor fails over
+/// across (HA-relay C2). This replaces the single-value [`derive_relay_url`] at
+/// the wiring layer while preserving its exact semantics for the single-relay
+/// case.
+///
+/// - `configured` EMPTY ⇒ `vec![derive_relay_url(coordinator_url, None)]` — the
+///   legacy single-relay derivation, byte-identical to today.
+/// - `configured` NON-EMPTY ⇒ each entry verbatim (the "explicit overrides
+///   derivation" rule, applied per-entry), de-duplicated while preserving
+///   first-seen order so an accidental double-listing cannot conjure a phantom
+///   2nd relay (which would falsely arm the failover branch over one endpoint).
+///
+/// The result is ALWAYS non-empty (a derived single when nothing is
+/// configured), so the relay floor always has at least one URL to dial. A
+/// one-element result keeps the failover machine's index pinned at 0
+/// (`(0 + 1) % 1 == 0`) — the no-op invariant.
+#[must_use]
+pub fn resolve_relay_urls(coordinator_url: &str, configured: &[String]) -> Vec<String> {
+    if configured.is_empty() {
+        return vec![derive_relay_url(coordinator_url, None)];
+    }
+    let mut out: Vec<String> = Vec::with_capacity(configured.len());
+    for url in configured {
+        if !out.iter().any(|seen| seen == url) {
+            out.push(url.clone());
+        }
+    }
+    out
+}
+
 /// Persistent relay client task: connect to the coordinator's relay
 /// endpoint, drain queued outbound datagrams onto the socket, and inject
 /// inbound relayed datagrams back into boringtun. Reconnects with a
@@ -238,7 +268,13 @@ pub async fn run(mut task: RelayTask) {
         return;
     }
 
-    let base = derive_relay_url(&task.coordinator_url, task.relay_url.as_deref());
+    // Resolve the ordered relay set (HA-relay). With today's single-value
+    // `relay_url` this yields a ONE-element list — identical to the legacy
+    // `derive_relay_url` call — so the failover machine (C4) stays dormant.
+    // The full multi-relay list is threaded in C3.
+    let configured: Vec<String> = task.relay_url.iter().cloned().collect();
+    let relays = resolve_relay_urls(&task.coordinator_url, &configured);
+    let base = relays[0].clone();
     let pubkey_q = B64URL.encode(task.my_pubkey);
     // `&lane=` tags which dedicated socket this is so the coordinator registers
     // it on the matching lane (handshakes on `hi`, bulk on `lo`).
@@ -466,6 +502,63 @@ mod tests {
         assert_eq!(
             derive_relay_url("http://x:1", Some("ws://override:9/v1/mesh/relay")),
             "ws://override:9/v1/mesh/relay"
+        );
+    }
+
+    // ---- multi-relay resolution (HA-relay C2) ----
+
+    /// An EMPTY configured list ⇒ derive the single default from the
+    /// coordinator URL — exactly the legacy single-relay behaviour. This is
+    /// the back-compat path: a node that never sets `relay_urls` still floors
+    /// on the one Frankfurt relay.
+    #[test]
+    fn resolve_empty_derives_single() {
+        assert_eq!(
+            resolve_relay_urls("http://3.124.69.92:8888", &[]),
+            vec!["ws://3.124.69.92:8888/v1/mesh/relay".to_owned()]
+        );
+    }
+
+    /// A non-empty list is taken VERBATIM, order preserved (explicit overrides
+    /// derivation per-entry). The coordinator URL is ignored when the list is
+    /// non-empty.
+    #[test]
+    fn resolve_keeps_explicit_verbatim() {
+        assert_eq!(
+            resolve_relay_urls(
+                "http://ignored:1",
+                &["wss://a/x".to_owned(), "wss://b/x".to_owned()]
+            ),
+            vec!["wss://a/x".to_owned(), "wss://b/x".to_owned()]
+        );
+    }
+
+    /// A duplicated entry collapses while preserving first-seen order, so an
+    /// accidental double-listing never creates a phantom 2nd relay (which
+    /// would arm the failover branch over what is really one endpoint).
+    #[test]
+    fn resolve_dedups_preserving_order() {
+        assert_eq!(
+            resolve_relay_urls(
+                "http://ignored:1",
+                &[
+                    "wss://a/x".to_owned(),
+                    "wss://b/x".to_owned(),
+                    "wss://a/x".to_owned(),
+                ]
+            ),
+            vec!["wss://a/x".to_owned(), "wss://b/x".to_owned()]
+        );
+    }
+
+    /// THE no-op invariant: a single explicit relay resolves to exactly that
+    /// one URL — a one-element list, so the failover machine's `current` can
+    /// never advance (`(0+1) % 1 == 0`). Byte-identical to today.
+    #[test]
+    fn resolve_single_is_identical_to_today() {
+        assert_eq!(
+            resolve_relay_urls("http://ignored:1", &["wss://a/x".to_owned()]),
+            vec!["wss://a/x".to_owned()]
         );
     }
 
