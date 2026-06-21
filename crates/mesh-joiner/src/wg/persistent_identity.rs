@@ -141,6 +141,13 @@ pub fn store(path: &Path, keypair: &WgKeypair, ula: Ipv6Addr) -> io::Result<()> 
     Ok(())
 }
 
+/// The quarantine path for a torn identity file: `<path>.corrupt`.
+fn corrupt_path(path: &Path) -> std::path::PathBuf {
+    let mut os = path.as_os_str().to_owned();
+    os.push(".corrupt");
+    std::path::PathBuf::from(os)
+}
+
 /// Load an existing identity if present, otherwise generate a fresh keypair
 /// (without persisting — the ULA is not known yet at this stage).
 ///
@@ -149,13 +156,44 @@ pub fn store(path: &Path, keypair: &WgKeypair, ula: Ipv6Addr) -> io::Result<()> 
 /// `sticky_ula` is `None` and the caller should call [`store`] after the
 /// coordinator returns the assigned ULA.
 ///
+/// # Corrupt-identity quarantine
+///
+/// A TORN identity file (truncated write, disk corruption, a half-flushed
+/// crash) surfaces [`ErrorKind::InvalidData`] from [`load`]. Such a file must
+/// NEVER brick the box: instead of propagating the error (which would hard-exit
+/// the joiner pre-network and strand a remote-only worker like MSI), we
+/// best-effort RENAME the torn file to `<path>.corrupt` (preserving it for
+/// post-mortem) and fall through to a FRESH keypair — the node simply re-joins
+/// with a new identity + a coordinator-allocated ULA. A failed rename is logged
+/// and ignored; we still proceed with a fresh keypair rather than fail.
+///
 /// # Errors
 ///
-/// Propagates filesystem errors from [`load`].
+/// Propagates only NON-`InvalidData` filesystem errors from [`load`] (a real
+/// transient I/O fault the caller should surface, not a corrupt-data brick).
 pub fn load_or_fresh(path: &Path) -> io::Result<(WgKeypair, Option<Ipv6Addr>)> {
-    match load(path)? {
-        Some(id) => Ok((id.keypair, Some(id.ula))),
-        None => Ok((generate(), None)),
+    match load(path) {
+        Ok(Some(id)) => Ok((id.keypair, Some(id.ula))),
+        Ok(None) => Ok((generate(), None)),
+        Err(e) if e.kind() == ErrorKind::InvalidData => {
+            let quarantine = corrupt_path(path);
+            match fs::rename(path, &quarantine) {
+                Ok(()) => tracing::warn!(
+                    identity_path = %path.display(),
+                    quarantine = %quarantine.display(),
+                    error = %e,
+                    "joiner: torn mesh-identity.json quarantined → fresh keypair (re-joins with a new ULA; the box must never brick on a corrupt identity)"
+                ),
+                Err(rename_err) => tracing::error!(
+                    identity_path = %path.display(),
+                    error = %e,
+                    rename_error = %rename_err,
+                    "joiner: torn mesh-identity.json could not be renamed; proceeding with a fresh keypair anyway"
+                ),
+            }
+            Ok((generate(), None))
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -305,6 +343,33 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
         let err = load(&path).expect_err("must fail on bad ULA");
         assert_eq!(err.kind(), ErrorKind::InvalidData, "err: {err}");
+    }
+
+    /// A torn / corrupt identity file must NEVER brick the box: `load_or_fresh`
+    /// quarantines it (renames to `<path>.corrupt`) and returns a FRESH keypair
+    /// with no sticky ULA, so the node re-joins instead of hard-exiting on a
+    /// `InvalidData` load error.
+    #[test]
+    fn load_or_fresh_quarantines_torn_file_and_returns_fresh() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("mesh-identity.json");
+        // A torn write: valid-looking JSON object but garbage that fails to
+        // parse into IdentityFile / decode — surfaces InvalidData from `load`.
+        fs::write(&path, b"{ this is not valid json").unwrap();
+
+        let (_, sticky) = load_or_fresh(&path).expect("must not hard-error on torn identity");
+        assert!(sticky.is_none(), "fresh keypair → no sticky ULA");
+
+        let corrupt = corrupt_path(&path);
+        assert!(
+            corrupt.exists(),
+            "torn file must be quarantined to {}",
+            corrupt.display()
+        );
+        assert!(
+            !path.exists(),
+            "the original torn path must be gone (renamed to .corrupt)"
+        );
     }
 
     /// On Unix, the stored file must have mode 0600 (owner read/write only).
