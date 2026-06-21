@@ -162,12 +162,17 @@ pub struct JoinArgs {
     #[arg(long)]
     pub no_relay: bool,
 
-    /// Explicit relay endpoint URL, OVERRIDING the default derivation from
-    /// `--coordinator`. Normally unset: the joiner derives
-    /// `ws(s)://<coordinator-host>/v1/mesh/relay`. Set only when the relay
-    /// lives at a non-default location.
-    #[arg(long, env = "TABBIFY_MESH_RELAY_URL")]
-    pub relay_url: Option<String>,
+    /// Explicit relay endpoint URL(s), OVERRIDING the default derivation from
+    /// `--coordinator`. REPEATABLE for HA-relay failover (primary first):
+    /// `--relay-url wss://a/v1/mesh/relay --relay-url wss://b/v1/mesh/relay`.
+    /// The `TABBIFY_MESH_RELAY_URL` env stays a SINGLE var but accepts a
+    /// COMMA-separated list (`value_delimiter = ','`) so a systemd/compose
+    /// drop-in ships the failover list with no new env var — the prod rollout
+    /// lever. Normally unset: the joiner derives
+    /// `ws(s)://<coordinator-host>/v1/mesh/relay`. A single value is
+    /// byte-identical to today (one-element list ⇒ failover dormant).
+    #[arg(long = "relay-url", env = "TABBIFY_MESH_RELAY_URL", value_delimiter = ',')]
+    pub relay_url: Vec<String>,
 
     /// Declare this peer RELAY-ONLY: it has no reachable direct endpoint
     /// (e.g. it runs in a container netns with no inbound mesh port). The
@@ -337,5 +342,70 @@ mod tests {
     fn join_status_file_defaults_none() {
         let args = parse_join(&["join", "--coordinator", "http://u", "--name", "x"]);
         assert_eq!(args.status_file, None);
+    }
+
+    /// HA-relay C7: `--relay-url` is REPEATABLE — multiple flags accumulate into
+    /// the ordered failover list (primary first).
+    #[test]
+    fn join_parses_repeated_relay_url() {
+        let args = parse_join(&[
+            "join",
+            "--coordinator",
+            "http://u",
+            "--name",
+            "x",
+            "--relay-url",
+            "wss://a/v1/mesh/relay",
+            "--relay-url",
+            "wss://b/v1/mesh/relay",
+        ]);
+        assert_eq!(
+            args.relay_url,
+            vec![
+                "wss://a/v1/mesh/relay".to_owned(),
+                "wss://b/v1/mesh/relay".to_owned()
+            ],
+            "repeated --relay-url must accumulate in order"
+        );
+    }
+
+    /// HA-relay C7: a COMMA-separated value splits into the ordered list. This
+    /// is the SAME `value_delimiter = ','` code path clap applies to the
+    /// `TABBIFY_MESH_RELAY_URL` env value (the prod rollout lever — one
+    /// systemd/compose drop-in, no new env var). Driven via a comma-bearing
+    /// flag so the test never mutates the (workspace-`deny(unsafe_code)`)
+    /// process environment.
+    #[test]
+    fn join_parses_comma_env_relay_url() {
+        let args = parse_join(&[
+            "join",
+            "--coordinator",
+            "http://u",
+            "--name",
+            "x",
+            "--relay-url",
+            "wss://a/v1/mesh/relay,wss://b/v1/mesh/relay",
+        ]);
+        assert_eq!(
+            args.relay_url,
+            vec![
+                "wss://a/v1/mesh/relay".to_owned(),
+                "wss://b/v1/mesh/relay".to_owned()
+            ],
+            "comma value must split into the ordered list (same path as the env var)"
+        );
+    }
+
+    /// HA-relay C7: omitting the flag/env leaves the list EMPTY ⇒ the joiner
+    /// derives the single relay from `--coordinator` (today's behaviour). This
+    /// asserts the value-source-precedence default; it does not read the env
+    /// (env-mutation is forbidden under `deny(unsafe_code)`).
+    #[test]
+    fn join_relay_url_defaults_empty() {
+        let args = parse_join(&["join", "--coordinator", "http://u", "--name", "x"]);
+        assert!(
+            args.relay_url.is_empty(),
+            "omitted --relay-url must be an empty list (derive single)"
+        );
     }
 }

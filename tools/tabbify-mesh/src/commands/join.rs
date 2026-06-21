@@ -92,10 +92,14 @@ fn build_join_config(args: JoinArgs) -> JoinConfig {
         tls_ca: args.tls_ca,
         insecure_no_mtls: args.insecure_no_mtls,
         // Relay is on by default (the connectivity floor); `--no-relay`
-        // opts out. `relay_url` overrides the default derivation from the
-        // coordinator URL.
+        // opts out. `relay_urls` is the ORDERED HA-relay failover list
+        // (repeated `--relay-url` / comma `TABBIFY_MESH_RELAY_URL`); empty
+        // derives the single relay from the coordinator URL. The legacy
+        // single `relay_url` field is unused from the CLI now — the list
+        // supersedes it.
         relay_enabled: !args.no_relay,
-        relay_url: args.relay_url,
+        relay_url: None,
+        relay_urls: args.relay_url,
         // Relay-only: this peer has no reachable direct endpoint, so the
         // coordinator must suppress its direct endpoint + hole-punch
         // directives. Off by default (a normal directly-reachable peer).
