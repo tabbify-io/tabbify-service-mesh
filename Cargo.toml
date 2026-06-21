@@ -48,6 +48,11 @@ chrono      = { version = "0.4", features = ["serde", "clock"] }
 dashmap     = "6"
 parking_lot = "0.12"
 
+# Raw socket options — SO_REUSEADDR / SO_REUSEPORT on the WG UDP bind so a
+# fast restart re-grabs the stable :51820 port instead of being demoted to an
+# ephemeral one (which loses reflexive discovery). Pure-rust, musl-clean.
+socket2     = { version = "0.5", features = ["all"] }
+
 # Networking — userspace WireGuard (boringtun) for the production mesh
 # fabric. boringtun pins x25519-dalek internally; we re-declare it here
 # only so the mesh-fabric crate can construct keypairs from its public

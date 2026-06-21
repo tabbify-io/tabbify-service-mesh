@@ -56,6 +56,10 @@ uuid        = { workspace = true }
 dashmap     = { workspace = true }
 parking_lot = { workspace = true }
 
+# Raw socket options for the WG UDP bind (SO_REUSEADDR/SO_REUSEPORT) so a fast
+# restart re-binds the stable :51820 port without an ephemeral demotion.
+socket2     = { workspace = true }
+
 tracing            = { workspace = true }
 # Unified logging-init, re-exported from this crate's root so host apps
 # that embed the joiner (supervisor / node) call the SAME `init_logging`

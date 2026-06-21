@@ -176,7 +176,7 @@ impl Joiner {
         //    test) we fall back to an OS-picked port so the bind still
         //    succeeds.
         let preferred_port = config.listen_port.unwrap_or(DEFAULT_WG_LISTEN_PORT);
-        let (socket, wg_listen_port) = bind_wg_socket(preferred_port).await?;
+        let (socket, wg_listen_port) = bind_wg_socket(preferred_port)?;
 
         // 1b) Track A-a: if a STUN server is configured, discover the WG
         //     socket's actual public mapping (symmetric-NAT-correct) and prefer
@@ -838,9 +838,36 @@ fn push_relay_tasks(
 /// runs working at the cost of a less predictable advertised port — fine
 /// because same-host peers reach each other via loopback / WG roaming, not
 /// via the coordinator-advertised reflexive endpoint.
-async fn bind_udp_with_fallback(preferred_port: u16) -> Result<UdpSocket, JoinerError> {
+/// Bind a non-blocking tokio [`UdpSocket`] on `addr` with `SO_REUSEADDR`
+/// (and `SO_REUSEPORT` on Linux) set BEFORE the bind.
+///
+/// The reuse flags are what let a FAST restart re-grab the SAME stable
+/// `:51820` port: without `SO_REUSEADDR` a freshly-restarted joiner can hit a
+/// transient `EADDRINUSE` on the lingering socket of the just-exited process
+/// and get demoted to an ephemeral port — which silently breaks reflexive
+/// endpoint discovery (the coordinator advertises a now-wrong port). With the
+/// flags set the rebind succeeds immediately on the stable port. Pure-`socket2`
+/// (musl-clean), converted to a tokio socket via `from_std`.
+fn make_reusable_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    #[cfg(target_os = "linux")]
+    sock.set_reuse_port(true)?;
+    sock.bind(&addr.into())?;
+    sock.set_nonblocking(true)?;
+    UdpSocket::from_std(std::net::UdpSocket::from(sock))
+}
+
+fn bind_udp_with_fallback(preferred_port: u16) -> Result<UdpSocket, JoinerError> {
     let preferred = SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), preferred_port);
-    match UdpSocket::bind(preferred).await {
+    match make_reusable_udp(preferred) {
         Ok(sock) => Ok(sock),
         Err(e) if preferred_port != 0 => {
             tracing::warn!(
@@ -849,12 +876,10 @@ async fn bind_udp_with_fallback(preferred_port: u16) -> Result<UdpSocket, Joiner
                 "joiner: preferred WG port unavailable, falling back to OS-picked port"
             );
             let ephemeral = SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0);
-            UdpSocket::bind(ephemeral)
-                .await
-                .map_err(|source| JoinerError::UdpBind {
-                    addr: ephemeral,
-                    source,
-                })
+            make_reusable_udp(ephemeral).map_err(|source| JoinerError::UdpBind {
+                addr: ephemeral,
+                source,
+            })
         }
         Err(source) => Err(JoinerError::UdpBind {
             addr: preferred,
@@ -1082,8 +1107,8 @@ async fn source_scope_reassert_loop(
 ///
 /// # Errors
 /// [`JoinerError::HttpTransport`] when the local addr cannot be read.
-async fn bind_wg_socket(preferred_port: u16) -> anyhow::Result<(Arc<UdpSocket>, u16)> {
-    let socket = bind_udp_with_fallback(preferred_port).await?;
+fn bind_wg_socket(preferred_port: u16) -> anyhow::Result<(Arc<UdpSocket>, u16)> {
+    let socket = bind_udp_with_fallback(preferred_port)?;
     let bound = socket
         .local_addr()
         .map_err(|e| JoinerError::HttpTransport(format!("udp local_addr: {e}")))?;
@@ -1350,5 +1375,46 @@ mod tests {
         assert_eq!(d.last_rx_age_ms, 5, "age 5_000 micros → 5 ms");
         let r = by_id.get(&relay_id).expect("relay peer reported");
         assert!(!r.direct, "unconfirmed session reports relay");
+    }
+
+    /// `make_reusable_udp` binds with `SO_REUSEADDR` (and `SO_REUSEPORT` on
+    /// Linux) so a fast restart can re-grab the SAME stable port instead of
+    /// being demoted to an ephemeral one. We assert the reuse flag is set on
+    /// the bound socket via a `socket2` view of the raw fd.
+    #[tokio::test]
+    async fn make_reusable_udp_sets_reuse_flags() {
+        let addr = SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0);
+        let sock = make_reusable_udp(addr).expect("bind reusable udp");
+
+        // Re-wrap the raw fd in a socket2 Socket (without taking ownership) to
+        // read back the options. `SockRef` borrows the fd — it must NOT close it.
+        let sref = socket2::SockRef::from(&sock);
+        assert!(
+            sref.reuse_address().expect("read reuse_address"),
+            "SO_REUSEADDR must be set"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            sref.reuse_port().expect("read reuse_port"),
+            "SO_REUSEPORT must be set on Linux"
+        );
+    }
+
+    /// With `SO_REUSEPORT` two binds to the SAME concrete port succeed on
+    /// Linux. On platforms without `SO_REUSEPORT` we only assert the first
+    /// bind succeeds (the reuse-address path still re-binds a freed port).
+    #[tokio::test]
+    async fn make_reusable_udp_double_bind_ok() {
+        // Bind an ephemeral port first to discover a concrete number, then try
+        // to bind it a SECOND time. On Linux + SO_REUSEPORT this succeeds.
+        let first = make_reusable_udp(SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0))
+            .expect("first bind");
+        let port = first.local_addr().expect("local_addr").port();
+        let again = make_reusable_udp(SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), port));
+        #[cfg(target_os = "linux")]
+        assert!(again.is_ok(), "SO_REUSEPORT allows a second bind of the same port");
+        // Keep `first` alive across the second bind attempt.
+        drop(first);
+        let _ = again;
     }
 }
