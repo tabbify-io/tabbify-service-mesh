@@ -378,7 +378,7 @@ impl Joiner {
             software_version: config.software_version.clone(),
             mesh_version: Some(MESH_VERSION.to_string()),
             relay_outbound_rx,
-            relay_url: config.relay_url.clone(),
+            relay_urls: resolve_configured_relay_urls(&config),
             coordinator_url: config.coordinator_url.clone(),
             my_pubkey: *keypair.public.as_bytes(),
             insecure_no_mtls: config.insecure_no_mtls,
@@ -622,11 +622,12 @@ struct SpawnContext {
     /// task drains for outbound relayed datagrams. `Some` only when relay is
     /// enabled; `None` (`--no-relay`) skips spawning the relay task entirely.
     relay_outbound_rx: Option<crate::relay::client::RelayOutboundRx>,
-    /// Explicit relay endpoint URL override; `None` derives it from
-    /// `coordinator_url`.
-    relay_url: Option<String>,
+    /// HA-relay: the ORDERED relay endpoint list (primary first) the floor
+    /// fails over across. Empty derives the single relay from
+    /// `coordinator_url` (today's behaviour).
+    relay_urls: Vec<String>,
     /// Coordinator base URL — the relay URL is derived from it when
-    /// `relay_url` is `None`.
+    /// `relay_urls` is empty.
     coordinator_url: String,
     /// Our raw WG public key — sent as the relay `?pubkey=` query param.
     my_pubkey: [u8; 32],
@@ -640,6 +641,40 @@ struct SpawnContext {
     /// Track C: host-side process-effects sink (`RestartJoiner` / `RebootHost`).
     command_sink: Arc<dyn crate::coordinator::command_exec::CommandSink>,
     shutdown_rx: watch::Receiver<bool>,
+}
+
+/// Merge the back-compat single [`JoinConfig::relay_url`] into the HA-relay
+/// [`JoinConfig::relay_urls`] list, producing the configured relay set the
+/// floor uses (BEFORE the `coordinator_url` derivation, which happens later in
+/// [`crate::relay::client::resolve_relay_urls`]).
+///
+/// Precedence (back-compat invariant):
+/// - non-empty `relay_urls` ⇒ use it verbatim (the legacy `relay_url` single
+///   value is ignored when the explicit list is given — the list is the modern
+///   knob);
+/// - empty `relay_urls` + `Some(relay_url)` ⇒ `[relay_url]` (today's single
+///   override, byte-identical: one element);
+/// - empty `relay_urls` + `None` `relay_url` ⇒ `[]` (derive the single relay
+///   from `coordinator_url`).
+///
+/// A one-element result keeps the failover machine dormant — the no-op
+/// invariant for the single-relay case.
+fn resolve_configured_relay_urls(config: &JoinConfig) -> Vec<String> {
+    if !config.relay_urls.is_empty() {
+        return config.relay_urls.clone();
+    }
+    config.relay_url.clone().into_iter().collect()
+}
+
+/// Resolve the configured relay list into the shared, ordered failover set
+/// (deriving the single relay from `coordinator_url` when empty) and wrap it in
+/// an `Arc` so BOTH lane tasks share ONE list — the fleet-wide-same-list
+/// invariant. A one-element result keeps the failover machine dormant.
+fn resolve_shared_relay_urls(coordinator_url: &str, configured: &[String]) -> Arc<Vec<String>> {
+    Arc::new(crate::relay::client::resolve_relay_urls(
+        coordinator_url,
+        configured,
+    ))
 }
 
 /// Spawn all five background loops and return their join handles in
@@ -660,7 +695,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         software_version,
         mesh_version,
         relay_outbound_rx,
-        relay_url,
+        relay_urls,
         coordinator_url,
         my_pubkey,
         insecure_no_mtls,
@@ -698,14 +733,15 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
     )));
 
     // Relay client tasks (Stage-3 connectivity floor). Spawned BEFORE the
-    // hole-punch block because that block MOVES `socket`; the relays clone
-    // what they need here.
+    // hole-punch block (it MOVES `socket`); the relays clone what they need.
+    // `relay_urls` resolves the shared ordered failover set (borrows
+    // `coordinator_url` before the struct moves it).
     push_relay_tasks(
         &mut tasks,
         relay_outbound_rx,
         RelayTaskShared {
+            relay_urls: resolve_shared_relay_urls(&coordinator_url, &relay_urls),
             coordinator_url,
-            relay_url,
             my_pubkey,
             insecure_no_mtls,
             sessions: sessions.clone(),
@@ -783,12 +819,13 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
 }
 
 /// Config shared by both relay lane tasks (everything except the lane and its
-/// outbound receiver). `coordinator_url`/`relay_url`/`my_pubkey`/`insecure`
+/// outbound receiver). `coordinator_url`/`relay_urls`/`my_pubkey`/`insecure`
 /// are identical for both sockets; `sessions`/`socket`/`tun`/`shutdown_rx` are
-/// the shared handles each task clones.
+/// the shared handles each task clones. `relay_urls` is an `Arc` so the two
+/// lanes share ONE resolved, ordered failover list (cheap clone).
 struct RelayTaskShared {
     coordinator_url: String,
-    relay_url: Option<String>,
+    relay_urls: Arc<Vec<String>>,
     my_pubkey: [u8; 32],
     insecure_no_mtls: bool,
     sessions: SessionTable,
@@ -814,7 +851,7 @@ fn push_relay_tasks(
     };
     let RelayTaskShared {
         coordinator_url,
-        relay_url,
+        relay_urls,
         my_pubkey,
         insecure_no_mtls,
         sessions,
@@ -824,7 +861,7 @@ fn push_relay_tasks(
     } = shared;
     tasks.push(tokio::spawn(run(RelayTask {
         coordinator_url: coordinator_url.clone(),
-        relay_url: relay_url.clone(),
+        relay_urls: relay_urls.clone(),
         my_pubkey,
         insecure_no_mtls,
         sessions: sessions.clone(),
@@ -836,7 +873,7 @@ fn push_relay_tasks(
     })));
     tasks.push(tokio::spawn(run(RelayTask {
         coordinator_url,
-        relay_url,
+        relay_urls,
         my_pubkey,
         insecure_no_mtls,
         sessions,

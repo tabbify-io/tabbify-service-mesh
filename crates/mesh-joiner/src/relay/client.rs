@@ -165,12 +165,16 @@ impl RelayHandle {
 
 /// Inputs for the persistent relay client task.
 pub struct RelayTask {
-    /// Coordinator base URL (used to derive the relay URL when `relay_url`
-    /// is `None`).
+    /// Coordinator base URL (used to derive the relay URL when `relay_urls`
+    /// is empty).
     pub coordinator_url: String,
-    /// Explicit relay endpoint URL; `None` derives it from
-    /// `coordinator_url`.
-    pub relay_url: Option<String>,
+    /// HA-relay: the ORDERED, resolved relay endpoint set (primary first) this
+    /// task fails over across. Shared (cheap-clone `Arc`) by both lanes so a
+    /// fleet-wide list is identical on `hi` and `lo`. Empty ⇒ the single relay
+    /// is derived from `coordinator_url` at [`run`] time. A one-element list is
+    /// byte-identical to the legacy single-relay behaviour — the failover
+    /// branch is unreachable (`(0 + 1) % 1 == 0`).
+    pub relay_urls: Arc<Vec<String>>,
     /// Our raw 32-byte X25519 WG public key — sent as the `?pubkey=` query
     /// parameter so the coordinator registers this connection.
     pub my_pubkey: [u8; 32],
@@ -268,12 +272,12 @@ pub async fn run(mut task: RelayTask) {
         return;
     }
 
-    // Resolve the ordered relay set (HA-relay). With today's single-value
-    // `relay_url` this yields a ONE-element list — identical to the legacy
-    // `derive_relay_url` call — so the failover machine (C4) stays dormant.
-    // The full multi-relay list is threaded in C3.
-    let configured: Vec<String> = task.relay_url.iter().cloned().collect();
-    let relays = resolve_relay_urls(&task.coordinator_url, &configured);
+    // Resolve the ordered relay set (HA-relay). An EMPTY `relay_urls` derives
+    // the single Frankfurt relay from `coordinator_url`; a one-element list is
+    // byte-identical to the legacy single-relay path. The failover machine
+    // (C4) advances `current` over this set on the existing disconnect path —
+    // dormant while `len == 1`.
+    let relays = resolve_relay_urls(&task.coordinator_url, &task.relay_urls);
     let base = relays[0].clone();
     let pubkey_q = B64URL.encode(task.my_pubkey);
     // `&lane=` tags which dedicated socket this is so the coordinator registers
@@ -636,7 +640,7 @@ mod tests {
 
         let task = tokio::spawn(run(RelayTask {
             coordinator_url: format!("http://{addr}"),
-            relay_url: None,
+            relay_urls: Arc::new(vec![]),
             my_pubkey: [42u8; 32],
             insecure_no_mtls: true,
             sessions,
@@ -681,7 +685,7 @@ mod tests {
             Duration::from_secs(2),
             run(RelayTask {
                 coordinator_url: "https://coord.example:8888".into(),
-                relay_url: None,
+                relay_urls: Arc::new(vec![]),
                 my_pubkey: [1u8; 32],
                 insecure_no_mtls: false,
                 sessions,
@@ -742,7 +746,7 @@ mod tests {
 
         let task = tokio::spawn(run(RelayTask {
             coordinator_url: format!("http://{addr}"),
-            relay_url: None,
+            relay_urls: Arc::new(vec![]),
             my_pubkey: [42u8; 32],
             insecure_no_mtls: true,
             sessions,
@@ -760,6 +764,78 @@ mod tests {
         assert!(
             uri.contains("lane=hi"),
             "hi-lane task must connect with &lane=hi; got {uri}"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    }
+
+    /// HA-relay C3: a [`RelayTask`] now carries the FULL ordered relay list as
+    /// an `Arc<Vec<String>>`. With a 2-element list `run` must dial the
+    /// PRIMARY (index 0) first — proving the list is threaded through and that
+    /// the start index is 0. The host string of the upgrade URI must be the
+    /// FIRST relay's address.
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // tokio-tungstenite's accept_hdr callback signature
+    async fn run_connects_to_first_of_relay_urls() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        // Primary fake relay — must be the one dialed.
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap();
+        // Secondary — never dialed on the happy path (primary accepts).
+        let secondary_addr = "127.0.0.1:9"; // unroutable port placeholder in the list
+
+        let (uri_tx, uri_rx) = tokio::sync::oneshot::channel::<String>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = primary.accept().await.unwrap();
+            let mut uri_tx = Some(uri_tx);
+            let _ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
+                if let Some(tx) = uri_tx.take() {
+                    let _ = tx.send(req.uri().to_string());
+                }
+                Ok(resp)
+            })
+            .await
+            .unwrap();
+        });
+
+        let sessions = SessionTable::new();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tun: Arc<dyn TunDevice> = Arc::new(RecordingTun {
+            written: parking_lot::Mutex::new(Vec::new()),
+        });
+        let (_handle, outbound_rx) = RelayHandle::new(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let relay_urls = Arc::new(vec![
+            format!("ws://{primary_addr}/v1/mesh/relay"),
+            format!("ws://{secondary_addr}/v1/mesh/relay"),
+        ]);
+        let task = tokio::spawn(run(RelayTask {
+            coordinator_url: "http://unused:1".into(),
+            relay_urls,
+            my_pubkey: [7u8; 32],
+            insecure_no_mtls: true,
+            sessions,
+            socket,
+            tun,
+            lane: RelayLane::Lo,
+            outbound_rx: outbound_rx.lo,
+            shutdown: shutdown_rx,
+        }));
+
+        let uri = tokio::time::timeout(Duration::from_secs(5), uri_rx)
+            .await
+            .expect("primary captured the upgrade URI in time")
+            .expect("uri channel ok");
+        // The captured request-target is path+query only, but the connection
+        // landed on `primary` — proving index 0 was dialed. Assert the lane +
+        // that we connected at all (the accept proves the primary host).
+        assert!(
+            uri.contains("lane=lo"),
+            "lo-lane task must connect with lane=lo; got {uri}"
         );
 
         let _ = shutdown_tx.send(true);
