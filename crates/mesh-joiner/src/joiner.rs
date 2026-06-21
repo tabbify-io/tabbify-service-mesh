@@ -158,6 +158,18 @@ impl Joiner {
         command_nonce_path: Option<std::path::PathBuf>,
         command_sink: Option<Arc<dyn crate::coordinator::command_exec::CommandSink>>,
     ) -> anyhow::Result<Self> {
+        // Startup phase-markers: emitted BEFORE each fallible step so that if
+        // the joiner dies PRE-NETWORK (the exact 06-22 mode — a wedged box with
+        // no roster entry), the last log line names which step never returned.
+        // Without these the failure is silent and unattributable.
+        tracing::info!(
+            phase = "config",
+            display_name = %config.display_name,
+            coordinator = %config.coordinator_url,
+            relay_only = config.relay_enabled && config.relay_only,
+            "joiner: starting join_with_commands"
+        );
+        tracing::info!(phase = "resolve_identity", "joiner: resolving local identity");
         let (keypair, sticky_ula, effective_requested_ula) = resolve_identity(&config)?;
 
         // 1) Open the UDP socket. We bind to v4 wildcard because the
@@ -176,6 +188,7 @@ impl Joiner {
         //    test) we fall back to an OS-picked port so the bind still
         //    succeeds.
         let preferred_port = config.listen_port.unwrap_or(DEFAULT_WG_LISTEN_PORT);
+        tracing::info!(phase = "bind_wg_socket", preferred_port, "joiner: binding WG UDP socket");
         let (socket, wg_listen_port) = bind_wg_socket(preferred_port)?;
 
         // 1b) Track A-a: if a STUN server is configured, discover the WG
@@ -254,6 +267,12 @@ impl Joiner {
         // coordinator-allocated address rather than failing the entire join.
         // Guarantees a node ALWAYS joins (defense in depth alongside the
         // coordinator's adopt-on-stale eviction).
+        tracing::info!(
+            phase = "register",
+            coordinator = %config.coordinator_url,
+            wg_listen_port,
+            "joiner: registering with coordinator"
+        );
         let resp = heartbeat::register_with_409_fallback(
             &client,
             &reregister,
@@ -281,6 +300,7 @@ impl Joiner {
         // 3) Open + configure the TUN device (cross-platform open() in
         //    the fabric crate). Extracted into a helper to keep this
         //    constructor under the clippy line cap.
+        tracing::info!(phase = "open_tun_device", %my_ula, "joiner: opening TUN device");
         let (tun_arc, iface_name) =
             open_tun_device(resolve_tun_name(&config, my_ula), my_ula).await?;
 
