@@ -135,6 +135,19 @@ pub struct JoinConfig {
     /// `ws(s)://{host}/v1/mesh/relay` from [`Self::coordinator_url`]. Set
     /// only when the relay lives at a non-default location.
     pub relay_url: Option<String>,
+    /// HA-relay: the ORDERED list of relay endpoints (primary first) the
+    /// connectivity floor fails over across, removing the single-relay SPOF.
+    /// Empty (default) ⇒ derive the single default from `coordinator_url`
+    /// (today's behaviour, byte-identical). A SINGLE-element list behaves
+    /// EXACTLY like the legacy single-relay path — the failover branch is
+    /// dormant (`(0+1) % 1 == 0`), so this is safe to ship before a 2nd relay
+    /// box exists. `len() >= 2` arms sticky failover: the floor sticks to the
+    /// connected relay until it drops, then advances to the next on the
+    /// EXISTING disconnect/backoff path. Resolved once at startup via
+    /// [`crate::relay::client::resolve_relay_urls`]; the explicit
+    /// [`Self::relay_url`] override still applies (an explicit single value =
+    /// a one-element list).
+    pub relay_urls: Vec<String>,
     /// Declare this peer **relay-only**: it has NO reachable direct endpoint
     /// (e.g. it runs in a container netns with no inbound mesh port, reachable
     /// ONLY via its outbound DERP relay connection). `false` (default) — the
@@ -222,6 +235,11 @@ impl Default for JoinConfig {
             // even behind a hard NAT. Opt out via `--no-relay`.
             relay_enabled: true,
             relay_url: None,
+            // HA-relay: no explicit relay list by default ⇒ the resolver
+            // derives the single Frankfurt relay from `coordinator_url`, so
+            // the failover machine sees a one-element list and never advances
+            // — byte-identical to the legacy single-relay floor.
+            relay_urls: vec![],
             // A peer is reachable directly by default; only a host that KNOWS
             // it has no inbound mesh port (e.g. a container netns) opts into
             // relay-only so the coordinator suppresses its direct endpoint +
@@ -263,6 +281,10 @@ mod tests {
         // peer is reachable even when direct + hole-punch fail.
         assert!(cfg.relay_enabled, "relay must default on");
         assert!(cfg.relay_url.is_none());
+        assert!(
+            cfg.relay_urls.is_empty(),
+            "relay_urls must default empty (single relay derived)"
+        );
         // Host-integration behaviors are opt-in: a plain peer must not
         // touch policy routing or the host firewall.
         assert!(
@@ -299,6 +321,7 @@ mod tests {
             software_version: Some("v1.4.0".into()),
             relay_enabled: false,
             relay_url: Some("ws://10.0.0.1:9000/v1/mesh/relay".into()),
+            relay_urls: vec!["wss://r1/v1/mesh/relay".into(), "wss://r2/v1/mesh/relay".into()],
             relay_only: true,
             source_scoped_routes: true,
             manage_firewall: true,
@@ -323,6 +346,7 @@ mod tests {
         assert_eq!(cloned.software_version, cfg.software_version);
         assert_eq!(cloned.relay_enabled, cfg.relay_enabled);
         assert_eq!(cloned.relay_url, cfg.relay_url);
+        assert_eq!(cloned.relay_urls, cfg.relay_urls);
         assert_eq!(cloned.relay_only, cfg.relay_only);
         assert_eq!(cloned.source_scoped_routes, cfg.source_scoped_routes);
         assert_eq!(cloned.manage_firewall, cfg.manage_firewall);
@@ -360,6 +384,35 @@ mod tests {
         let cloned = cfg2.clone();
         assert!(cfg2.relay_only);
         assert!(cloned.relay_only);
+    }
+
+    /// HA-relay C1: the multi-relay list defaults to EMPTY (today's behaviour
+    /// — derive the single relay from `coordinator_url`) and round-trips
+    /// through Clone. An empty `relay_urls` is the back-compat signal that the
+    /// resolver derives one URL, so the single-relay path stays byte-identical.
+    #[test]
+    fn relay_urls_default_is_empty_and_clones() {
+        let cfg = JoinConfig::default();
+        assert!(
+            cfg.relay_urls.is_empty(),
+            "relay_urls must default to empty (derive single relay)"
+        );
+        let cfg2 = JoinConfig {
+            relay_urls: vec![
+                "wss://a/v1/mesh/relay".to_owned(),
+                "wss://b/v1/mesh/relay".to_owned(),
+            ],
+            ..JoinConfig::default()
+        };
+        let cloned = cfg2.clone();
+        assert_eq!(cloned.relay_urls, cfg2.relay_urls);
+        assert_eq!(
+            cloned.relay_urls,
+            vec![
+                "wss://a/v1/mesh/relay".to_owned(),
+                "wss://b/v1/mesh/relay".to_owned(),
+            ]
+        );
     }
 
     /// SV-2: the host-supplied `software_version` round-trips through clone
