@@ -993,27 +993,32 @@ mod tests {
         server.abort();
     }
 
-    /// HA-relay C3: a [`RelayTask`] now carries the FULL ordered relay list as
-    /// an `Arc<Vec<String>>`. With a 2-element list `run` must dial the
-    /// PRIMARY (index 0) first — proving the list is threaded through and that
-    /// the start index is 0. The host string of the upgrade URI must be the
-    /// FIRST relay's address.
+    /// HA-relay C3/C4: a [`RelayTask`] carries the FULL ordered relay list as an
+    /// `Arc<Vec<String>>` and `run` MUST dial the PRIMARY (index 0) FIRST.
+    ///
+    /// This genuinely proves the start-index-0 ordering — NOT just "we connected
+    /// somewhere". BOTH relays are real, accepting listeners that HOLD the WS
+    /// open; since the primary stays healthy, the sticky floor never advances, so
+    /// the SECONDARY must receive **zero** connections. A drifted start index
+    /// (`current = 1`) would dial the secondary first → it would record a hit →
+    /// this test FAILS. (With the old single-`uri.contains("lane=lo")` assertion
+    /// and an unroutable secondary, a `current = 1` start merely failed over back
+    /// to the primary inside the timeout and went undetected — the coverage gap
+    /// this test closes.)
     #[tokio::test]
     #[allow(clippy::result_large_err)] // tokio-tungstenite's accept_hdr callback signature
     async fn run_connects_to_first_of_relay_urls() {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
-        // Primary fake relay — must be the one dialed.
+        // Primary fake relay — captures its upgrade URI then HOLDS the WS open
+        // (a healthy primary the sticky floor must never leave).
         let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let primary_addr = primary.local_addr().unwrap();
-        // Secondary — never dialed on the happy path (primary accepts).
-        let secondary_addr = "127.0.0.1:9"; // unroutable port placeholder in the list
-
         let (uri_tx, uri_rx) = tokio::sync::oneshot::channel::<String>();
-        let server = tokio::spawn(async move {
+        let primary_srv = tokio::spawn(async move {
             let (stream, _) = primary.accept().await.unwrap();
             let mut uri_tx = Some(uri_tx);
-            let _ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
+            let ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
                 if let Some(tx) = uri_tx.take() {
                     let _ = tx.send(req.uri().to_string());
                 }
@@ -1021,47 +1026,49 @@ mod tests {
             })
             .await
             .unwrap();
+            // Hold the socket open forever — the floor must stay here.
+            let _held = ws;
+            std::future::pending::<()>().await;
         });
 
-        let sessions = SessionTable::new();
-        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let tun: Arc<dyn TunDevice> = Arc::new(RecordingTun {
-            written: parking_lot::Mutex::new(Vec::new()),
-        });
-        let (_handle, outbound_rx) = RelayHandle::new(false);
+        // Secondary — a REAL, accepting listener that records every connection.
+        // On the correct (index-0-first, sticky) path it must receive NONE.
+        let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary_addr = secondary.local_addr().unwrap();
+        let (s_hits_tx, mut s_hits_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let secondary_srv = spawn_accept_then_drop(secondary, s_hits_tx, true);
+
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        let relay_urls = Arc::new(vec![
+        let relay_urls = vec![
             format!("ws://{primary_addr}/v1/mesh/relay"),
             format!("ws://{secondary_addr}/v1/mesh/relay"),
-        ]);
-        let task = tokio::spawn(run(RelayTask {
-            coordinator_url: "http://unused:1".into(),
-            relay_urls,
-            my_pubkey: [7u8; 32],
-            insecure_no_mtls: true,
-            sessions,
-            socket,
-            tun,
-            lane: RelayLane::Lo,
-            outbound_rx: outbound_rx.lo,
-            shutdown: shutdown_rx,
-        }));
+        ];
+        let (relay_task, _handle) = make_failover_task(relay_urls, shutdown_rx).await;
+        let task = tokio::spawn(run(relay_task));
 
+        // The PRIMARY must capture the very first upgrade (index 0 dialed first).
         let uri = tokio::time::timeout(Duration::from_secs(5), uri_rx)
             .await
-            .expect("primary captured the upgrade URI in time")
+            .expect("primary must be dialed first (index 0)")
             .expect("uri channel ok");
-        // The captured request-target is path+query only, but the connection
-        // landed on `primary` — proving index 0 was dialed. Assert the lane +
-        // that we connected at all (the accept proves the primary host).
         assert!(
             uri.contains("lane=lo"),
             "lo-lane task must connect with lane=lo; got {uri}"
         );
 
+        // Stickiness + index-0 proof: while the healthy primary holds the floor,
+        // the secondary must NEVER be reached. A drifted start index (or a
+        // non-sticky failover) would land a connection here.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert!(
+            s_hits_rx.try_recv().is_err(),
+            "secondary must receive ZERO connections while the primary is healthy \
+             (proves index-0-first + sticky floor)"
+        );
+
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        primary_srv.abort();
+        secondary_srv.abort();
     }
 }
