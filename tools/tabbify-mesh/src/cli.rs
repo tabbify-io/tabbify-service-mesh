@@ -96,6 +96,17 @@ pub struct JoinArgs {
     #[arg(long)]
     pub identity_path: Option<PathBuf>,
 
+    /// Super-admin Ed25519 pubkey as 64-char hex (Track C). When set, this
+    /// standalone joiner becomes a signed-remote-command TARGET: it verifies
+    /// every command against this key end-to-end and, on an accepted verb,
+    /// drives a host effect (`systemctl restart tabbify-supervisor` for
+    /// `RestartJoiner`, a guarded `systemctl reboot` ≤3/hr for `RebootHost`).
+    /// This is exactly what makes the redundant lifeline joiner the recovery
+    /// lever when the in-process supervisor joiner is wedged. Unset / empty /
+    /// malformed ⇒ remote commands stay FAIL-CLOSED (every command rejected).
+    #[arg(long, env = "TABBIFY_MESH_SUPER_ADMIN_PUBKEY")]
+    pub super_admin_pubkey: Option<String>,
+
     /// Heartbeat interval (seconds).
     #[arg(long, default_value_t = 20)]
     pub heartbeat_interval: u64,
@@ -262,5 +273,32 @@ mod tests {
     fn join_identity_path_defaults_none() {
         let args = parse_join(&["join", "--coordinator", "http://u", "--name", "x"]);
         assert_eq!(args.identity_path, None);
+    }
+
+    /// `--super-admin-pubkey <hex>` parses into `JoinArgs::super_admin_pubkey`.
+    #[test]
+    fn join_parses_super_admin_pubkey() {
+        let hex = "aa".repeat(32);
+        let args = parse_join(&[
+            "join",
+            "--coordinator",
+            "http://u",
+            "--name",
+            "lifeline",
+            "--super-admin-pubkey",
+            &hex,
+        ]);
+        assert_eq!(
+            args.super_admin_pubkey.as_deref(),
+            Some(hex.as_str()),
+            "--super-admin-pubkey must populate JoinArgs::super_admin_pubkey"
+        );
+    }
+
+    /// Omitting `--super-admin-pubkey` leaves it `None` (remote commands off).
+    #[test]
+    fn join_super_admin_pubkey_defaults_none() {
+        let args = parse_join(&["join", "--coordinator", "http://u", "--name", "x"]);
+        assert_eq!(args.super_admin_pubkey, None);
     }
 }

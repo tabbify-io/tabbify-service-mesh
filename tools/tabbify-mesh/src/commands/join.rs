@@ -16,45 +16,26 @@ use crate::status_file::{self, StatusSnapshot};
 /// Interval at which the daemon refreshes `~/.tabbify-mesh/status.json`.
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Run the `join` subcommand.
-///
-/// # Errors
-/// Returns an error if the coordinator handshake fails or if the status
-/// file cannot be written during startup.
-pub async fn run(args: JoinArgs) -> Result<()> {
-    let JoinArgs {
-        coordinator,
-        name,
-        tags,
-        join_token,
-        listen_port,
-        tun_name,
-        identity_path,
-        heartbeat_interval,
-        advertise_endpoint,
-        tls_cert,
-        tls_key,
-        tls_ca,
-        insecure_no_mtls,
-        no_relay,
-        relay_url,
-        relay_only,
-        source_scoped_routes,
-        manage_firewall,
-        mesh_stun_server,
-    } = args;
+/// Default data dir for the standalone joiner's sidecars (reboot-guard, …)
+/// when `--identity-path` is unset: `~/.tabbify-mesh`, falling back to the
+/// current dir if `$HOME` is unavailable (a sidecar there is harmless).
+fn default_data_dir() -> std::path::PathBuf {
+    status_file::status_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
 
-    println!("joining... coordinator={coordinator}");
-
-    let config = JoinConfig {
-        coordinator_url: coordinator.clone(),
-        display_name: name.clone(),
-        tags: tags.clone(),
-        join_token,
-        listen_port,
-        tun_name,
-        heartbeat_interval: Duration::from_secs(heartbeat_interval),
-        advertise_endpoint,
+/// Map the parsed [`JoinArgs`] onto a [`JoinConfig`]. `super_admin_pubkey` is
+/// NOT a config field (the sink + gate are SEPARATE `join_with_commands` args),
+/// so it is consumed by the caller, not here.
+fn build_join_config(args: JoinArgs) -> JoinConfig {
+    JoinConfig {
+        coordinator_url: args.coordinator,
+        display_name: args.name,
+        tags: args.tags,
+        join_token: args.join_token,
+        listen_port: args.listen_port,
+        tun_name: args.tun_name,
+        heartbeat_interval: Duration::from_secs(args.heartbeat_interval),
+        advertise_endpoint: args.advertise_endpoint,
         // CLI doesn't expose `--keypair-path` yet — fall back to the
         // joiner's `$HOME/.tabbify-mesh/keypair` default so smoke tests
         // and ad-hoc runs persist a stable identity across restarts.
@@ -63,36 +44,96 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         // takes PRECEDENCE over the keypair-only default: the joiner's
         // `resolve_identity` uses the identity file and re-requests the same
         // mesh ULA across restarts (the lifeline-joiner sticky-address path).
-        identity_path,
-        tls_cert,
-        tls_key,
-        tls_ca,
-        insecure_no_mtls,
+        identity_path: args.identity_path,
+        tls_cert: args.tls_cert,
+        tls_key: args.tls_key,
+        tls_ca: args.tls_ca,
+        insecure_no_mtls: args.insecure_no_mtls,
         // Relay is on by default (the connectivity floor); `--no-relay`
         // opts out. `relay_url` overrides the default derivation from the
         // coordinator URL.
-        relay_enabled: !no_relay,
-        relay_url,
+        relay_enabled: !args.no_relay,
+        relay_url: args.relay_url,
         // Relay-only: this peer has no reachable direct endpoint, so the
         // coordinator must suppress its direct endpoint + hole-punch
         // directives. Off by default (a normal directly-reachable peer).
-        relay_only,
+        relay_only: args.relay_only,
         // Host-integration toggles (multi-joiner-per-netns routing +
         // tailscaled-style firewall trust). Off by default.
-        source_scoped_routes,
-        manage_firewall,
+        source_scoped_routes: args.source_scoped_routes,
+        manage_firewall: args.manage_firewall,
         // Track A-a: optional STUN server for a symmetric-NAT-correct WG
         // mapping. Unset (default) keeps coordinator-reflexive advertise.
-        stun_server: mesh_stun_server,
+        stun_server: args.mesh_stun_server,
         // Runner-specific fields are not exposed via CLI — plain join is
         // always a plain peer. Per-app-runner processes set these
         // programmatically via JoinConfig directly.
         ..JoinConfig::default()
-    };
+    }
+}
 
-    let joiner = Joiner::join(config)
-        .await
-        .with_context(|| format!("join failed (coordinator={coordinator})"))?;
+/// Join the mesh, wiring the Track-C signed-command gate + host sink IFF a
+/// non-empty super-admin pubkey is given.
+///
+/// `super_admin_pubkey` set (and valid 64-char hex) ⇒ this standalone joiner is
+/// a signed-remote-command TARGET (the lifeline recovery lever). Empty / unset
+/// ⇒ plain join, remote commands fail-closed. `sink_data_dir` hosts the
+/// reboot-guard sidecar. Factored out of [`run`] to keep it under the line cap.
+async fn join_with_optional_sink(
+    config: JoinConfig,
+    coordinator: &str,
+    super_admin_pubkey: Option<&str>,
+    sink_data_dir: &std::path::Path,
+) -> Result<Joiner> {
+    match super_admin_pubkey.filter(|hex| !hex.trim().is_empty()) {
+        Some(pubkey_hex) => {
+            let pubkey = crate::host_sink::parse_super_admin_pubkey(Some(pubkey_hex))
+                .with_context(|| "invalid --super-admin-pubkey (expected 64-char hex)")?;
+            let sink = crate::host_sink::build_sink(pubkey_hex, sink_data_dir)
+                .with_context(|| "invalid --super-admin-pubkey (expected 64-char hex)")?;
+            println!("Track C: super-admin pubkey configured — signed remote commands ENABLED");
+            Joiner::join_with_commands(config, Some(pubkey), None, Some(sink))
+                .await
+                .with_context(|| format!("join failed (coordinator={coordinator})"))
+        }
+        None => Joiner::join(config)
+            .await
+            .with_context(|| format!("join failed (coordinator={coordinator})")),
+    }
+}
+
+/// Run the `join` subcommand.
+///
+/// # Errors
+/// Returns an error if the coordinator handshake fails or if the status
+/// file cannot be written during startup.
+pub async fn run(args: JoinArgs) -> Result<()> {
+    // Identity tied to coordinator / name / tags for the status snapshots, plus
+    // the standalone Track-C sink inputs — built in a dedicated helper so `run`
+    // stays under the clippy line cap.
+    let coordinator = args.coordinator.clone();
+    let name = args.name.clone();
+    let tags = args.tags.clone();
+    let super_admin_pubkey = args.super_admin_pubkey.clone();
+    // Track C (standalone lifeline sink): the reboot-guard sidecar lives next to
+    // the identity file (the lifeline's data dir) when one is set, else in the
+    // default `~/.tabbify-mesh` dir.
+    let sink_data_dir = args
+        .identity_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map_or_else(default_data_dir, std::path::Path::to_path_buf);
+
+    println!("joining... coordinator={coordinator}");
+
+    let config = build_join_config(args);
+
+    // When a super-admin pubkey is configured AND parses, run the joiner with
+    // the Track-C gate (verifies every command against the key) wired to the
+    // host command sink. Otherwise plain join — remote commands fail-closed.
+    let joiner =
+        join_with_optional_sink(config, &coordinator, super_admin_pubkey.as_deref(), &sink_data_dir)
+            .await?;
 
     let my_peer_id = joiner.my_peer_id();
     let my_ula = joiner.my_ula();

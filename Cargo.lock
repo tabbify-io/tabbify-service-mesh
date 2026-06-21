@@ -2281,6 +2281,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",

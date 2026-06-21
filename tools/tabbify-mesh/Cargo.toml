@@ -33,6 +33,9 @@ serde_json = { workspace = true }
 reqwest    = { workspace = true }
 uuid       = { workspace = true }
 chrono     = { workspace = true }
+# Parse the 64-char super-admin Ed25519 pubkey hex for the Track-C standalone
+# command sink (--super-admin-pubkey).
+hex        = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

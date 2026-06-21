@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod commands;
+pub mod host_sink;
 pub mod joiner_api;
 pub mod status_file;
 pub mod time_format;
