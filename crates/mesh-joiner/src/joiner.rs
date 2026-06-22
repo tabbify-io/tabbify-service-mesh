@@ -924,6 +924,16 @@ fn make_reusable_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     };
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
+    // CO-RESIDENCE CAVEAT (FIX 8): `SO_REUSEPORT` lets a same-port rebind
+    // SUCCEED instead of `EADDRINUSE`-ing, but on Linux two joiners bound to the
+    // SAME port on one host then LOAD-BALANCE inbound UDP across both sockets
+    // (kernel hashes by 4-tuple) rather than the second falling back to an
+    // ephemeral port — so a fraction of each peer's frames would be delivered to
+    // the WRONG joiner's `Tunn` and silently dropped. Co-resident joiners (e.g.
+    // the supervisor in-process joiner + the standalone lifeline on one box)
+    // MUST therefore be given DISTINCT `--listen-port` values (e.g. 51820 +
+    // 51821); the ephemeral fallback in `bind_udp_with_fallback` is NOT a
+    // safety net here because the same-port bind no longer errors.
     #[cfg(target_os = "linux")]
     sock.set_reuse_port(true)?;
     sock.bind(&addr.into())?;

@@ -79,6 +79,13 @@ pub struct JoinArgs {
     /// to peers, and a port-preserving `NAT` maps the same port). If 51820
     /// is already in use the joiner falls back to an OS-picked port. Set
     /// this explicitly only when you port-forward a specific UDP port.
+    ///
+    /// CO-RESIDENCE (FIX 8): when TWO joiners run on ONE host (e.g. the
+    /// supervisor in-process joiner on 51820 + the standalone LIFELINE joiner),
+    /// the lifeline MUST be given its OWN port (e.g. `--listen-port 51821`).
+    /// `SO_REUSEPORT` makes a same-port bind succeed but then load-balances
+    /// inbound UDP across both sockets, so co-resident joiners on the same port
+    /// would steal each other's frames — distinct ports keep them isolated.
     #[arg(long)]
     pub listen_port: Option<u16>,
 
