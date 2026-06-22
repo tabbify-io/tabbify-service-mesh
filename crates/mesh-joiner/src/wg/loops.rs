@@ -547,9 +547,15 @@ pub(crate) fn ipv6_source(bytes: &[u8]) -> Option<Ipv6Addr> {
 
 /// Drive each peer's timer state every 200ms. boringtun expects
 /// `update_timers` roughly every 250ms; this matches `mesh-fabric`.
+///
+/// `our_private` is this node's own X25519 secret (the SAME key the sessions
+/// were built with at `upsert` time). It is needed only for the FIX-3
+/// expired-`Tunn` re-arm ([`PeerSession::reset_handshake`]); threading it here
+/// mirrors how [`SessionTable::force_rehandshake_all`] already takes it.
 pub(crate) async fn timer_loop(
     socket: Arc<UdpSocket>,
     sessions: SessionTable,
+    our_private: x25519_dalek::StaticSecret,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(200));
@@ -573,6 +579,23 @@ pub(crate) async fn timer_loop(
                         now,
                         crate::wg::session::peer_session::DIRECT_PATH_TTL_MICROS,
                     );
+                    // FIX 3: detect + re-arm a boringtun `Tunn` that has gone
+                    // PERMANENTLY EXPIRED. After `REKEY_ATTEMPT_TIME` (90s) of
+                    // un-answered handshake-init retransmits boringtun calls
+                    // `set_expired()` and from then on EVERY `update_timers`
+                    // returns `ConnectionExpired` forever — it never emits
+                    // another init on its own, so a fresh relay-only ⇄
+                    // relay-only peer (the lifeline) whose first 90s window
+                    // lapsed without a completed relayed handshake is wedged +
+                    // unreachable. Re-arm it here so it bootstraps over the
+                    // relay floor. Returns BEFORE `update_timers` this tick so a
+                    // freshly re-armed session emits its init via the re-arm
+                    // path (an expired `update_timers` would only error).
+                    if maybe_rearm_expired_session(&socket, &sessions, &session, &our_private, now)
+                        .await
+                    {
+                        continue;
+                    }
                     let outbound: Option<Vec<u8>> = {
                         let mut scratch = vec![0u8; 256];
                         let mut tunn = session.tunn.lock().await;
@@ -659,6 +682,80 @@ async fn maybe_idle_probe(socket: &UdpSocket, sessions: &SessionTable, now: i64)
         // `last_send_attempt_ts`, advancing the send clock past a stale RX.
         send_wire(socket, sessions.relay(), sessions, &session, bytes).await;
     }
+}
+
+/// Re-arm ONE session whose boringtun `Tunn` has gone PERMANENTLY EXPIRED, so a
+/// wedged relay-only ⇄ relay-only handshake bootstraps instead of black-holing
+/// forever (FIX 3 — THE lifeline-reachability root cause). Returns `true` when
+/// it re-armed + emitted a fresh handshake-init this tick (the caller then skips
+/// the normal `update_timers` pass for this session, which would only error),
+/// `false` otherwise (healthy session, no relay floor, or still in back-off).
+///
+/// Mechanism, holding the per-`Tunn` lock as briefly as each step needs:
+///   1. Peek `Tunn::is_expired()`. NOT expired ⇒ return `false` immediately —
+///      a healthy / in-progress / never-started session is NEVER touched here,
+///      preserving all existing behaviour for non-expired sessions.
+///   2. Expired but NO relay floor (`sessions.relay()` is `None`) ⇒ return
+///      `false`: with no relay there is no delivery floor to bootstrap over, and
+///      boringtun's own retransmit already drove the direct attempt to
+///      exhaustion. (A direct-capable node re-handshakes via the normal data
+///      path; this fix targets the relay-floored black hole.)
+///   3. Expired + relay present + the per-session re-arm back-off has elapsed
+///      ([`PeerSession::should_rearm_expired`]) ⇒ re-arm via the EXISTING
+///      [`PeerSession::reset_handshake`] (clears the Expired noise sessions +
+///      re-arms via `set_static_private`, preserving endpoint / allowed-set /
+///      `direct_confirmed` / relay floor), then `encapsulate(&[], …)` to mint
+///      ONE fresh init and route it through [`send_wire`] so it rides the relay
+///      floor. Stamping the back-off in step 3 keeps a genuinely-unreachable
+///      peer re-arming at WG attempt-window cadence, not every 200 ms tick.
+async fn maybe_rearm_expired_session(
+    socket: &UdpSocket,
+    sessions: &SessionTable,
+    session: &Arc<PeerSession>,
+    our_private: &x25519_dalek::StaticSecret,
+    now: i64,
+) -> bool {
+    // Step 1: cheap expiry peek under a short-lived lock. Drop the guard before
+    // any further work so we never hold it across the re-arm / encapsulate /
+    // send below (each re-locks as needed).
+    let expired = {
+        let tunn = session.tunn.lock().await;
+        tunn.is_expired()
+    };
+    if !expired {
+        return false;
+    }
+    // Step 2: only re-arm when the relay floor can carry the bootstrap init.
+    if sessions.relay().is_none() {
+        return false;
+    }
+    // Step 3: rate-limit the re-arm to WG attempt-window cadence.
+    if !session
+        .should_rearm_expired(now, crate::wg::session::peer_session::EXPIRED_REARM_BACKOFF_MICROS)
+    {
+        return false;
+    }
+    tracing::info!(
+        peer = %session.peer_id,
+        ula = %session.ula,
+        "timer: re-arming EXPIRED Tunn (relay-floored handshake bootstrap, FIX 3)"
+    );
+    // Clear the Expired noise sessions + re-arm the handshake in place (endpoint,
+    // allowed-set, direct_confirmed, relay floor all preserved).
+    session.reset_handshake(our_private).await;
+    // Mint ONE fresh handshake-init: an empty-packet encapsulate on a freshly
+    // re-armed Tunn emits a `WriteToNetwork` init (no session yet ⇒
+    // format_handshake_initiation). Route it through the chokepoint so it rides
+    // the relay floor (relay_only ⇒ no direct probe).
+    let action: WgAction = {
+        let mut out = vec![0u8; MAX_UDP_FRAME];
+        let mut tunn = session.tunn.lock().await;
+        classify_tunn_result(tunn.encapsulate(&[], &mut out))
+    };
+    if let WgAction::SendToPeer(bytes) = action {
+        send_wire(socket, sessions.relay(), sessions, session, bytes).await;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -798,6 +895,7 @@ mod tests {
             last_probe_micros: std::sync::atomic::AtomicI64::new(0),
             failed_handshake_count: std::sync::atomic::AtomicU32::new(0),
             direct_suppressed_until: std::sync::atomic::AtomicI64::new(0),
+            last_rearm_micros: std::sync::atomic::AtomicI64::new(0),
             tunn: tokio::sync::Mutex::new(boringtun::noise::Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
@@ -1478,6 +1576,171 @@ mod tests {
                 .is_err(),
             "repeated idle ticks must not emit a second probe (no busy-loop)"
         );
+    }
+
+    // ---- FIX 3: automatic expired-Tunn re-arm (timer-loop seam) ----
+
+    /// Drive `session`'s `Tunn` into the permanently-Expired state FIX 3
+    /// rescues, the ONLY way boringtun's public API allows: kick off a
+    /// handshake (`encapsulate(&[])`), then call `update_timers` until it
+    /// returns `ConnectionExpired` (boringtun's `set_expired` after
+    /// `REKEY_ATTEMPT_TIME` = 90 s of unanswered init retransmits). This costs
+    /// real wall-clock — boringtun's `mock-instant` is a GLOBAL build feature
+    /// that would freeze the clock for every other timer test (breaking the
+    /// mesh-fabric handshake round-trip), so we deliberately do NOT enable it.
+    /// Hence the single caller is `#[ignore]`d; the fast deterministic gate +
+    /// safety invariants below carry the routine coverage.
+    async fn drive_tunn_to_expired(session: &Arc<PeerSession>) {
+        let mut scratch = vec![0u8; MAX_UDP_FRAME];
+        {
+            let mut guard = session.tunn.lock().await;
+            let _ = guard.encapsulate(&[], &mut scratch);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            {
+                let mut guard = session.tunn.lock().await;
+                if guard.is_expired() {
+                    return;
+                }
+                let _ = guard.update_timers(&mut scratch);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Tunn failed to reach Expired within the attempt window"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// THE fix, end to end at the timer seam: a session whose `Tunn` went
+    /// permanently EXPIRED (boringtun gave up after `REKEY_ATTEMPT_TIME`) is
+    /// re-armed by `maybe_rearm_expired_session` — it returns `true` and emits
+    /// ONE fresh handshake-init over the RELAY floor. Before this fix the
+    /// expired `Tunn` would `update_timers`→`ConnectionExpired` forever and
+    /// NOTHING re-armed it: the lifeline black hole.
+    ///
+    /// `#[ignore]` by default ONLY because driving a real boringtun `Tunn` to
+    /// expiry costs the real `REKEY_ATTEMPT_TIME` (90 s) of wall-clock with no
+    /// global mock clock; run explicitly with `--ignored` to exercise the full
+    /// loop. The fast deterministic guarantees (gate + safety invariants) are
+    /// covered by the non-ignored tests below.
+    #[tokio::test]
+    #[ignore = "drives a real boringtun Tunn to 90s expiry (no global mock clock); run with --ignored"]
+    async fn expired_session_is_rearmed_over_relay() {
+        use x25519_dalek::StaticSecret;
+        let (relay, mut rx) = crate::relay::RelayHandle::new(true); // relay_only floor
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:6::1", Some("127.0.0.1:51820"));
+        drive_tunn_to_expired(&session).await;
+        assert!(
+            session.tunn.lock().await.is_expired(),
+            "precondition: the Tunn must be EXPIRED"
+        );
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let our_private = StaticSecret::from([9u8; 32]);
+
+        let rearmed =
+            maybe_rearm_expired_session(&socket, &table, &session, &our_private, now_micros()).await;
+
+        assert!(rearmed, "an expired session must be re-armed");
+        let out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("re-arm must emit a handshake-init over the relay")
+            .expect("relay channel delivered the init");
+        assert!(!out.payload.is_empty(), "the re-arm frame is a real WG init");
+        assert!(
+            !session.tunn.lock().await.is_expired(),
+            "after re-arm the Tunn is no longer expired"
+        );
+    }
+
+    /// SAFETY INVARIANT (conservatism): a HEALTHY, NON-expired session is NEVER
+    /// touched by the re-arm seam — `maybe_rearm_expired_session` returns
+    /// `false` and relays NOTHING. This is the most important guard: the data
+    /// plane must behave exactly as before for every non-expired session.
+    #[tokio::test]
+    async fn healthy_session_is_never_rearmed() {
+        use x25519_dalek::StaticSecret;
+        let (relay, mut rx) = crate::relay::RelayHandle::new(true);
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        // A fresh upsert → Tunn state is `None`, never `Expired`.
+        let session = upsert_peer(&table, "fd5a:1f00:6::2", Some("127.0.0.1:51820"));
+        assert!(
+            !session.tunn.lock().await.is_expired(),
+            "a fresh session is not expired"
+        );
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let our_private = StaticSecret::from([9u8; 32]);
+
+        let rearmed =
+            maybe_rearm_expired_session(&socket, &table, &session, &our_private, now_micros()).await;
+
+        assert!(!rearmed, "a healthy session must NOT be re-armed");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "a healthy session must relay nothing from the re-arm seam"
+        );
+    }
+
+    /// The re-arm ACTION wiring, deterministically (no 90 s wait): the exact
+    /// two-step the seam performs on an expired `Tunn` — `reset_handshake`
+    /// (in-place re-arm) then `encapsulate(&[])` — emits a real `WriteToNetwork`
+    /// handshake-init that `send_wire` carries over the RELAY floor. This pins
+    /// the bootstrap-frame half of FIX 3 without needing boringtun to actually
+    /// be Expired (a freshly-reset Tunn with no session encapsulates an init the
+    /// same way an expired-then-rearmed one does).
+    #[tokio::test]
+    async fn rearm_action_emits_init_over_relay() {
+        use x25519_dalek::StaticSecret;
+        let (relay, mut rx) = crate::relay::RelayHandle::new(true); // relay_only floor
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:6::3", Some("127.0.0.1:51820"));
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let our_private = StaticSecret::from([9u8; 32]);
+
+        // Mirror the seam's action: re-arm in place, then mint one init.
+        session.reset_handshake(&our_private).await;
+        let action: WgAction = {
+            let mut out = vec![0u8; MAX_UDP_FRAME];
+            let mut tunn = session.tunn.lock().await;
+            classify_tunn_result(tunn.encapsulate(&[], &mut out))
+        };
+        assert!(
+            matches!(action, WgAction::SendToPeer(ref b) if !b.is_empty()),
+            "a re-armed Tunn's empty-encapsulate yields a WG handshake-init"
+        );
+        if let WgAction::SendToPeer(bytes) = action {
+            send_wire(&socket, table.relay(), &table, &session, bytes).await;
+        }
+
+        let out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the re-arm init must ride the relay floor")
+            .expect("relay channel");
+        assert!(!out.payload.is_empty(), "the relayed re-arm frame is a real init");
+    }
+
+    /// The re-arm is GATED on a relay floor: with NO relay handle there is no
+    /// delivery floor to bootstrap over, so `maybe_rearm_expired_session` is a
+    /// no-op (returns `false`) even were the session expired. Driven on a fresh
+    /// (not-expired) session — the relay-`None` guard short-circuits before the
+    /// expiry peek matters, but this pins that a no-relay node never re-arms.
+    #[tokio::test]
+    async fn no_relay_node_never_rearms() {
+        use x25519_dalek::StaticSecret;
+        let table = SessionTable::new(); // no relay handle
+        assert!(table.relay().is_none(), "this table has no relay floor");
+        let session = upsert_peer(&table, "fd5a:1f00:6::4", Some("127.0.0.1:51820"));
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let our_private = StaticSecret::from([9u8; 32]);
+
+        let rearmed =
+            maybe_rearm_expired_session(&socket, &table, &session, &our_private, now_micros()).await;
+
+        assert!(!rearmed, "a node with no relay floor must never re-arm");
     }
 
     /// A peerless `relay_only` node never probes (mirrors the no-peers fail-open

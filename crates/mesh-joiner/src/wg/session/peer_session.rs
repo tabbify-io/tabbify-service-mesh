@@ -40,6 +40,20 @@ pub const DIRECT_BACKOFF_BASE_MICROS: i64 = 2_000_000;
 /// still periodically re-checking in case the NAT mapping changes.
 pub const DIRECT_BACKOFF_CAP_MICROS: i64 = 300_000_000;
 
+/// Minimum spacing between automatic expired-`Tunn` RE-ARMS (FIX 3).
+///
+/// boringtun gives up on a handshake after `REKEY_ATTEMPT_TIME` (90 s of
+/// retransmitting the init every `REKEY_TIMEOUT`=5 s with no response): it calls
+/// `set_expired()` and from then on EVERY `update_timers` returns
+/// `ConnectionExpired` forever — it never emits another init on its own. A fresh
+/// relay-only ⇄ relay-only peer (the lifeline `fc22:6::1`) whose first 90 s
+/// window lapses without a completed relayed handshake is then permanently
+/// wedged. The timer loop detects the expired `Tunn` and re-arms it (a fresh
+/// handshake-init over the relay floor); this gates the re-arm so a genuinely
+/// unreachable peer retries at WG cadence (~one fresh 90 s attempt-window after
+/// the last), NOT in a tight 200 ms-tick loop. Matches `REKEY_ATTEMPT_TIME`.
+pub const EXPIRED_REARM_BACKOFF_MICROS: i64 = 90_000_000;
+
 /// One peer's encryption state + routing metadata.
 pub struct PeerSession {
     /// The peer's coordinator-assigned id. Useful for tracing.
@@ -108,6 +122,14 @@ pub struct PeerSession {
     /// `now < direct_suppressed_until`, converting the 1/s forever-probe into
     /// bounded, exponentially-spaced attempts. Cleared on a valid inbound rx.
     pub direct_suppressed_until: AtomicI64,
+    /// Unix-micros of the last automatic EXPIRED-`Tunn` re-arm (FIX 3). The
+    /// timer loop re-arms a `Tunn` boringtun gave up on (`set_expired` after
+    /// `REKEY_ATTEMPT_TIME`) so a wedged relay-only ⇄ relay-only session can
+    /// bootstrap; this clock rate-limits the re-arm to one per
+    /// `EXPIRED_REARM_BACKOFF_MICROS` (WG attempt-window cadence) so a
+    /// genuinely-unreachable peer retries at WG speed instead of every 200 ms
+    /// tick. `0` = never re-armed → the first detected expiry re-arms at once.
+    pub last_rearm_micros: AtomicI64,
     /// Boringtun session state. Wrapped in a tokio Mutex so async
     /// send + receive halves can serialise access without holding a
     /// guard across socket I/O.
@@ -234,6 +256,26 @@ impl PeerSession {
         self.direct_suppressed_until.store(0, Ordering::Relaxed);
     }
 
+    /// Rate-limit gate for the automatic expired-`Tunn` RE-ARM (FIX 3):
+    /// returns `true` at most once per `backoff_micros`, stamping the clock when
+    /// it does. The timer loop calls this only after it has already observed
+    /// `Tunn::is_expired()`, so a `true` means "this expired session is due for
+    /// a fresh handshake-init now". The first call (clock = `0`) re-arms
+    /// immediately so a just-wedged session bootstraps without waiting a full
+    /// back-off; subsequent re-arms are spaced at WG attempt-window cadence so a
+    /// genuinely-unreachable peer is not re-armed every 200 ms tick. A relaxed
+    /// load/store is fine — a racing double-read at worst fires one extra init,
+    /// which boringtun's own retransmit logic would emit anyway.
+    pub fn should_rearm_expired(&self, now_micros: i64, backoff_micros: i64) -> bool {
+        let last = self.last_rearm_micros.load(Ordering::Relaxed);
+        if now_micros.saturating_sub(last) >= backoff_micros {
+            self.last_rearm_micros.store(now_micros, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Downgrade a confirmed path back to the relay floor if it has gone
     /// silent for longer than `ttl_micros` (NAT rebind / path death). A
     /// no-op when the path is already unconfirmed or still fresh. Called
@@ -340,6 +382,10 @@ impl std::fmt::Debug for PeerSession {
                 "direct_suppressed_until",
                 &self.direct_suppressed_until.load(Ordering::Relaxed),
             )
+            .field(
+                "last_rearm_micros",
+                &self.last_rearm_micros.load(Ordering::Relaxed),
+            )
             .field("tunn", &"<Tunn>")
             .finish()
     }
@@ -367,6 +413,7 @@ mod tests {
             last_probe_micros: AtomicI64::new(0),
             failed_handshake_count: AtomicU32::new(0),
             direct_suppressed_until: AtomicI64::new(0),
+            last_rearm_micros: AtomicI64::new(0),
             tunn: Mutex::new(Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
@@ -559,6 +606,38 @@ mod tests {
         s.downgrade_direct_if_stale(1_000_000 + 1, DIRECT_PATH_TTL_MICROS);
         assert!(s.direct_confirmed());
         assert_eq!(s.failed_handshake_count(), 0, "a no-op downgrade must not penalise");
+    }
+
+    /// FIX 3 re-arm gate: `should_rearm_expired` fires the FIRST time (clock = 0
+    /// ⇒ a just-wedged session re-arms immediately), is suppressed for a full
+    /// `EXPIRED_REARM_BACKOFF_MICROS` window afterwards (so the 200 ms timer
+    /// tick can NOT tight-loop the re-arm), and fires again once that WG
+    /// attempt-window cadence elapses — so a genuinely-unreachable expired peer
+    /// retries at WG speed, not every tick.
+    #[test]
+    fn should_rearm_expired_rate_limits() {
+        let s = bare_session();
+        let backoff = EXPIRED_REARM_BACKOFF_MICROS;
+        // Use a realistic wall-clock baseline (≫ backoff) so the first call —
+        // with `last_rearm_micros == 0` — always satisfies `now - 0 >= backoff`,
+        // matching the live `now_micros()` magnitude the timer loop feeds in.
+        let base = 1_700_000_000_000_000;
+        assert!(
+            s.should_rearm_expired(base, backoff),
+            "first re-arm fires immediately (clock starts at 0)"
+        );
+        assert!(
+            !s.should_rearm_expired(base + 1, backoff),
+            "a re-arm 1µs later is suppressed (no tight-loop)"
+        );
+        assert!(
+            !s.should_rearm_expired(base + backoff - 1, backoff),
+            "still suppressed just under the back-off window"
+        );
+        assert!(
+            s.should_rearm_expired(base + backoff, backoff),
+            "re-arms again once a full WG attempt-window has elapsed"
+        );
     }
 
     /// A keepalive refresh (`note_direct_rx`) keeps a confirmed-but-idle

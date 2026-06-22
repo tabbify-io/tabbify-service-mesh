@@ -679,6 +679,11 @@ fn resolve_shared_relay_urls(coordinator_url: &str, configured: &[String]) -> Ar
 
 /// Spawn all five background loops and return their join handles in
 /// the order they were spawned.
+// A flat dispatcher: it only destructures the context and `tokio::spawn`s each
+// loop — there is no logic to extract into a helper. One line over the cap after
+// threading `our_private` into the timer loop (FIX 3); same allowance as
+// `join_with_commands` above.
+#[allow(clippy::too_many_lines)]
 fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
     let SpawnContext {
         socket,
@@ -725,10 +730,14 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         shutdown_rx.clone(),
     )));
 
-    // Timer loop — keeps each `Tunn` alive (rekey, keepalives).
+    // Timer loop — keeps each `Tunn` alive (rekey, keepalives) and re-arms an
+    // EXPIRED `Tunn` so a wedged relay-only ⇄ relay-only handshake bootstraps
+    // (FIX 3). `our_private` is the key the in-place re-arm (`reset_handshake`)
+    // needs — threaded in exactly like `force_rehandshake_all` already takes it.
     tasks.push(tokio::spawn(timer_loop(
         socket.clone(),
         sessions.clone(),
+        our_private.clone(),
         shutdown_rx.clone(),
     )));
 

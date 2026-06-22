@@ -653,6 +653,9 @@ impl SessionTable {
             // A freshly-upserted peer starts un-penalised (A-c hysteresis).
             failed_handshake_count: AtomicU32::new(0),
             direct_suppressed_until: AtomicI64::new(0),
+            // Never re-armed yet — the first detected `Tunn` expiry re-arms
+            // at once (FIX 3).
+            last_rearm_micros: AtomicI64::new(0),
             tunn: Mutex::new(tunn),
         });
         // Re-apply any app-ULAs this peer already hosts onto the FRESH
