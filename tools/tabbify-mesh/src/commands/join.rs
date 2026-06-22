@@ -118,6 +118,15 @@ fn build_join_config(args: JoinArgs) -> JoinConfig {
     }
 }
 
+/// Lifeline-distinct executed-nonce sidecar path (FIX 7). Lives in the SAME
+/// `sink_data_dir` as the reboot-guard, but under a `lifeline-`-prefixed name so
+/// it never collides with the supervisor in-process joiner's
+/// `mesh-command-nonces.json` (both default to the identity dir). Factored out
+/// so the lifeline-vs-supervisor distinctness is a directly testable contract.
+fn lifeline_command_nonce_path(sink_data_dir: &std::path::Path) -> std::path::PathBuf {
+    sink_data_dir.join("lifeline-command-nonces.json")
+}
+
 /// Join the mesh, wiring the Track-C signed-command gate + host sink IFF a
 /// non-empty super-admin pubkey is given.
 ///
@@ -138,7 +147,14 @@ async fn join_with_optional_sink(
             let sink = crate::host_sink::build_sink(pubkey_hex, sink_data_dir)
                 .with_context(|| "invalid --super-admin-pubkey (expected 64-char hex)")?;
             println!("Track C: super-admin pubkey configured — signed remote commands ENABLED");
-            Joiner::join_with_commands(config, Some(pubkey), None, Some(sink))
+            // FIX 7: the standalone LIFELINE joiner MUST use a nonce file
+            // DISTINCT from the supervisor's in-process joiner. Passing `None`
+            // here would derive the same `<dataDir>/mesh-command-nonces.json` the
+            // in-process joiner uses (they share `identity_path`'s parent dir),
+            // so the two replay-guards would clobber each other's executed-nonce
+            // ledger. Pin a lifeline-specific path in the SAME sink data dir.
+            let nonce_path = lifeline_command_nonce_path(sink_data_dir);
+            Joiner::join_with_commands(config, Some(pubkey), Some(nonce_path), Some(sink))
                 .await
                 .with_context(|| format!("join failed (coordinator={coordinator})"))
         }
@@ -372,6 +388,26 @@ mod tests {
         );
         assert!(raw.contains("fd5a:1f00:2:3::1"), "ula must be serialized: {raw}");
         assert!(raw.contains("lifeline"), "name must be serialized: {raw}");
+    }
+
+    /// FIX 7: the standalone lifeline joiner derives a nonce path ending in
+    /// `lifeline-command-nonces.json` inside its sink data dir — DISTINCT from
+    /// the supervisor in-process joiner's `mesh-command-nonces.json` (which the
+    /// `None` arm of `join_with_commands` would otherwise derive in the same
+    /// dir), so the two replay-guards never clobber each other.
+    #[test]
+    fn lifeline_command_nonce_path_is_distinct() {
+        let dir = std::path::Path::new("/opt/tabbify/data");
+        let path = lifeline_command_nonce_path(dir);
+        assert!(
+            path.ends_with("lifeline-command-nonces.json"),
+            "lifeline nonce path must end in lifeline-command-nonces.json, got {}",
+            path.display()
+        );
+        // It lives in the given sink data dir...
+        assert_eq!(path.parent(), Some(dir));
+        // ...and is NOT the supervisor in-process joiner's nonce file.
+        assert_ne!(path, dir.join("mesh-command-nonces.json"));
     }
 
     /// A second write overwrites the file atomically (operator always reads the
