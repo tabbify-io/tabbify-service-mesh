@@ -19,7 +19,7 @@ use crate::error::JoinerError;
 use crate::nat::holepunch;
 use crate::peer::PeerInfo;
 use crate::platform;
-use crate::wg::loops::{now_micros, timer_loop, tun_read_loop, udp_recv_loop};
+use crate::wg::loops::{convergence_loop, now_micros, timer_loop, tun_read_loop, udp_recv_loop};
 use crate::wg::persistent_identity;
 use crate::wg::session::{PeerSession, SessionTable};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -338,7 +338,13 @@ impl Joiner {
             || platform::TunRouteSink::new(iface_name.clone()),
             |scope| platform::TunRouteSink::source_scoped(iface_name.clone(), scope),
         ));
-        let sessions = SessionTable::with_route_sink_and_relay(route_sink, relay_handle);
+        // Eager-relay-convergence: the kick queue. `upsert` (including the
+        // initial-roster seed below) enqueues each genuinely-new, non-ephemeral
+        // peer; `convergence_loop` drains it and fires one relay-floored kick so a
+        // passive/far peer converges without waiting on the ~25 s keepalive boot.
+        let (convergence_tx, convergence_rx) = mpsc::unbounded_channel();
+        let sessions = SessionTable::with_route_sink_and_relay(route_sink, relay_handle)
+            .with_convergence_tx(convergence_tx);
         let peer_info: Arc<dashmap::DashMap<Ipv6Addr, PeerInfo>> = Arc::default();
         seed_initial_roster(&sessions, &peer_info, &keypair.private, &resp.peers).await;
 
@@ -385,6 +391,7 @@ impl Joiner {
             command_gate,
             command_sink,
             shutdown_rx,
+            convergence_rx,
         });
 
         spawn_host_integration_loops(
@@ -641,6 +648,8 @@ struct SpawnContext {
     /// Track C: host-side process-effects sink (`RestartJoiner` / `RebootHost`).
     command_sink: Arc<dyn crate::coordinator::command_exec::CommandSink>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Eager-relay-convergence kick queue receiver; drained by `convergence_loop`.
+    convergence_rx: mpsc::UnboundedReceiver<Arc<crate::wg::session::PeerSession>>,
 }
 
 /// Merge the back-compat single [`JoinConfig::relay_url`] into the HA-relay
@@ -707,6 +716,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         command_gate,
         command_sink,
         shutdown_rx,
+        convergence_rx,
     } = ctx;
     let mut tasks: Vec<JoinHandle<()>> = Vec::with_capacity(8);
 
@@ -738,6 +748,15 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         socket.clone(),
         sessions.clone(),
         our_private.clone(),
+        shutdown_rx.clone(),
+    )));
+
+    // Convergence loop — drains the eager-relay-convergence kick queue and fires
+    // ONE relay-floored handshake kick per genuinely-new, non-ephemeral peer, so
+    // a passive/far peer converges without waiting on the ~25 s keepalive boot.
+    tasks.push(tokio::spawn(convergence_loop(
+        sessions.clone(),
+        convergence_rx,
         shutdown_rx.clone(),
     )));
 

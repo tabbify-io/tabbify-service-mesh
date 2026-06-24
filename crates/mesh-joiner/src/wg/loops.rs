@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tabbify_mesh_fabric::tun::TunDevice;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::watch;
 
 /// Count of inbound inner packets dropped because their source address
@@ -166,6 +167,51 @@ async fn send_wire(
         }
     } else {
         tracing::debug!(peer = %session.peer_id, "send_wire: drop (no direct path, no relay)");
+    }
+}
+
+/// Relay-ONLY TX for the convergence kick + brisk re-arm (invariant I2). A
+/// *bootstrap* handshake-init must ride the relay floor ONLY and must NEVER
+/// double as a direct probe at an unproven endpoint — regardless of the LOCAL
+/// node's `relay_only` flag. `send_wire`'s direct-probe guard is
+/// `!relay.relay_only()` (the LOCAL flag, `false` on a default node like a
+/// laptop), so reusing `send_wire` for the kick would direct-dial a far peer's
+/// black-hole endpoint — the 2026-06-07 ignition (minus the `force_resend`
+/// amplifier). Direct attempts are owned EXCLUSIVELY by the governed path
+/// (`send_wire`'s steady-state probe + the coordinator punch directive). This
+/// is byte-identical to `send_wire` EXCEPT it never takes the direct-probe
+/// branch: it stamps the send clock (Track K) and relays, full stop.
+fn send_wire_relay_floored(
+    relay: Option<&RelayHandle>,
+    sessions: &SessionTable,
+    session: &Arc<PeerSession>,
+    bytes: Vec<u8>,
+) {
+    // Track K: stamp the send-attempt clock so a kick / brisk re-arm counts
+    // toward `dataplane_healthy` exactly like `send_wire` does at its chokepoint.
+    sessions.note_send_attempt(now_micros());
+    // Relay floor ONLY — never the UDP socket, never a direct probe, regardless
+    // of the local node's `relay_only` flag. A `--no-relay` node has no floor to
+    // bootstrap over, so the kick is a no-op there (consistent with
+    // `maybe_rearm_expired_session`'s `relay().is_none() ⇒ false` gate, I8).
+    if let Some(relay) = relay {
+        tracing::debug!(peer = %session.peer_id, len = bytes.len(), "send_wire_relay_floored: relay (kick / brisk re-arm)");
+        relay.try_relay(session.peer_pubkey, bytes);
+    } else {
+        tracing::debug!(peer = %session.peer_id, "send_wire_relay_floored: drop (no relay floor — kick is relay-only)");
+    }
+}
+
+/// Select the expired-`Tunn` re-arm BASE window: an EAGER (host/infra) peer that
+/// has not converged uses the BRISK 5 s base so a lossy/passive far peer
+/// bootstraps quickly; everyone else (incl. ephemeral runner-FCs) keeps the 90 s
+/// default. The CAP and the escalating streak (`should_rearm_expired`) are
+/// unchanged — only the base shrinks for eager peers.
+const fn rearm_base_micros(eager: bool) -> i64 {
+    if eager {
+        crate::wg::session::peer_session::CONVERGENCE_REARM_BACKOFF_MICROS
+    } else {
+        crate::wg::session::peer_session::EXPIRED_REARM_BACKOFF_MICROS
     }
 }
 
@@ -591,7 +637,7 @@ pub(crate) async fn timer_loop(
                     // relay floor. Returns BEFORE `update_timers` this tick so a
                     // freshly re-armed session emits its init via the re-arm
                     // path (an expired `update_timers` would only error).
-                    if maybe_rearm_expired_session(&socket, &sessions, &session, &our_private, now)
+                    if maybe_rearm_expired_session(&sessions, &session, &our_private, now)
                         .await
                     {
                         continue;
@@ -602,6 +648,14 @@ pub(crate) async fn timer_loop(
                         match tunn.update_timers(&mut scratch) {
                             boringtun::noise::TunnResult::WriteToNetwork(bytes) => {
                                 Some(bytes.to_vec())
+                            }
+                            boringtun::noise::TunnResult::Err(e) => {
+                                // A permanently-EXPIRED Tunn returns ConnectionExpired
+                                // here forever; `maybe_rearm_expired_session` (run
+                                // BEFORE this) is what bootstraps it back over the
+                                // relay floor. Trace only — behaviour unchanged.
+                                tracing::trace!(?e, peer = %session.peer_id, "timer: update_timers err (expired/idle — re-arm handles expiry)");
+                                None
                             }
                             _ => None,
                         }
@@ -708,11 +762,10 @@ async fn maybe_idle_probe(socket: &UdpSocket, sessions: &SessionTable, now: i64)
 ///      [`PeerSession::reset_handshake`] (clears the Expired noise sessions +
 ///      re-arms via `set_static_private`, preserving endpoint / allowed-set /
 ///      `direct_confirmed` / relay floor), then `encapsulate(&[], …)` to mint
-///      ONE fresh init and route it through [`send_wire`] so it rides the relay
-///      floor. Stamping the back-off in step 3 keeps a genuinely-unreachable
+///      ONE fresh init and route it through [`send_wire_relay_floored`] so it
+///      rides the relay floor ONLY (I2). Stamping the back-off in step 3 keeps a genuinely-unreachable
 ///      peer re-arming at WG attempt-window cadence, not every 200 ms tick.
 async fn maybe_rearm_expired_session(
-    socket: &UdpSocket,
     sessions: &SessionTable,
     session: &Arc<PeerSession>,
     our_private: &x25519_dalek::StaticSecret,
@@ -736,9 +789,11 @@ async fn maybe_rearm_expired_session(
     // (task #14 loop-guard): BASE on the first re-arm, doubling per still-failing
     // re-arm up to CAP, reset on a valid inbound rx — so a chronically dead peer
     // is not re-handshaked at a fixed rate forever.
+    // EAGER (host/infra) peers re-arm on the brisk 5 s base so a lossy/passive
+    // far peer converges quickly; ephemeral/non-eager peers keep the 90 s base.
     if !session.should_rearm_expired(
         now,
-        crate::wg::session::peer_session::EXPIRED_REARM_BACKOFF_MICROS,
+        rearm_base_micros(session.eager_convergence()),
         crate::wg::session::peer_session::EXPIRED_REARM_BACKOFF_CAP_MICROS,
     ) {
         return false;
@@ -761,9 +816,59 @@ async fn maybe_rearm_expired_session(
         classify_tunn_result(tunn.encapsulate(&[], &mut out))
     };
     if let WgAction::SendToPeer(bytes) = action {
-        send_wire(socket, sessions.relay(), sessions, session, bytes).await;
+        // Relay floor ONLY — the re-arm bootstrap must not direct-probe an
+        // unproven endpoint either (invariant I2), exactly like the kick.
+        send_wire_relay_floored(sessions.relay(), sessions, session, bytes);
     }
     true
+}
+
+/// Fire ONE relay-floored convergence kick for a freshly-upserted peer
+/// (eager-relay-convergence). An empty-packet `encapsulate` on the fresh `Tunn`
+/// yields a WG handshake-init (no session yet ⇒ `format_handshake_initiation`),
+/// routed through [`send_wire_relay_floored`] so it rides the relay floor ONLY —
+/// never a direct probe at the peer's (possibly black-hole) candidate endpoint
+/// (invariant I2). This converges a passive/far peer over the relay without
+/// waiting on boringtun's ~25s persistent-keepalive bootstrap.
+async fn kick_convergence_handshake(sessions: &SessionTable, session: &Arc<PeerSession>) {
+    // Empty-packet encapsulate on the fresh Tunn ⇒ a WG handshake-init
+    // (`WriteToNetwork`); the same idiom `maybe_rearm_expired_session` uses.
+    let action: WgAction = {
+        let mut out = vec![0u8; MAX_UDP_FRAME];
+        let mut tunn = session.tunn.lock().await;
+        classify_tunn_result(tunn.encapsulate(&[], &mut out))
+    };
+    if let WgAction::SendToPeer(bytes) = action {
+        // Relay floor ONLY — never a direct probe at an unproven endpoint (I2).
+        send_wire_relay_floored(sessions.relay(), sessions, session, bytes);
+    }
+}
+
+/// Drain the convergence-kick queue (eager-relay-convergence). [`SessionTable::upsert`]
+/// enqueues each genuinely-new, non-ephemeral peer; this loop fires its one
+/// relay-floored [`kick_convergence_handshake`]. Runs alongside `timer_loop` for
+/// the joiner's lifetime; exits on shutdown or when the sender (the table) drops.
+pub(crate) async fn convergence_loop(
+    sessions: SessionTable,
+    mut rx: UnboundedReceiver<Arc<PeerSession>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(session) => kick_convergence_handshake(&sessions, &session).await,
+                    None => return, // sender dropped — nothing more to converge
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -905,6 +1010,7 @@ mod tests {
             direct_suppressed_until: std::sync::atomic::AtomicI64::new(0),
             last_rearm_micros: std::sync::atomic::AtomicI64::new(0),
             rearm_streak: std::sync::atomic::AtomicU32::new(0),
+            eager_convergence: std::sync::atomic::AtomicBool::new(false),
             tunn: tokio::sync::Mutex::new(boringtun::noise::Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
@@ -1171,6 +1277,119 @@ mod tests {
         assert!(
             probe.is_err(),
             "a suppressed candidate must not be probed while in back-off"
+        );
+    }
+
+    /// Invariant I2: the convergence kick / brisk re-arm rides the relay floor
+    /// ONLY and NEVER direct-probes — even on a NON-`relay_only` local node with
+    /// a candidate endpoint and a fresh, unsuppressed session (the exact state
+    /// where plain `send_wire` WOULD fire a direct probe at a possibly-black-hole
+    /// endpoint). This is the corrected core-safety claim: the kick must not
+    /// inherit `send_wire`'s `!relay.relay_only()`-gated direct branch.
+    #[tokio::test]
+    async fn send_wire_relay_floored_never_probes_direct_even_on_non_relay_only_node() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new(false); // NON relay_only — the critical case
+        let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst = receiver.local_addr().unwrap();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        // Fresh session: unconfirmed, never-probed, NOT suppressed, WITH a
+        // candidate endpoint ⇒ plain send_wire would direct-probe it.
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
+
+        send_wire_relay_floored(table.relay(), &table, &session, b"kick".to_vec());
+
+        // The relay floor carries the bootstrap init.
+        let relayed = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("frame relayed (the floor)")
+            .expect("relay channel");
+        assert_eq!(relayed.payload, b"kick");
+
+        // ...but the candidate endpoint is NEVER direct-probed.
+        let mut buf = vec![0u8; MAX_UDP_FRAME];
+        let probe =
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf)).await;
+        assert!(
+            probe.is_err(),
+            "the relay-floored kick must NEVER direct-probe, even on a non-relay_only node with a candidate endpoint"
+        );
+    }
+
+    /// The convergence kick mints a real handshake-init via empty-encapsulate and
+    /// relays it, while NEVER direct-probing the candidate endpoint (I2).
+    #[tokio::test]
+    async fn convergence_kick_rides_relay_floor_and_never_probes() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new(false);
+        let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst = receiver.local_addr().unwrap();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
+
+        kick_convergence_handshake(&table, &session).await;
+
+        let relayed = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the kick relays a handshake-init")
+            .expect("relay channel");
+        assert!(!relayed.payload.is_empty(), "a real WG handshake-init was relayed");
+
+        let mut buf = vec![0u8; MAX_UDP_FRAME];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the convergence kick must never direct-probe the candidate endpoint (I2)"
+        );
+    }
+
+    /// `convergence_loop` drains the queue and fires the relay-floored kick for
+    /// each enqueued session.
+    #[tokio::test]
+    async fn convergence_loop_drains_and_kicks() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new(false);
+        let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst = receiver.local_addr().unwrap();
+        let (conv_tx, conv_rx) = tokio::sync::mpsc::unbounded_channel();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay))
+            .with_convergence_tx(conv_tx);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let loop_table = table.clone();
+        let handle = tokio::spawn(async move { convergence_loop(loop_table, conv_rx, sd_rx).await });
+
+        // upsert enqueues a new non-ephemeral peer ⇒ the loop kicks it.
+        let _ = upsert_peer(&table, "fd5a:1f00:1::2", Some(&dst.to_string()));
+
+        let relayed = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the loop drained the enqueued session and kicked")
+            .expect("relay channel");
+        assert!(!relayed.payload.is_empty());
+
+        // Dropping the table drops the only convergence sender → the loop ends.
+        drop(table);
+        let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
+    }
+
+    /// Cycle 5: an eager (host/infra) session re-arms on the BRISK 5 s base; an
+    /// ephemeral runner-FC keeps the 90 s default. Pure base-selection — the
+    /// real-clock expiry path stays `#[ignore]` nightly.
+    #[test]
+    fn eager_session_rearms_brisk_ephemeral_stays_slow() {
+        use crate::wg::session::peer_session::{
+            CONVERGENCE_REARM_BACKOFF_MICROS, EXPIRED_REARM_BACKOFF_MICROS,
+        };
+        let table = SessionTable::new();
+        let eager = upsert_peer(&table, "fd5a:1f00:1::1", None);
+        let ephemeral = upsert_peer(&table, "fd5a:1f02:abcd::1", None);
+        assert!(eager.eager_convergence(), "a host/infra peer is eager");
+        assert!(!ephemeral.eager_convergence(), "a runner-FC is not eager");
+        assert_eq!(
+            rearm_base_micros(eager.eager_convergence()),
+            CONVERGENCE_REARM_BACKOFF_MICROS
+        );
+        assert_eq!(
+            rearm_base_micros(ephemeral.eager_convergence()),
+            EXPIRED_REARM_BACKOFF_MICROS
         );
     }
 
@@ -1646,11 +1865,10 @@ mod tests {
             session.tunn.lock().await.is_expired(),
             "precondition: the Tunn must be EXPIRED"
         );
-        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let our_private = StaticSecret::from([9u8; 32]);
 
         let rearmed =
-            maybe_rearm_expired_session(&socket, &table, &session, &our_private, now_micros()).await;
+            maybe_rearm_expired_session(&table, &session, &our_private, now_micros()).await;
 
         assert!(rearmed, "an expired session must be re-armed");
         let out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -1679,11 +1897,10 @@ mod tests {
             !session.tunn.lock().await.is_expired(),
             "a fresh session is not expired"
         );
-        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let our_private = StaticSecret::from([9u8; 32]);
 
         let rearmed =
-            maybe_rearm_expired_session(&socket, &table, &session, &our_private, now_micros()).await;
+            maybe_rearm_expired_session(&table, &session, &our_private, now_micros()).await;
 
         assert!(!rearmed, "a healthy session must NOT be re-armed");
         assert!(
@@ -1743,11 +1960,10 @@ mod tests {
         let table = SessionTable::new(); // no relay handle
         assert!(table.relay().is_none(), "this table has no relay floor");
         let session = upsert_peer(&table, "fd5a:1f00:6::4", Some("127.0.0.1:51820"));
-        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let our_private = StaticSecret::from([9u8; 32]);
 
         let rearmed =
-            maybe_rearm_expired_session(&socket, &table, &session, &our_private, now_micros()).await;
+            maybe_rearm_expired_session(&table, &session, &our_private, now_micros()).await;
 
         assert!(!rearmed, "a node with no relay floor must never re-arm");
     }
