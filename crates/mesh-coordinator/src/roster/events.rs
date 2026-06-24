@@ -168,3 +168,27 @@ impl MeshEvent for HolePunchInitiate {
         "holepunch_initiate"
     }
 }
+
+/// Stage-3 relay-RENDEZVOUS nudge — the relay tells a COLD destination to fire
+/// back so a cold pair converges.
+///
+/// Emitted by the relay (`route_uplink`) when a handshake-INIT arrives for a
+/// destination with no live relay drain (a passive peer). The relay still spools
+/// the bytes as before, AND tells the destination to fire its OWN relay-floored
+/// handshake back at the source. A cold `relay_only`↔`relay_only` pair never
+/// converged before because the relay only forwards bytes — it never made the
+/// destination RESPOND; this closes that gap (both sides then hold an init over
+/// the relay → they converge). Routed to a single peer (`recipient_peer_id`)
+/// like a hole-punch; transient (NOT event-logged — no `MeshEvent` impl).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RelayWake {
+    /// The cold destination that should wake and kick back; the per-viewer SSE
+    /// filter routes this frame to exactly this peer.
+    pub recipient_peer_id: String,
+    /// The mesh ULA of the SOURCE the recipient should fire its relay-floored
+    /// convergence kick toward (the recipient looks it up in its own session
+    /// table by ULA).
+    pub source_ula: String,
+    /// Emission wall-clock micros.
+    pub timestamp_micros: i64,
+}

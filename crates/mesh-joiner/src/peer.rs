@@ -103,6 +103,11 @@ pub enum PeerEventKind {
     /// SSE consumer forwards it to the hole-punch task instead of touching
     /// the session table.
     HolePunch,
+    /// Stage 3 — a relay-rendezvous wake: a cold peer is told the source named
+    /// in the payload is trying to reach it, so it should fire a relay-floored
+    /// convergence kick back at that source. Not a roster mutation; the SSE
+    /// consumer enqueues the source session for a kick.
+    RelayWake,
 }
 
 impl PeerEventKind {
@@ -114,6 +119,7 @@ impl PeerEventKind {
             "peer_updated" => Some(Self::Updated),
             "peer_removed" => Some(Self::Removed),
             "holepunch_initiate" => Some(Self::HolePunch),
+            "relay_wake" => Some(Self::RelayWake),
             _ => None,
         }
     }

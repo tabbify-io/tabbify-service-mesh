@@ -100,6 +100,12 @@ const SPOOL_CAP: usize = 16;
 /// older is dropped rather than delivered stale.
 const SPOOL_TTL: Duration = Duration::from_secs(2);
 
+/// How long a destination is on cooldown after a relay-rendezvous wake. ≥ the
+/// boringtun `REKEY_TIMEOUT` (5s) so a single cold-handshake attempt's
+/// retransmits produce exactly ONE wake; the next genuine attempt window can
+/// wake it again.
+const WAKE_COOLDOWN: Duration = Duration::from_secs(5);
+
 /// Ephemeral pubkey → live-WS registry.
 ///
 /// Keyed by the RAW 32-byte X25519 pubkey, exactly like `Inner.by_pubkey`.
@@ -120,6 +126,11 @@ pub struct RelayRegistry {
     /// the flush re-routes it through [`Self::forward`] (lane + fallback).
     spool: Arc<DashMap<Vec<u8>, VecDeque<SpooledFrame>>>,
     next_id: Arc<AtomicU64>,
+    /// Relay-rendezvous wake rate-limit, keyed by DESTINATION pubkey. A cold
+    /// destination is woken at most once per [`WAKE_COOLDOWN`] no matter how many
+    /// times a retransmitting source re-sends its handshake-init — without this
+    /// a source's normal 5s `REKEY` retransmits would amplify into a wake storm.
+    wake_cooldown: Arc<DashMap<Vec<u8>, Instant>>,
 }
 
 impl RelayRegistry {
@@ -127,6 +138,29 @@ impl RelayRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Claim the right to emit ONE relay-rendezvous wake toward `dst`. Returns
+    /// `true` (and arms the cooldown) when no wake has fired for `dst` within
+    /// [`WAKE_COOLDOWN`], else `false`. This is the idempotence guard (R2): K
+    /// duplicate handshake-init uplinks to a still-cold `dst` yield ≤1 wake per
+    /// window, so a retransmitting source cannot amplify wakes.
+    pub fn take_wake_slot(&self, dst: &[u8]) -> bool {
+        let now = Instant::now();
+        match self.wake_cooldown.entry(dst.to_vec()) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                if now.duration_since(*e.get()) >= WAKE_COOLDOWN {
+                    *e.get_mut() = now;
+                    true
+                } else {
+                    false
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                e.insert(now);
+                true
+            }
+        }
     }
 
     /// Register a single-lane connection's send channel under `(pubkey,

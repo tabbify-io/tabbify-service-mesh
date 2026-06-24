@@ -17,8 +17,10 @@
 //! unauthenticated in insecure mode (matches the current register posture); the
 //! claimed pubkey must still resolve to a registered peer.
 
+use crate::http::sse::PeerEvent;
 use crate::relay::{Lane, decode_relay_frame, encode_relay_frame};
 use crate::roster::coordinator::Coordinator;
+use crate::roster::events::RelayWake;
 use base64::Engine as _;
 // base64url (no padding): the pubkey rides in the URL query, where standard
 // base64's `+`/`/` are unsafe (`+` decodes to a space). The joiner encodes the
@@ -126,6 +128,9 @@ pub fn route_uplink(
     // behind thousands of data frames — the cause of REKEY_TIMEOUT mid-transfer
     // (the tunnel then dies and the long transfer EOFs).
     let hi_prio = payload.first().is_some_and(|&t| matches!(t, 1..=3));
+    // A handshake-INIT (type 1) to a cold destination is the relay-rendezvous
+    // trigger below. Capture it before `payload` is moved into the downlink.
+    let is_init = payload.first() == Some(&1);
     let downlink = encode_relay_frame(my_pubkey, payload);
     if coordinator.relay().forward(&dst, downlink.clone(), hi_prio) {
         tracing::debug!(
@@ -148,8 +153,43 @@ pub fn route_uplink(
             dst = %B64URL.encode(dst),
             "relay: not forwarded (destination not yet connected → spooled, or lo congested → dropped)"
         );
+        // Relay-RENDEZVOUS (R2): a handshake-INIT for a COLD destination means a
+        // cold pair that would otherwise never converge — the relay only spools
+        // bytes, it never makes the destination RESPOND. Nudge the destination
+        // over the SSE control plane to fire its OWN relay-floored convergence
+        // kick back at the source, so both sides hold an init over the relay and
+        // converge. Only on a type-1 INIT (steady-state data to a momentarily-
+        // cold peer must not spam wakes), only when BOTH peers resolve, and at
+        // most once per `WAKE_COOLDOWN` per destination (idempotence — a
+        // retransmitting source can't amplify wakes). `take_wake_slot` is checked
+        // LAST so the cooldown is only armed when a wake actually fires.
+        if is_init
+            && let Some((recipient, _)) = coordinator.peer_for_pubkey(&dst)
+            && let Some((_, source_ula)) = coordinator.peer_for_pubkey(my_pubkey)
+            && coordinator.relay().take_wake_slot(&dst)
+        {
+            coordinator.broadcaster().broadcast(PeerEvent::RelayWake(RelayWake {
+                recipient_peer_id: recipient.to_string(),
+                source_ula: source_ula.to_string(),
+                timestamp_micros: wall_micros(),
+            }));
+            tracing::debug!(
+                dst = %B64URL.encode(dst),
+                src = %B64URL.encode(my_pubkey),
+                "relay-rendezvous: woke cold destination to kick back"
+            );
+        }
         None
     }
+}
+
+/// Wall-clock micros for event timestamps (best-effort; 0 before the epoch).
+fn wall_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_micros()).ok())
+        .unwrap_or(0)
 }
 
 /// `WebSocket` relay upgrade. Validates the claimed pubkey (must be 32 raw
@@ -330,6 +370,85 @@ mod tests {
         assert_eq!(&forwarded[32..], b"ping");
         let received = b_rx.try_recv().expect("b received the downlink");
         assert_eq!(received, forwarded);
+    }
+
+    /// Relay-rendezvous (R2): a handshake-INIT to a COLD destination (no live
+    /// relay WS) broadcasts ONE `RelayWake` addressed to that destination,
+    /// naming the source's ULA — so the destination kicks back and the cold
+    /// pair converges (the relay never made the destination respond before).
+    #[tokio::test]
+    async fn route_uplink_wakes_cold_destination_on_init() {
+        let c = coordinator();
+        let (a, _) = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
+        let (b, _) = c
+            .register(req(2, "b", "svc", &["tag:svc"]))
+            .await
+            .expect("b");
+        let mut sub = c.broadcaster().subscribe();
+        // B has NO live relay conn registered ⇒ cold. Type-1 handshake-init.
+        let uplink = encode_relay_frame(&[2u8; 32], &[1u8, 0, 0, 0]);
+        let out = route_uplink(&c, &[1u8; 32], &uplink);
+        assert!(out.is_none(), "cold dst ⇒ spooled, not forwarded");
+        match sub.try_recv().expect("a relay-wake was broadcast") {
+            PeerEvent::RelayWake(rw) => {
+                assert_eq!(rw.recipient_peer_id, b.peer_id.to_string());
+                assert_eq!(rw.source_ula, a.ula.to_string());
+            }
+            other => panic!("expected RelayWake, got {other:?}"),
+        }
+    }
+
+    /// Idempotence (R2): K duplicate init uplinks to a still-cold destination
+    /// produce EXACTLY ONE wake — a retransmitting source can't amplify wakes.
+    #[tokio::test]
+    async fn rendezvous_wake_is_idempotent_no_amplification() {
+        let c = coordinator();
+        let _ = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
+        let _ = c
+            .register(req(2, "b", "svc", &["tag:svc"]))
+            .await
+            .expect("b");
+        let mut sub = c.broadcaster().subscribe();
+        let uplink = encode_relay_frame(&[2u8; 32], &[1u8]);
+        for _ in 0..5 {
+            route_uplink(&c, &[1u8; 32], &uplink);
+        }
+        assert!(
+            matches!(sub.try_recv(), Ok(PeerEvent::RelayWake(_))),
+            "exactly one wake fires"
+        );
+        assert!(
+            sub.try_recv().is_err(),
+            "≤1 wake per cooldown window — no amplification"
+        );
+    }
+
+    /// Steady-state transport data (type 4) to a momentarily-cold peer must NOT
+    /// fire a wake — only a type-1 handshake-init is the rendezvous trigger.
+    #[tokio::test]
+    async fn route_uplink_no_wake_for_non_init_frame() {
+        let c = coordinator();
+        let _ = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
+        let _ = c
+            .register(req(2, "b", "svc", &["tag:svc"]))
+            .await
+            .expect("b");
+        let mut sub = c.broadcaster().subscribe();
+        let uplink = encode_relay_frame(&[2u8; 32], &[4u8]);
+        route_uplink(&c, &[1u8; 32], &uplink);
+        assert!(
+            sub.try_recv().is_err(),
+            "transport data to a cold peer must not wake"
+        );
     }
 
     /// Rollout back-compat at the routing layer: a HANDSHAKE-typed uplink

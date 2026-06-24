@@ -312,6 +312,23 @@ impl SessionTable {
         self
     }
 
+    /// Enqueue an EXISTING peer session (looked up by ULA) for ONE relay-floored
+    /// convergence kick — the joiner's response to a relay-rendezvous `RelayWake`
+    /// naming this `source_ula` as a cold peer trying to reach us. Reuses the
+    /// eager-convergence machinery: `convergence_loop` drains it and fires
+    /// `kick_convergence_handshake` (`encapsulate(&[])` → a handshake-init on a
+    /// cold `Tunn`, a harmless keepalive on an established one), ALWAYS relay-
+    /// floored (I2). No-op when the peer is unknown or no convergence channel is
+    /// wired (`--no-relay` / tests). Idempotence is enforced coordinator-side
+    /// (the per-dst wake cooldown), so this needs no rate-limit of its own.
+    pub fn request_convergence_kick(&self, ula: Ipv6Addr) {
+        if let Some(tx) = &self.convergence_tx
+            && let Some(session) = self.by_ula.get(&ula).map(|kv| kv.value().clone())
+        {
+            let _ = tx.send(session);
+        }
+    }
+
     /// Borrow the relay handle, if this table was built with one. The WG
     /// TX/timer loops call this to relay a packet when no direct endpoint
     /// is known.
@@ -1040,6 +1057,28 @@ mod liveness_tests {
             .try_recv()
             .expect("a new non-ephemeral peer is enqueued for the convergence kick");
         assert_eq!(got.ula, info.ula);
+    }
+
+    /// Relay-rendezvous: `request_convergence_kick` enqueues an EXISTING session
+    /// (looked up by ULA) for a relay-floored kick — the joiner's response to a
+    /// `RelayWake` naming that source. An unknown ULA is a safe no-op.
+    #[test]
+    fn request_convergence_kick_enqueues_known_peer_and_noops_unknown() {
+        let me = StaticSecret::from([9u8; 32]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let t = SessionTable::new().with_convergence_tx(tx);
+        let info = mk_info("fd5a:1f00:1::1", 1, Some("127.0.0.1:51820"));
+        t.upsert(&me, &info);
+        let _ = rx.try_recv(); // drain the eager upsert enqueue
+        // A wake naming this peer's ULA enqueues it for the kick-back.
+        t.request_convergence_kick(info.ula);
+        let got = rx
+            .try_recv()
+            .expect("a known peer is enqueued for the rendezvous kick");
+        assert_eq!(got.ula, info.ula);
+        // An unknown ULA is a safe no-op (no panic, no enqueue).
+        t.request_convergence_kick("fd5a:1f00:9::9".parse().unwrap());
+        assert!(rx.try_recv().is_err(), "unknown peer ⇒ no enqueue");
     }
 
     /// Invariant I11: a same-pubkey re-upsert (the ~20s `peer_updated` path)

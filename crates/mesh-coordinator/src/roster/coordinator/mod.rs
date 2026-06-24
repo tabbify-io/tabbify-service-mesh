@@ -542,6 +542,17 @@ impl Coordinator {
         self.inner.by_pubkey.contains_key(pk)
     }
 
+    /// Resolve a raw WG pubkey to `(peer_id, ula)` via the `by_pubkey` index +
+    /// roster. Used by the relay-rendezvous wake (`route_uplink`) to address the
+    /// wake to the cold destination (its `peer_id`) and to tell that destination
+    /// which source ULA to kick back toward. `None` for an unknown pubkey.
+    #[must_use]
+    pub fn peer_for_pubkey(&self, pk: &[u8]) -> Option<(Uuid, std::net::Ipv6Addr)> {
+        let peer_id = *self.inner.by_pubkey.get(pk)?;
+        let entry = self.inner.roster.get(&peer_id)?;
+        Some((peer_id, entry.ula))
+    }
+
     /// Snapshot the entire roster, ordered by `peer_index` for stable output.
     /// Each peer's `connectivity` is its PER-MACHINE self-view
     /// ([`Self::self_connectivity`]) — the meaningful default the admin pill

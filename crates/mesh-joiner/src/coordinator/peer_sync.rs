@@ -281,11 +281,42 @@ pub async fn apply_event(
                 }
             }
         }
+        PeerEventKind::RelayWake => apply_relay_wake(sessions, data),
     }
     // `our_private` is used by the upsert paths above; explicitly
     // ignore the parameter on the `Removed` arm so clippy doesn't
     // complain about the dead use.
     let _ = our_private;
+}
+
+/// Handle a relay-rendezvous `RelayWake`: a COLD source named in the payload is
+/// trying to reach us, so fire our OWN relay-floored convergence kick back at it
+/// (reusing the eager-convergence machinery — the relay only forwarded the
+/// source's init, it never made us respond). Split out of [`apply_event`] to
+/// keep that function within the line budget.
+fn apply_relay_wake(sessions: &SessionTable, data: &str) {
+    #[derive(serde::Deserialize)]
+    struct RelayWakePayload {
+        source_ula: String,
+    }
+    match serde_json::from_str::<RelayWakePayload>(data) {
+        Ok(w) => match w.source_ula.parse::<std::net::Ipv6Addr>() {
+            Ok(ula) => {
+                tracing::info!(
+                    ula = %ula,
+                    event = "relay_wake",
+                    "peer-stream: relay-rendezvous wake → kicking source back over the relay floor"
+                );
+                sessions.request_convergence_kick(ula);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, body = %data, "peer-stream: bad relay_wake source_ula");
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, body = %data, "peer-stream: bad relay_wake json");
+        }
+    }
 }
 
 /// Sleep for `dur` unless `shutdown` fires first. Returns `true` if

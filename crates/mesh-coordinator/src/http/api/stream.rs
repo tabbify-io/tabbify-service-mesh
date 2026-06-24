@@ -153,6 +153,17 @@ impl ViewerFilter {
                     None
                 }
             }
+            // A relay-rendezvous wake goes only to the cold destination told to
+            // kick back. Routed by recipient id, not tags — and never gated by
+            // `revealed`, since the wake can be needed before either peer has
+            // appeared in the other's roster view (the passive-peer case).
+            PeerEvent::RelayWake(ref rw) => {
+                if rw.recipient_peer_id == self.viewer_id.to_string() {
+                    Some(to_sse_frame(&event))
+                } else {
+                    None
+                }
+            }
         }
     }
 }

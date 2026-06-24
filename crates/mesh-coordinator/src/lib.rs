@@ -39,6 +39,6 @@ pub use publisher::{EventPublisher, NoopPublisher};
 pub use relay::RelayRegistry;
 pub use roster::allocator::{DEFAULT_NETWORK_SLOT, ULA_PREFIX_LITERAL, UlaAllocator, network_slot};
 pub use roster::coordinator::{Coordinator, CoordinatorError, PeerEntry};
-pub use roster::events::{HolePunchInitiate, MeshEvent, PeerHeartbeat, PeerJoined, PeerLeft};
+pub use roster::events::{HolePunchInitiate, MeshEvent, PeerHeartbeat, PeerJoined, PeerLeft, RelayWake};
 pub use roster::identity::{NodeIdentity, stamp_identity};
 pub use roster::store::{FileRosterStore, NoopRosterStore, RosterStore, SharedRosterStore};
