@@ -651,6 +651,16 @@ impl Coordinator {
             for p in paths {
                 if let Ok(target) = Uuid::parse_str(&p.peer_id) {
                     edges.insert(target, (p.direct, p.last_rx_age_ms));
+                    // R4: a CONFIRMED direct edge resets this pair's punch
+                    // re-emit escalation streak, so a later flap back to relay
+                    // re-punches briskly at BASE again instead of the decayed
+                    // CAP. Reuses the existing per-pair `direct` signal — no new
+                    // wire field. Canonical key so either reporter hits the same.
+                    if p.direct {
+                        self.inner
+                            .punch_tracker
+                            .note_confirmed(crate::nat::holepunch::canonical_pair(reporter, target));
+                    }
                 }
             }
             entry.paths = edges;
