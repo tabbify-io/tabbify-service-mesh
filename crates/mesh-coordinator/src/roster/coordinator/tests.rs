@@ -585,6 +585,7 @@ async fn heartbeat_emits_holepunch_pair_when_both_peers_have_external() {
     // Passive registrations (no self-report) so the stored endpoint is
     // synthesized reflexively from the heartbeat source — the real NAT-peer
     // path the hole-punch logic targets.
+    c.set_proactive(true); // R7: punch is emitted only with the proactive gate ON
     let (alice, _) = c.register(passive_req(40, "alice")).await.expect("a");
     let (bob, _) = c.register(passive_req(41, "bob")).await.expect("b");
 
@@ -681,6 +682,7 @@ async fn heartbeat_broadcasts_holepunch_pair_to_sse_subscribers() {
     let c = coordinator_with(pub_.clone());
     // Passive registrations (no self-report) so each peer's stored endpoint
     // is the reflexive value synthesized from its heartbeat source IP.
+    c.set_proactive(true); // R7: punch is emitted only with the proactive gate ON
     let (alice, _) = c.register(passive_req(70, "alice")).await.expect("a");
     let (bob, _) = c.register(passive_req(71, "bob")).await.expect("b");
 
@@ -817,6 +819,7 @@ async fn heartbeat_with_empty_external_skips_emit() {
 async fn heartbeat_suppresses_holepunch_when_either_peer_relay_only() {
     let pub_ = StdArc::new(CapturingPublisher::new());
     let c = coordinator_with(pub_.clone());
+    c.set_proactive(true); // gate ON ⇒ relay_only is the ONLY reason to suppress (R6/I9)
     let (alice, _) = c.register(req(80, "alice")).await.expect("a");
     let (bob, _) = c.register(req(81, "bob")).await.expect("b");
 
@@ -873,6 +876,7 @@ async fn heartbeat_suppresses_holepunch_when_either_peer_relay_only() {
 async fn heartbeat_emits_holepunch_for_two_non_relay_only_peers() {
     let pub_ = StdArc::new(CapturingPublisher::new());
     let c = coordinator_with(pub_.clone());
+    c.set_proactive(true); // R7: gate ON ⇒ an unpinned, non-relay_only pair punches
     let (alice, _) = c.register(req(82, "alice")).await.expect("a");
     let (bob, _) = c.register(req(83, "bob")).await.expect("b");
     // Give bob a dialable endpoint, but leave relay_only = false (the
@@ -912,28 +916,27 @@ async fn heartbeat_emits_holepunch_for_two_non_relay_only_peers() {
     );
 }
 
-/// Track A-a: with a pair explicitly flagged `direct`, the coordinator DOES
-/// emit a hole-punch pair EVEN THOUGH one peer is relay-only — the one
-/// deliberate, flagged relaxation of the 06-07 suppression. The flagged
-/// relay-only peer's reflexive endpoint is synthesized from its observed
-/// heartbeat source so the punch has a target. Unflagged relay-only pairs
-/// remain fully suppressed (the existing test still passes).
+/// R6 (INVERTS the old Track A-a relaxation): `relay_only` is a HARD SELF-PIN.
+/// Even with the pair explicitly flagged `direct` AND the global proactive gate
+/// ON, a `relay_only` peer is NEVER punched — its endpoint is a black hole and
+/// dialing it is the exact 2026-06-07 ignition. In the Tailscale model a NAT'd
+/// peer that WANTS direct simply drops `relay_only` (and falls back to relay if
+/// its NAT is un-punchable); `relay_only` is now reserved for peers that must
+/// never be dialed (a netns container, a metered link).
 #[tokio::test]
-async fn flagged_direct_pair_emits_holepunch_despite_relay_only() {
+async fn flagged_direct_pair_still_suppressed_when_relay_only() {
     let pub_ = StdArc::new(CapturingPublisher::new());
     let c = coordinator_with(pub_.clone());
-    // Two peers: alice public, bob relay-only behind NAT (the MSI shape).
+    c.set_proactive(true); // gate ON — and STILL suppressed because bob is relay_only
     let (alice, _) = c.register(req(86, "alice")).await.expect("a");
     let (bob, _) = c.register(req(87, "bob")).await.expect("b");
     {
-        // Mark bob relay-only after register; the reflexive resolver drops its
-        // listen_endpoint, so the only dial target is the synthesized one.
         let mut e = c.inner.roster.get_mut(&bob.peer_id).expect("bob entry");
         e.relay_only = true;
     }
+    // Flag the pair direct UP FRONT — under R6 this must NOT relax the self-pin.
+    c.direct_pair_flags().set_direct(alice.peer_id, bob.peer_id, true);
 
-    // Both heartbeat with a public observed source (so a reflexive endpoint
-    // CAN be synthesized for the flagged pair).
     c.heartbeat(
         alice.peer_id,
         "203.0.113.86:11111".into(),
@@ -957,49 +960,105 @@ async fn flagged_direct_pair_emits_holepunch_despite_relay_only() {
     .await
     .expect("bob hb");
 
-    // Baseline: WITHOUT the flag, no punch fires for the relay_only pair.
     assert_eq!(
         c.punch_tracker().len(),
         0,
-        "relay_only pair must be suppressed until explicitly flagged direct"
+        "R6: a relay_only peer is a hard self-pin — the `direct` flag must NOT relax it"
     );
+    assert_eq!(
+        pub_.count_by_type("holepunch_initiate"),
+        0,
+        "no punch may be emitted toward a relay_only black-hole endpoint, flagged or not"
+    );
+}
 
-    // Flip the per-pair flag direct, then heartbeat again.
+/// R7 deploy default: with the proactive gate OFF (the default), even two
+/// directly-reachable NON-relay_only peers emit NO punch — byte-identical to a
+/// pre-Tailscale deploy. The gate is the only thing that un-suppresses them.
+#[tokio::test]
+async fn proactive_gate_off_suppresses_all_punch_like_today() {
+    let pub_ = StdArc::new(CapturingPublisher::new());
+    let c = coordinator_with(pub_.clone());
+    // Gate is OFF by default — deliberately do NOT call set_proactive.
+    let (alice, _) = c.register(req(90, "alice")).await.expect("a");
+    let (bob, _) = c.register(req(91, "bob")).await.expect("b");
+    {
+        let mut e = c.inner.roster.get_mut(&bob.peer_id).expect("bob entry");
+        e.listen_endpoint = Some("198.51.100.91:51820".into());
+    }
+    c.heartbeat(alice.peer_id, "203.0.113.90:11111".into(), Some(51820), vec![], None, None, false)
+        .await
+        .expect("a hb");
+    c.heartbeat(bob.peer_id, "198.51.100.91:22222".into(), Some(51820), vec![], None, None, false)
+        .await
+        .expect("b hb");
+    assert_eq!(
+        pub_.count_by_type("holepunch_initiate"),
+        0,
+        "gate OFF suppresses every unflagged punch (the pre-Tailscale default)"
+    );
+    assert!(c.punch_tracker().is_empty());
+}
+
+/// R5 back-compat: a per-pair `direct` flag forces a direct attempt for a
+/// NON-pinned, non-relay_only pair EVEN while the global proactive gate is OFF —
+/// the Stage-2 single-pair canary lever, and proof the old direct-flag runbook
+/// still works.
+#[tokio::test]
+async fn direct_true_forces_attempt_even_gate_off() {
+    let pub_ = StdArc::new(CapturingPublisher::new());
+    let c = coordinator_with(pub_.clone());
+    // Gate OFF — the per-pair direct flag must still force the punch.
+    let (alice, _) = c.register(req(92, "alice")).await.expect("a");
+    let (bob, _) = c.register(req(93, "bob")).await.expect("b");
+    {
+        let mut e = c.inner.roster.get_mut(&bob.peer_id).expect("bob entry");
+        e.listen_endpoint = Some("198.51.100.93:51820".into());
+    }
     c.direct_pair_flags().set_direct(alice.peer_id, bob.peer_id, true);
-    c.heartbeat(
-        bob.peer_id,
-        "198.51.100.87:22222".into(),
-        Some(51820),
-        vec![],
-        None,
-        None,
-        true,
-    )
-    .await
-    .expect("bob hb #2");
+    c.heartbeat(alice.peer_id, "203.0.113.92:11111".into(), Some(51820), vec![], None, None, false)
+        .await
+        .expect("a hb");
+    c.heartbeat(bob.peer_id, "198.51.100.93:22222".into(), Some(51820), vec![], None, None, false)
+        .await
+        .expect("b hb");
+    assert_eq!(
+        pub_.count_by_type("holepunch_initiate"),
+        2,
+        "a per-pair direct flag forces a direct attempt even with the gate OFF"
+    );
+}
 
+/// R5: a `pin_to_relay` hard pin suppresses a pair EVEN with the gate ON and
+/// even if `direct` is also set — the relay pin wins over everything.
+#[tokio::test]
+async fn pin_to_relay_true_suppresses_even_gate_on() {
+    let pub_ = StdArc::new(CapturingPublisher::new());
+    let c = coordinator_with(pub_.clone());
+    c.set_proactive(true); // gate ON ...
+    let (alice, _) = c.register(req(94, "alice")).await.expect("a");
+    let (bob, _) = c.register(req(95, "bob")).await.expect("b");
+    {
+        let mut e = c.inner.roster.get_mut(&bob.peer_id).expect("bob entry");
+        e.listen_endpoint = Some("198.51.100.95:51820".into());
+    }
+    // ... but the pair is hard-pinned to relay (and even flagged direct, which
+    // the pin must override).
+    c.direct_pair_flags().set_direct(alice.peer_id, bob.peer_id, true);
+    c.direct_pair_flags()
+        .set_pinned_to_relay(alice.peer_id, bob.peer_id, true);
+    c.heartbeat(alice.peer_id, "203.0.113.94:11111".into(), Some(51820), vec![], None, None, false)
+        .await
+        .expect("a hb");
+    c.heartbeat(bob.peer_id, "198.51.100.95:22222".into(), Some(51820), vec![], None, None, false)
+        .await
+        .expect("b hb");
     assert_eq!(
-        c.punch_tracker().len(),
-        1,
-        "a flagged direct pair MUST emit a hole-punch even with a relay_only peer"
+        pub_.count_by_type("holepunch_initiate"),
+        0,
+        "a relay-pinned pair is never punched, even with the gate on and direct set"
     );
-    // And the punch target for the flagged relay-only peer is its SYNTHESIZED
-    // reflexive endpoint (observed-ip:wg-port), proving the on-the-fly dial
-    // target was built rather than read from a (None) listen_endpoint.
-    let events: Vec<HolePunchInitiate> = pub_
-        .events()
-        .into_iter()
-        .filter(|(t, _, _)| t == "holepunch_initiate")
-        .map(|(_, _, bytes)| serde_json::from_slice::<HolePunchInitiate>(&bytes).expect("decode"))
-        .collect();
-    let to_bob = events
-        .iter()
-        .find(|e| e.target_peer_id == bob.peer_id.to_string())
-        .expect("a punch targeting bob");
-    assert_eq!(
-        to_bob.target_external_endpoint, "198.51.100.87:51820",
-        "flagged relay-only peer's punch target is its synthesized reflexive endpoint"
-    );
+    assert!(c.punch_tracker().is_empty());
 }
 
 /// A relay-only peer registered through the full `register_authenticated`

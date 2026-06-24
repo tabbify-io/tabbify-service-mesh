@@ -58,6 +58,15 @@ struct Args {
     #[arg(long)]
     insecure_no_mtls: bool,
 
+    /// Enable the GLOBAL proactive (always-direct) gate (R7). OFF by default:
+    /// the coordinator emits a hole-punch ONLY for admin-`direct`-flagged pairs
+    /// (byte-identical to a pre-Tailscale deploy). ON: every non-pinned,
+    /// non-`relay_only` pair attempts direct, governed entirely joiner-side. The
+    /// Stage-4 default-on lever AND its kill-switch (unset + restart re-suppresses
+    /// all punches; the coordinator can also flip it live).
+    #[arg(long, env = "TABBIFY_MESH_PROACTIVE", default_value_t = false)]
+    proactive: bool,
+
     /// Path to the declarative ACL policy file (JSON, `{ "acls": [...] }`).
     /// Loaded into the in-memory store at startup. When omitted, the
     /// coordinator starts with the Phase-2 BOOTSTRAP policy — exactly two
@@ -152,6 +161,8 @@ async fn main() -> Result<()> {
         validator,
         roster_store,
     );
+    // Seed the global proactive (always-direct) gate from the CLI/env (R7).
+    coordinator.set_proactive(args.proactive);
 
     // Restore any persisted roster BEFORE serving + before the sweeper runs,
     // so the first re-register hits the idempotent by_pubkey path (same ULA)

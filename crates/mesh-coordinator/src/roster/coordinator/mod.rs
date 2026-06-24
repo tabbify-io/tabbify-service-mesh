@@ -323,6 +323,15 @@ pub(crate) struct Inner {
     /// whole store → every pair returns to relay (the SAFE direction — a restart
     /// never silently leaves a pair direct). Set only via the admin-gated API.
     pub(crate) direct_pair_flags: DirectPairFlags,
+    /// Global PROACTIVE gate (R7) — the always-direct kill-switch. OFF (the
+    /// default) suppresses every NON-`direct`-flagged pair's punch, so a fresh
+    /// deploy is byte-identical to today (only admin-flagged pairs punch). ON
+    /// makes every non-pinned, non-`relay_only` pair attempt direct, governed
+    /// ENTIRELY joiner-side (`force_resend`=false + A-c backoff + relay floor +
+    /// promote-on-DATA — none of which this gate touches). `AtomicBool` so it
+    /// flips LIVE for an instant Stage-4 rollback without dropping the roster.
+    /// Seeded from `TABBIFY_MESH_PROACTIVE` at startup (`main.rs`); default false.
+    pub(crate) proactive: Arc<std::sync::atomic::AtomicBool>,
     /// Ephemeral pubkey → live relay WS connection (Stage-3 relay floor).
     pub(crate) relay: crate::relay::RelayRegistry,
     /// Durable roster snapshot sink. Persisted on every membership change
@@ -412,6 +421,7 @@ impl Coordinator {
                 heartbeat_timeout,
                 punch_tracker: PunchTracker::new(),
                 direct_pair_flags: DirectPairFlags::new(),
+                proactive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 relay: crate::relay::RelayRegistry::new(),
                 roster_store,
             }),
@@ -497,6 +507,26 @@ impl Coordinator {
     #[must_use]
     pub fn direct_pair_flags(&self) -> &DirectPairFlags {
         &self.inner.direct_pair_flags
+    }
+
+    /// `true` iff the global proactive (always-direct) gate is ON. Read at every
+    /// `punch_peer_for_pair` decision; OFF suppresses all non-`direct`-flagged
+    /// punches (R7), so the gate is the global always-direct kill-switch.
+    #[must_use]
+    pub fn proactive_on(&self) -> bool {
+        self.inner
+            .proactive
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Flip the global proactive gate (R7). Seeded from `TABBIFY_MESH_PROACTIVE`
+    /// at startup; flippable LIVE for an instant Stage-4 rollback —
+    /// `set_proactive(false)` re-suppresses every non-flagged punch on the next
+    /// heartbeat with no restart and no roster churn.
+    pub fn set_proactive(&self, on: bool) {
+        self.inner
+            .proactive
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Borrow the relay registry — the WS handler registers/forwards through it.

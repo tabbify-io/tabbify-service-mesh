@@ -19,9 +19,22 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// In-memory per-pair direct-enable flags. Cheap clone (`Arc<DashMap>`).
+///
+/// Two INDEPENDENT per-pair overrides (R5 dual-field):
+/// * `direct` — a per-pair "force-attempt-direct" override: when set, the pair
+///   attempts direct even while the GLOBAL proactive gate is OFF (the back-compat
+///   lever + the Stage-2 single-pair canary). It only relaxes the GATE.
+/// * `pinned_to_relay` — a HARD per-pair relay pin: the pair is NEVER dialed,
+///   winning over the gate AND over `direct`. The admin counterpart to a
+///   self-declared `relay_only` peer.
+///
+/// Both DEFAULT OFF and are set only via the admin-gated API; a coordinator
+/// restart drops the whole store → every pair returns to the relay floor (the
+/// SAFE direction — a restart never silently leaves a pair direct).
 #[derive(Default, Clone)]
 pub struct DirectPairFlags {
     direct: Arc<DashMap<PunchPair, bool>>,
+    pinned_to_relay: Arc<DashMap<PunchPair, bool>>,
 }
 
 impl DirectPairFlags {
@@ -30,6 +43,7 @@ impl DirectPairFlags {
     pub fn new() -> Self {
         Self {
             direct: Arc::new(DashMap::new()),
+            pinned_to_relay: Arc::new(DashMap::new()),
         }
     }
 
@@ -50,10 +64,31 @@ impl DirectPairFlags {
         }
     }
 
-    /// Drop every flag involving `peer_id` (called on deregister/timeout so a
-    /// departed peer leaves no stale direct enable behind).
+    /// `true` iff the (canonical) pair is HARD-pinned to the relay — never
+    /// dialed direct, regardless of the global gate or the `direct` override.
+    #[must_use]
+    pub fn is_pinned_to_relay(&self, a: Uuid, b: Uuid) -> bool {
+        self.pinned_to_relay
+            .get(&canonical_pair(a, b))
+            .is_some_and(|v| *v)
+    }
+
+    /// Set (or clear) the hard relay pin for a pair. `false` clears the entry.
+    pub fn set_pinned_to_relay(&self, a: Uuid, b: Uuid, on: bool) {
+        let key = canonical_pair(a, b);
+        if on {
+            self.pinned_to_relay.insert(key, true);
+        } else {
+            self.pinned_to_relay.remove(&key);
+        }
+    }
+
+    /// Drop every flag (direct AND relay-pin) involving `peer_id` (called on
+    /// deregister/timeout so a departed peer leaves no stale override behind).
     pub fn remove_peer(&self, peer_id: Uuid) {
         self.direct
+            .retain(|&(a, b), _| a != peer_id && b != peer_id);
+        self.pinned_to_relay
             .retain(|&(a, b), _| a != peer_id && b != peer_id);
     }
 
@@ -105,5 +140,39 @@ mod tests {
         flags.remove_peer(a);
         assert!(!flags.is_direct(a, b), "a's pairs are cleared");
         assert!(flags.is_direct(b, c), "unrelated pairs survive");
+    }
+
+    /// The hard relay-pin defaults off, toggles, is order-independent, and is
+    /// INDEPENDENT of the `direct` flag (a pair can be both set-direct and
+    /// pinned — the pin wins at the punch site, but the store holds both).
+    #[test]
+    fn pin_to_relay_defaults_off_and_toggles_independently_of_direct() {
+        let flags = DirectPairFlags::new();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        assert!(!flags.is_pinned_to_relay(a, b), "defaults to not-pinned");
+        flags.set_pinned_to_relay(a, b, true);
+        assert!(flags.is_pinned_to_relay(a, b), "set pins the pair to relay");
+        assert!(flags.is_pinned_to_relay(b, a), "order-independent (canonical)");
+        // Independent of `direct`: setting direct does not touch the pin.
+        flags.set_direct(a, b, true);
+        assert!(flags.is_pinned_to_relay(a, b), "direct flag leaves the pin intact");
+        flags.set_pinned_to_relay(a, b, false);
+        assert!(!flags.is_pinned_to_relay(a, b), "clearing un-pins");
+        assert!(flags.is_direct(a, b), "un-pinning leaves the direct flag intact");
+    }
+
+    /// Removing a peer clears its relay-pins too (not just its direct flags).
+    #[test]
+    fn remove_peer_clears_its_relay_pins() {
+        let flags = DirectPairFlags::new();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let c = Uuid::from_u128(3);
+        flags.set_pinned_to_relay(a, b, true);
+        flags.set_pinned_to_relay(b, c, true);
+        flags.remove_peer(a);
+        assert!(!flags.is_pinned_to_relay(a, b), "a's pins are cleared");
+        assert!(flags.is_pinned_to_relay(b, c), "unrelated pins survive");
     }
 }

@@ -31,11 +31,19 @@ pub struct DirectApiState {
     pub admin_token: Option<String>,
 }
 
-/// `POST` body: whether the pair should be direct (`true`) or relay (`false`).
+/// `POST` body — two INDEPENDENT, optional per-pair overrides (R5 dual-field).
+/// Back-compat: an existing `{"direct": true|false}` body still works verbatim.
 #[derive(Debug, Deserialize)]
 pub struct DirectBody {
-    /// `true` flags the pair for direct WG; `false` clears it (relay floor).
-    pub direct: bool,
+    /// Per-pair "force-attempt-direct" override: `true` makes the pair attempt
+    /// direct even while the GLOBAL proactive gate is OFF (the Stage-2 single-
+    /// pair canary lever); `false` clears it. Absent ⇒ leave it unchanged.
+    #[serde(default)]
+    pub direct: Option<bool>,
+    /// HARD relay pin: `true` pins the pair to the relay (wins over the gate AND
+    /// over `direct`); `false` clears the pin. Absent ⇒ leave it unchanged.
+    #[serde(default)]
+    pub pin_to_relay: Option<bool>,
 }
 
 fn err(status: StatusCode, message: impl Into<String>) -> Response {
@@ -75,13 +83,15 @@ fn parse_uuid(raw: &str) -> Result<Uuid, Box<Response>> {
         .map_err(|e| Box::new(err(StatusCode::BAD_REQUEST, format!("invalid peer id: {e}"))))
 }
 
-/// Set (or clear) the per-pair direct flag (admin-gated, Track A-a).
+/// Set (or clear) the per-pair direct overrides (admin-gated).
 ///
-/// `{"direct": true}` flags the (canonical) pair so the coordinator MAY
-/// synthesize a reflexive endpoint + emit a punch for it even when a peer is
-/// `relay_only` — the one deliberate, observable relaxation of the 2026-06-07
-/// contract. `{"direct": false}` clears it; the pair returns to the relay floor
-/// on the next heartbeat. Returns `204 No Content` on success.
+/// `{"direct": true}` forces the (canonical) pair to attempt direct even while
+/// the global proactive gate is OFF; `{"pin_to_relay": true}` HARD-pins the pair
+/// to the relay (wins over the gate and over `direct`). Either field may be sent
+/// (both optional); `false` clears that override; absent leaves it unchanged.
+/// Returns `204 No Content` on success. NOTE: a self-declared `relay_only` peer
+/// is never dialed regardless of `direct` (R6) — the per-pair `direct` override
+/// only relaxes the GLOBAL gate for a NON-pinned pair.
 pub async fn post_direct_handler(
     State(state): State<DirectApiState>,
     Path((a, b)): Path<(String, String)>,
@@ -99,9 +109,12 @@ pub async fn post_direct_handler(
         Ok(p) => p,
         Err(r) => return *r,
     };
-    state
-        .coordinator
-        .direct_pair_flags()
-        .set_direct(a, b, body.direct);
+    let flags = state.coordinator.direct_pair_flags();
+    if let Some(direct) = body.direct {
+        flags.set_direct(a, b, direct);
+    }
+    if let Some(pin) = body.pin_to_relay {
+        flags.set_pinned_to_relay(a, b, pin);
+    }
     StatusCode::NO_CONTENT.into_response()
 }
