@@ -1058,6 +1058,194 @@ mod tests {
         table.by_ula(ula.parse().unwrap()).unwrap()
     }
 
+    // ===================================================================
+    // Two-node convergence INTEGRATION harness (sudo-free, in-process).
+    //
+    // Models the coordinator relay as a reliable in-process byte-forwarder:
+    // each node's relay-outbound (`RelayOutboundRx`) is ferried into the OTHER
+    // node's `process_inbound_datagram` with `via_direct=false` — exactly the
+    // path a real relay-downlink takes. Two REAL boringtun `Tunn`s thus run a
+    // full WireGuard handshake over the simulated relay, proving a PASSIVE cold
+    // pair (no app traffic, no advertised endpoint) converges end-to-end — the
+    // headline eager-relay-convergence fix — with no TUN, no sudo, no network.
+    //
+    // Lives in this in-crate `#[cfg(test)]` module (not `tests/`) because the
+    // path it drives — `process_inbound_datagram`, `kick_convergence_handshake`,
+    // the `RelayOutboundRx` test drain — is `pub(crate)`.
+    // ===================================================================
+
+    /// One in-process mesh node: a real `SessionTable` (+ relay floor + the
+    /// eager-convergence kick queue), its relay-outbound + kick-queue receivers,
+    /// a silent UDP socket + TUN (the relay-only path touches neither), and its
+    /// own private key (so the two nodes hold DISTINCT keypairs and can actually
+    /// complete a handshake).
+    struct HarnessNode {
+        table: SessionTable,
+        relay_rx: crate::relay::client::RelayOutboundRx,
+        conv_rx: tokio::sync::mpsc::UnboundedReceiver<Arc<PeerSession>>,
+        priv_key: x25519_dalek::StaticSecret,
+        socket: Arc<UdpSocket>,
+        tun: Arc<dyn TunDevice>,
+    }
+
+    async fn harness_node(seed: u8) -> HarnessNode {
+        let (relay, relay_rx) = crate::relay::RelayHandle::new(false); // non-relay_only
+        let (conv_tx, conv_rx) = tokio::sync::mpsc::unbounded_channel();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay))
+            .with_convergence_tx(conv_tx);
+        HarnessNode {
+            table,
+            relay_rx,
+            conv_rx,
+            priv_key: x25519_dalek::StaticSecret::from([seed; 32]),
+            socket: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            tun: Arc::new(NoopTun),
+        }
+    }
+
+    /// Upsert a PASSIVE peer (no advertised endpoint ⇒ pure relay floor) keyed
+    /// by `peer_pub`; returns this node's session for it.
+    fn harness_upsert(node: &HarnessNode, ula: &str, peer_pub: [u8; 32]) -> Arc<PeerSession> {
+        let info = crate::peer::PeerInfo {
+            peer_id: uuid::Uuid::nil(),
+            wg_public_key: peer_pub,
+            ula: ula.parse().unwrap(),
+            listen_endpoint: None,
+            display_name: "peer".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            software_version: None,
+            mesh_version: None,
+            joined_at_micros: 0,
+        };
+        node.table.upsert(&node.priv_key, &info);
+        node.table.by_ula(ula.parse().unwrap()).unwrap()
+    }
+
+    /// Ferry every queued relay-outbound frame from `from` into `to`'s WG
+    /// inbound path (`via_direct=false`, the relay path). `to_sess` is `to`'s
+    /// session for `from`. Returns the number of frames ferried this sweep.
+    async fn pump_relay(
+        from: &mut HarnessNode,
+        to: &HarnessNode,
+        to_sess: &Arc<PeerSession>,
+    ) -> usize {
+        let mut n = 0;
+        while let Ok(frame) = from.relay_rx.try_recv() {
+            process_inbound_datagram(
+                &to.socket,
+                to.table.relay(),
+                false,
+                &to.tun,
+                &to.table,
+                to_sess,
+                &frame.payload,
+            )
+            .await;
+            n += 1;
+        }
+        n
+    }
+
+    async fn handshook(s: &Arc<PeerSession>) -> bool {
+        s.tunn.lock().await.time_since_last_handshake().is_some()
+    }
+
+    /// SCENARIO 1 (the headline fix): a PASSIVE cold pair — both non-ephemeral
+    /// `fd5a:1f00:…`, no app traffic, no advertised endpoint — completes a full
+    /// WG handshake OVER THE RELAY, driven solely by the eager upsert→enqueue→
+    /// kick path. Pre-fix it would wait ~25s on persistent-keepalive (and a
+    /// lossy far pair would wedge forever); here it converges immediately.
+    #[tokio::test]
+    async fn two_node_passive_pair_converges_over_relay_via_eager_kick() {
+        let mut a = harness_node(1).await;
+        let mut b = harness_node(2).await;
+        let pub_a = *x25519_dalek::PublicKey::from(&a.priv_key).as_bytes();
+        let pub_b = *x25519_dalek::PublicKey::from(&b.priv_key).as_bytes();
+        let a_for_b = harness_upsert(&a, "fd5a:1f00:b::1", pub_b);
+        let b_for_a = harness_upsert(&b, "fd5a:1f00:a::1", pub_a);
+
+        // The eager upsert ENQUEUED a's session-for-b for a kick (I11: new +
+        // non-ephemeral). Drain + fire it exactly as `convergence_loop` would —
+        // relay-floored, no direct probe (I2).
+        let kicked = a
+            .conv_rx
+            .try_recv()
+            .expect("eager upsert enqueued the convergence kick");
+        assert_eq!(kicked.ula, a_for_b.ula);
+        kick_convergence_handshake(&a.table, &kicked).await;
+
+        // Pump the sim-relay both ways until quiescent (bounded). init → response
+        // → (keepalive) settles in a few sweeps.
+        let mut ferried = 0;
+        for _ in 0..8 {
+            let na = pump_relay(&mut a, &b, &b_for_a).await;
+            let nb = pump_relay(&mut b, &a, &a_for_b).await;
+            ferried += na + nb;
+            if na == 0 && nb == 0 {
+                break;
+            }
+        }
+
+        assert!(
+            handshook(&a_for_b).await,
+            "node A's session converged (handshake completed over the relay)"
+        );
+        assert!(
+            handshook(&b_for_a).await,
+            "node B's session converged (handshake completed over the relay)"
+        );
+        // Relay-floored / no-storm: convergence rode the simulated relay (frames
+        // ferried) and NOTHING reached either UDP socket — endpoint=None ⇒ no
+        // direct dial path exists, so the cold kick can only be relay-floored (I2).
+        assert!(ferried >= 2, "convergence rode the relay (init + response)");
+        let mut buf = [0u8; 64];
+        assert!(
+            a.socket.try_recv(&mut buf).is_err() && b.socket.try_recv(&mut buf).is_err(),
+            "no direct UDP frame — the cold kick is relay-floored (I2)"
+        );
+    }
+
+    /// SCENARIO 2 (rendezvous joiner-side effect): a node that did NOT kick on
+    /// its own is woken by a `RelayWake` — modelled as
+    /// `SessionTable::request_convergence_kick(source_ula)` — then kicks back
+    /// relay-floored, converging the pair. Proves the wake→kick→converge path.
+    #[tokio::test]
+    async fn rendezvous_request_convergence_kick_converges_the_pair() {
+        let mut a = harness_node(1).await;
+        let mut b = harness_node(2).await;
+        let pub_a = *x25519_dalek::PublicKey::from(&a.priv_key).as_bytes();
+        let pub_b = *x25519_dalek::PublicKey::from(&b.priv_key).as_bytes();
+        let a_for_b = harness_upsert(&a, "fd5a:1f00:b::1", pub_b);
+        let b_for_a = harness_upsert(&b, "fd5a:1f00:a::1", pub_a);
+        // Discard the eager-upsert enqueues — drive convergence SOLELY via the
+        // rendezvous wake to isolate that path.
+        let _ = a.conv_rx.try_recv();
+        let _ = b.conv_rx.try_recv();
+
+        // B receives a RelayWake naming A (the joiner-side effect): enqueue B's
+        // session-for-A for a relay-floored kick-back.
+        b.table.request_convergence_kick(b_for_a.ula);
+        let woken = b
+            .conv_rx
+            .try_recv()
+            .expect("RelayWake enqueued B's kick-back toward A");
+        assert_eq!(woken.ula, b_for_a.ula);
+        kick_convergence_handshake(&b.table, &woken).await;
+
+        for _ in 0..8 {
+            let nb = pump_relay(&mut b, &a, &a_for_b).await;
+            let na = pump_relay(&mut a, &b, &b_for_a).await;
+            if na == 0 && nb == 0 {
+                break;
+            }
+        }
+        assert!(
+            handshook(&a_for_b).await && handshook(&b_for_a).await,
+            "the rendezvous wake converged the pair over the relay"
+        );
+    }
+
     /// When a session has NO direct endpoint and the table carries a relay
     /// handle, `encapsulate_and_send` relays the (encrypted) datagram
     /// instead of dropping it. The relayed payload targets the peer's
