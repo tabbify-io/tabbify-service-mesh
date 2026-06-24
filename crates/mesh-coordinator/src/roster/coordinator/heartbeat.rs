@@ -285,7 +285,7 @@ impl Coordinator {
             ) else {
                 continue;
             };
-            try_emit_pair(
+            if try_emit_pair(
                 self.inner.publisher.as_ref(),
                 &self.inner.broadcaster,
                 &self.inner.punch_tracker,
@@ -293,7 +293,11 @@ impl Coordinator {
                 &pb,
                 now,
             )
-            .await;
+            .await
+            {
+                // Phase-5 metrics: the Stage-4 N²-punch alarm signal.
+                self.note_holepunch_emitted();
+            }
         }
     }
 

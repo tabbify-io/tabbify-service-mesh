@@ -133,6 +133,8 @@ pub fn route_uplink(
     let is_init = payload.first() == Some(&1);
     let downlink = encode_relay_frame(my_pubkey, payload);
     if coordinator.relay().forward(&dst, downlink.clone(), hi_prio) {
+        // Phase-5 metrics: relay offload — this total drops as direct engages.
+        coordinator.note_relay_forwarded(downlink.len());
         tracing::debug!(
             src = %B64URL.encode(my_pubkey),
             dst = %B64URL.encode(dst),
@@ -178,6 +180,7 @@ pub fn route_uplink(
                 src = %B64URL.encode(my_pubkey),
                 "relay-rendezvous: woke cold destination to kick back"
             );
+            coordinator.note_relay_wake_emitted(); // Phase-5 metrics
         }
         None
     }
@@ -426,6 +429,13 @@ mod tests {
         assert!(
             sub.try_recv().is_err(),
             "≤1 wake per cooldown window — no amplification"
+        );
+        // Phase-5: exactly one wake COUNTED despite 5 init uplinks (the counter
+        // tracks real emits, so it inherits the idempotence).
+        assert!(
+            c.render_metrics().contains("relay_wake_emitted_total 1"),
+            "{}",
+            c.render_metrics()
         );
     }
 

@@ -332,6 +332,14 @@ pub(crate) struct Inner {
     /// flips LIVE for an instant Stage-4 rollback without dropping the roster.
     /// Seeded from `TABBIFY_MESH_PROACTIVE` at startup (`main.rs`); default false.
     pub(crate) proactive: Arc<std::sync::atomic::AtomicBool>,
+    /// Phase-5 observability counters (read-only; never affect any routing or
+    /// emit decision — pure atomic side-effects, exposed at `GET /metrics`).
+    /// `relay_forwarded_bytes` proves relay OFFLOAD drops as direct engages;
+    /// `holepunch_emitted` is the Stage-4 N²-punch alarm; `relay_wake_emitted`
+    /// tracks rendezvous nudges.
+    pub(crate) relay_forwarded_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) holepunch_emitted: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) relay_wake_emitted: Arc<std::sync::atomic::AtomicU64>,
     /// Ephemeral pubkey → live relay WS connection (Stage-3 relay floor).
     pub(crate) relay: crate::relay::RelayRegistry,
     /// Durable roster snapshot sink. Persisted on every membership change
@@ -422,6 +430,9 @@ impl Coordinator {
                 punch_tracker: PunchTracker::new(),
                 direct_pair_flags: DirectPairFlags::new(),
                 proactive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                relay_forwarded_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                holepunch_emitted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                relay_wake_emitted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 relay: crate::relay::RelayRegistry::new(),
                 roster_store,
             }),
@@ -527,6 +538,50 @@ impl Coordinator {
         self.inner
             .proactive
             .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Phase-5 metrics: record `bytes` forwarded over the relay floor (read-only
+    /// side-effect; never affects routing).
+    pub fn note_relay_forwarded(&self, bytes: usize) {
+        self.inner
+            .relay_forwarded_bytes
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Phase-5 metrics: record one emitted `HolePunchInitiate` (the Stage-4
+    /// N²-punch alarm signal).
+    pub fn note_holepunch_emitted(&self) {
+        self.inner
+            .holepunch_emitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Phase-5 metrics: record one emitted `RelayWake` rendezvous nudge.
+    pub fn note_relay_wake_emitted(&self) {
+        self.inner
+            .relay_wake_emitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Render the Prometheus-style `/metrics` text exposition — counts only, no
+    /// secrets. A read-only snapshot of the observability counters.
+    #[must_use]
+    pub fn render_metrics(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bytes = self.inner.relay_forwarded_bytes.load(Relaxed);
+        let punches = self.inner.holepunch_emitted.load(Relaxed);
+        let wakes = self.inner.relay_wake_emitted.load(Relaxed);
+        format!(
+            "# HELP relay_forwarded_bytes_total Bytes forwarded over the relay floor.\n\
+             # TYPE relay_forwarded_bytes_total counter\n\
+             relay_forwarded_bytes_total {bytes}\n\
+             # HELP holepunch_emitted_total HolePunchInitiate directives emitted.\n\
+             # TYPE holepunch_emitted_total counter\n\
+             holepunch_emitted_total {punches}\n\
+             # HELP relay_wake_emitted_total RelayWake rendezvous nudges emitted.\n\
+             # TYPE relay_wake_emitted_total counter\n\
+             relay_wake_emitted_total {wakes}\n"
+        )
     }
 
     /// Borrow the relay registry — the WS handler registers/forwards through it.

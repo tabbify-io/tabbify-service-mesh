@@ -23,6 +23,24 @@ fn coordinator() -> Coordinator {
     Coordinator::new(Arc::new(NoopPublisher), Duration::from_secs(60))
 }
 
+/// Phase-5 observability: the rollout counters accumulate and render in the
+/// `/metrics` text exposition. `relay_forwarded_bytes_total` proves relay
+/// OFFLOAD (drops as direct engages); `holepunch_emitted_total` is the Stage-4
+/// N²-punch alarm; `relay_wake_emitted_total` tracks rendezvous nudges.
+#[test]
+fn metrics_counters_increment_and_render() {
+    let c = coordinator();
+    c.note_relay_forwarded(123);
+    c.note_relay_forwarded(7);
+    c.note_holepunch_emitted();
+    c.note_relay_wake_emitted();
+    c.note_relay_wake_emitted();
+    let m = c.render_metrics();
+    assert!(m.contains("relay_forwarded_bytes_total 130"), "{m}");
+    assert!(m.contains("holepunch_emitted_total 1"), "{m}");
+    assert!(m.contains("relay_wake_emitted_total 2"), "{m}");
+}
+
 fn req(seed: u8, name: &str) -> RegisterRequest {
     RegisterRequest {
         wg_public_key: pubkey(seed),
@@ -913,6 +931,13 @@ async fn heartbeat_emits_holepunch_for_two_non_relay_only_peers() {
         pub_.count_by_type("holepunch_initiate"),
         2,
         "two directly-reachable, non-relay-only peers must still pair (2 events)"
+    );
+    // Phase-5: the emit increments the Stage-4 alarm counter exactly once (one
+    // logical pair, regardless of the 2 swapped-endpoint SSE events).
+    assert!(
+        c.render_metrics().contains("holepunch_emitted_total 1"),
+        "{}",
+        c.render_metrics()
     );
 }
 

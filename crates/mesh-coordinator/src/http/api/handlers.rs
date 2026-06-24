@@ -308,3 +308,18 @@ pub async fn peers_handler(
 pub async fn topology_handler(State(coordinator): State<Coordinator>) -> Response {
     Json(coordinator.topology()).into_response()
 }
+
+/// `GET /metrics` — Prometheus-style text exposition of the Phase-5 rollout
+/// observability counters (relay-offload bytes, holepunch emits, relay wakes).
+/// Counts ONLY — no secrets — and unauthenticated so a scraper / an operator's
+/// `curl` can read the V-pill-adjacent signals during a risky rollout step.
+pub async fn metrics_handler(State(coordinator): State<Coordinator>) -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        coordinator.render_metrics(),
+    )
+        .into_response()
+}
