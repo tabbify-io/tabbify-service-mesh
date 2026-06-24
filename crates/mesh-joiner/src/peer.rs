@@ -103,6 +103,11 @@ pub enum PeerEventKind {
     /// SSE consumer forwards it to the hole-punch task instead of touching
     /// the session table.
     HolePunch,
+    /// Stage 3 — a relay-rendezvous wake: a cold peer is told the source named
+    /// in the payload is trying to reach it, so it should fire a relay-floored
+    /// convergence kick back at that source. Not a roster mutation; the SSE
+    /// consumer enqueues the source session for a kick.
+    RelayWake,
 }
 
 impl PeerEventKind {
@@ -114,6 +119,7 @@ impl PeerEventKind {
             "peer_updated" => Some(Self::Updated),
             "peer_removed" => Some(Self::Removed),
             "holepunch_initiate" => Some(Self::HolePunch),
+            "relay_wake" => Some(Self::RelayWake),
             _ => None,
         }
     }
@@ -127,10 +133,47 @@ pub struct PeerRemovedPayload {
     pub peer_id: Uuid,
 }
 
+/// Classify a peer as an EPHEMERAL runner-Firecracker-VM purely by its mesh ULA.
+///
+/// The supervisor's `derive_app_ula` (`tabbify-service-supervisor/src/app_ula.rs`)
+/// mints every per-app runner ULA in the `fd5a:1f02:…` slot (blake3(uuid) → the
+/// second 16-bit segment is ALWAYS `0x1f02`), while every host / infra joiner is
+/// allocated in the `fd5a:1f00:…` slot by the coordinator. So the `1f02`
+/// second-segment test is a COMPLETE classifier needing no new wire field — it
+/// supersedes adding a `kind` to `RemotePeer`. Runner-FCs are numerous + short-
+/// lived, so they stay on the LAZY convergence path; only `!is_ephemeral_peer`
+/// host/infra peers get the eager relay-floored convergence kick.
+pub(crate) const fn is_ephemeral_peer(ula: Ipv6Addr) -> bool {
+    // Second 16-bit segment == 0x1f02 ⇔ a per-app runner ULA (derive_app_ula);
+    // 0x1f00 ⇔ a coordinator-allocated host/infra ULA.
+    ula.segments()[1] == 0x1f02
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Ephemeral runner-FCs get an `fd5a:1f02:…` ULA from the supervisor's
+    /// `derive_app_ula`; host/infra peers are always `fd5a:1f00:…`. The `1f02`
+    /// second-segment check is therefore a complete, wire-free classifier.
+    #[test]
+    fn classifies_ephemeral_runner_fc_by_1f02_ula() {
+        // A runner-FC app-ULA (1f02 slot) is ephemeral → lazy convergence.
+        assert!(is_ephemeral_peer(
+            "fd5a:1f02:abcd:1234:5678::1".parse::<Ipv6Addr>().unwrap()
+        ));
+        // Host / infra peers (1f00 slot) are NOT ephemeral → eager kick.
+        assert!(!is_ephemeral_peer(
+            "fd5a:1f00:0:2::1".parse::<Ipv6Addr>().unwrap()
+        )); // serving supervisor
+        assert!(!is_ephemeral_peer(
+            "fd5a:1f00:fc22:2::1".parse::<Ipv6Addr>().unwrap()
+        )); // MSI host
+        assert!(!is_ephemeral_peer(
+            "fd5a:1f00:fc22:6::1".parse::<Ipv6Addr>().unwrap()
+        )); // lifeline
+    }
 
     #[test]
     fn parses_known_event_names() {

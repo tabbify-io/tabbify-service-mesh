@@ -69,6 +69,16 @@ pub const EXPIRED_REARM_BACKOFF_MICROS: i64 = 90_000_000;
 /// to the responsive BASE cadence.
 pub const EXPIRED_REARM_BACKOFF_CAP_MICROS: i64 = 600_000_000;
 
+/// BRISK re-arm base for an EAGER (host/infra) peer that has not yet converged.
+///
+/// At `= REKEY_TIMEOUT` (5 s) it is the FLOOR that avoids double-minting an init
+/// inside one boringtun REKEY window: boringtun retransmits its own init every
+/// 5 s, so a faster re-arm would race it (WG dedups and the relay carries both,
+/// but 5 s keeps it clean). An eager peer thus re-arms at 5 s → 10 s → … →
+/// [`EXPIRED_REARM_BACKOFF_CAP_MICROS`], converging a lossy WAN far faster than
+/// the 90 s default, while the streak still backs a chronically-dead peer off.
+pub const CONVERGENCE_REARM_BACKOFF_MICROS: i64 = 5_000_000;
+
 /// The escalating expired-`Tunn` re-arm interval for a consecutive-failure
 /// `streak` (task #14 loop-guard).
 ///
@@ -168,6 +178,15 @@ pub struct PeerSession {
     /// to the responsive BASE cadence. Relaxed like the other counters — an
     /// off-by-one in a racing increment only nudges the back-off by one step.
     pub rearm_streak: AtomicU32,
+    /// `true` when this is a long-lived host/infra peer eligible for EAGER
+    /// convergence (set at upsert from `!is_ephemeral_peer`). An eager peer that
+    /// has not yet converged re-arms its expired `Tunn` on the BRISK
+    /// [`CONVERGENCE_REARM_BACKOFF_MICROS`] (5 s) base instead of the 90 s
+    /// default — so a far/lossy/passive peer bootstraps quickly once its first
+    /// cold-handshake window lapses, while ephemeral runner-FCs keep the slow
+    /// default. Relaxed like the other flags; a stale read shifts ONE re-arm
+    /// window at worst.
+    pub eager_convergence: AtomicBool,
     /// Boringtun session state. Wrapped in a tokio Mutex so async
     /// send + receive halves can serialise access without holding a
     /// guard across socket I/O.
@@ -187,6 +206,13 @@ impl PeerSession {
     /// over the wrong path.
     pub fn direct_confirmed(&self) -> bool {
         self.direct_confirmed.load(Ordering::Relaxed)
+    }
+
+    /// `true` when this peer is eligible for eager convergence (a long-lived
+    /// host/infra peer, set at upsert). Drives the BRISK expired-`Tunn` re-arm
+    /// base (`CONVERGENCE_REARM_BACKOFF_MICROS`) instead of the 90 s default.
+    pub fn eager_convergence(&self) -> bool {
+        self.eager_convergence.load(Ordering::Relaxed)
     }
 
     /// Live path snapshot for diagnostics / heartbeat reporting:
@@ -428,6 +454,7 @@ impl std::fmt::Debug for PeerSession {
             .field("allowed_ips", &self.allowed_ips.read())
             .field("endpoint", &self.endpoint())
             .field("direct_confirmed", &self.direct_confirmed())
+            .field("eager_convergence", &self.eager_convergence())
             .field(
                 "last_direct_rx_micros",
                 &self.last_direct_rx_micros.load(Ordering::Relaxed),
@@ -478,6 +505,7 @@ mod tests {
             direct_suppressed_until: AtomicI64::new(0),
             last_rearm_micros: AtomicI64::new(0),
             rearm_streak: AtomicU32::new(0),
+            eager_convergence: AtomicBool::new(false),
             tunn: Mutex::new(Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),

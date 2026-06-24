@@ -196,54 +196,64 @@ impl Coordinator {
 
     /// Build a punch candidate for `e` IN THE CONTEXT of a specific peer pair.
     ///
-    /// A peer is normally eligible once it has heartbeated (non-empty
-    /// `observed_external`) AND has a dialable `listen_endpoint`. The punch
-    /// TARGET is that reflexive `WireGuard` endpoint (`ip:wg_port`), NOT the raw
-    /// heartbeat TCP source — a punch fired at the TCP source would miss the
-    /// `WireGuard` UDP NAT mapping entirely.
+    /// The punch TARGET is the peer's reflexive `WireGuard` `listen_endpoint`
+    /// (`ip:wg_port`), NOT the raw heartbeat TCP source — a punch fired at the
+    /// TCP source would miss the `WireGuard` UDP NAT mapping entirely.
     ///
-    /// A **relay-only** peer is NEVER a punch candidate (returns `None`) for an
-    /// UNFLAGGED pair: `try_emit_holepunch_pairs` builds each pair from
-    /// `punch_peer_for_pair(a, b)` AND `punch_peer_for_pair(b, a)`, so returning
-    /// `None` for either end suppresses the whole pair — preserving the
-    /// 2026-06-07 contract (no punch when EITHER peer is relay-only, so neither
-    /// side double-inits a handshake at a black-hole endpoint).
+    /// Suppression precedence (most-suppressing first). `None` skips this end and
+    /// — because `try_emit_holepunch_pairs` AND-gates BOTH directions — suppresses
+    /// the WHOLE pair:
+    ///   1. No `observed_external` yet ⇒ no dial target.
+    ///   2. **R6 — `relay_only` is a HARD SELF-PIN.** A peer that declared it has
+    ///      no direct plane (a netns container, a metered link) is NEVER dialed,
+    ///      regardless of the global gate or any per-pair flag — its endpoint is a
+    ///      black hole. This is the 2026-06-07 contract, now keyed on an EXPLICIT
+    ///      self-declaration instead of the old global `relay_only` sledgehammer.
+    ///   3. **R5 — an admin `pin_to_relay`** on this pair wins over the gate and
+    ///      over `direct`.
+    ///   4. **R7 — the global PROACTIVE gate.** A punch is emitted only when the
+    ///      gate is ON, OR this pair carries the per-pair `direct` override
+    ///      (back-compat: `{direct:true}` forces a direct attempt with the gate
+    ///      OFF — the Stage-2 single-pair canary). Gate OFF + unflagged ⇒ relay
+    ///      floor, byte-identical to a pre-Tailscale deploy.
     ///
-    /// Track A-a is the ONE deliberate relaxation: when the `(e, other)` pair is
-    /// explicitly flagged `direct`, a `relay_only` peer is NOT skipped — instead
-    /// its reflexive endpoint is synthesized ON THE FLY from its observed
-    /// heartbeat source so the flagged punch has a dial target. The synthesized
-    /// endpoint is computed HERE and never stored on the entry, so an unflagged
-    /// peer's `listen_endpoint` invariant (`None` for `relay_only`) is untouched
-    /// — it never sees a black-hole endpoint. Only an explicitly-flagged pair
-    /// gets a direct dial target; every other pair stays on the relay floor.
+    /// Everything that survives is governed ENTIRELY joiner-side (`force_resend`
+    /// = false + A-c backoff + relay floor + promote-on-DATA — none of which this
+    /// site touches), so a black-hole endpoint never confirms and the pair stays
+    /// on the relay floor. This site only DECIDES whether to emit; it never
+    /// re-mints an init, drops the floor, or skips the backoff — so the 06-04
+    /// storm cannot recur from here.
     fn punch_peer_for_pair(&self, e: &PeerEntry, other: Uuid) -> Option<PunchPeer> {
+        // (1) No reflexive observation yet ⇒ nothing to dial.
         if e.observed_external.is_empty() {
             return None;
         }
+        // (2) R6: relay_only is a HARD self-pin — never dialed at its black hole,
+        // regardless of the gate or any flag.
         if e.relay_only {
-            // Relay-only is normally suppressed. Relax ONLY for a flagged pair.
-            if !self.inner.direct_pair_flags.is_direct(e.peer_id, other) {
-                return None;
-            }
-            // Synthesize the reflexive endpoint from the observed source +
-            // reported WG port for THIS punch only — never stored on the entry.
-            let observed: SocketAddr = e.observed_external.parse().ok()?;
-            // Reuse the joiner-reported WG port if the reflexive listen_endpoint
-            // carried one; fall back to the well-known WG port when absent.
-            let port = e
-                .listen_endpoint
-                .as_deref()
-                .and_then(|s| s.rsplit(':').next())
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(51820);
-            let dial = crate::nat::reflexive::reflexive_endpoint(observed.ip(), port);
-            return Some(PunchPeer {
-                peer_id: e.peer_id,
-                dial_endpoint: dial,
-            });
+            return None;
         }
-        // Non-relay-only: the standard reflexive listen_endpoint.
+        // (3) R5: an admin hard relay-pin on this pair beats the gate AND `direct`.
+        if self
+            .inner
+            .direct_pair_flags
+            .is_pinned_to_relay(e.peer_id, other)
+        {
+            return None;
+        }
+        // (4) R7: emit only when the global proactive gate is ON, or the pair is
+        // explicitly `direct`-flagged (the per-pair gate-override / canary lever).
+        let gate_on = self
+            .inner
+            .proactive
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !gate_on && !self.inner.direct_pair_flags.is_direct(e.peer_id, other) {
+            return None;
+        }
+        // Punchable: the standard reflexive listen_endpoint (set by
+        // `resolve_listen_endpoint` for a non-relay_only peer — observed public
+        // IP + reported WG port for a cone/port-preserving NAT, or an explicit
+        // `--advertise-endpoint`).
         let dial = e.listen_endpoint.clone().filter(|s| !s.is_empty())?;
         Some(PunchPeer {
             peer_id: e.peer_id,
@@ -275,7 +285,7 @@ impl Coordinator {
             ) else {
                 continue;
             };
-            try_emit_pair(
+            if try_emit_pair(
                 self.inner.publisher.as_ref(),
                 &self.inner.broadcaster,
                 &self.inner.punch_tracker,
@@ -283,7 +293,11 @@ impl Coordinator {
                 &pb,
                 now,
             )
-            .await;
+            .await
+            {
+                // Phase-5 metrics: the Stage-4 N²-punch alarm signal.
+                self.note_holepunch_emitted();
+            }
         }
     }
 

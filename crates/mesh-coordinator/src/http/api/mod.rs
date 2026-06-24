@@ -26,7 +26,8 @@ pub use dto::{
     TopologyResponse,
 };
 pub(crate) use handlers::{
-    deregister_handler, heartbeat_handler, peers_handler, register_handler, topology_handler,
+    deregister_handler, heartbeat_handler, metrics_handler, peers_handler, register_handler,
+    topology_handler,
 };
 pub(crate) use stream::stream_handler;
 
@@ -76,6 +77,7 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
         .route("/v1/mesh/deregister", post(deregister_handler))
         .route("/v1/mesh/peers", get(peers_handler))
         .route("/v1/mesh/topology", get(topology_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/v1/mesh/peers/stream", get(stream_handler))
         .route("/v1/mesh/relay", get(crate::http::relay::relay_ws_handler))
         .with_state(coordinator.clone());

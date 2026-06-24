@@ -26,6 +26,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedSender;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Shared registry of active per-peer sessions. Cheap to clone.
@@ -96,6 +97,14 @@ pub struct SessionTable {
     /// `Arc<AtomicU32>` so the streak is process-global across the cheap-clone
     /// table, like the liveness clocks.
     idle_probe_streak: Arc<AtomicU32>,
+    /// Optional sender to the convergence-kick queue (eager-relay-convergence).
+    /// When `Some` (the joiner wires it via [`Self::with_convergence_tx`]), a
+    /// genuinely-NEW, non-ephemeral session is enqueued on [`Self::upsert`] so a
+    /// background `convergence_loop` fires ONE relay-floored handshake kick —
+    /// converging a passive/far peer without waiting on the ~25s persistent-
+    /// keepalive bootstrap. `None` (the default) keeps the pre-convergence
+    /// behaviour (tests, `--no-relay`). Cheap-clone like `relay`.
+    convergence_tx: Option<UnboundedSender<Arc<PeerSession>>>,
 }
 
 /// How long a node may be AMBIGUOUSLY IDLE before the active idle liveness
@@ -231,6 +240,10 @@ impl std::fmt::Debug for SessionTable {
             )
             .field("relay", &self.relay.as_ref().map(|_| "<RelayHandle>"))
             .field(
+                "convergence_tx",
+                &self.convergence_tx.as_ref().map(|_| "<convergence_tx>"),
+            )
+            .field(
                 "last_inbound_data_frame_ts",
                 &self.last_inbound_data_frame_ts.load(Ordering::Relaxed),
             )
@@ -286,6 +299,33 @@ impl SessionTable {
             route_sink: Some(route_sink),
             relay,
             ..Self::default()
+        }
+    }
+
+    /// Wire the eager-relay-convergence kick queue onto an existing table: a
+    /// genuinely-new, non-ephemeral [`Self::upsert`] enqueues its session onto
+    /// `tx`, drained by the joiner's `convergence_loop`. Composes with the other
+    /// builders (`with_route_sink_and_relay(...).with_convergence_tx(tx)`).
+    #[must_use]
+    pub fn with_convergence_tx(mut self, tx: UnboundedSender<Arc<PeerSession>>) -> Self {
+        self.convergence_tx = Some(tx);
+        self
+    }
+
+    /// Enqueue an EXISTING peer session (looked up by ULA) for ONE relay-floored
+    /// convergence kick — the joiner's response to a relay-rendezvous `RelayWake`
+    /// naming this `source_ula` as a cold peer trying to reach us. Reuses the
+    /// eager-convergence machinery: `convergence_loop` drains it and fires
+    /// `kick_convergence_handshake` (`encapsulate(&[])` → a handshake-init on a
+    /// cold `Tunn`, a harmless keepalive on an established one), ALWAYS relay-
+    /// floored (I2). No-op when the peer is unknown or no convergence channel is
+    /// wired (`--no-relay` / tests). Idempotence is enforced coordinator-side
+    /// (the per-dst wake cooldown), so this needs no rate-limit of its own.
+    pub fn request_convergence_kick(&self, ula: Ipv6Addr) {
+        if let Some(tx) = &self.convergence_tx
+            && let Some(session) = self.by_ula.get(&ula).map(|kv| kv.value().clone())
+        {
+            let _ = tx.send(session);
         }
     }
 
@@ -747,6 +787,10 @@ impl SessionTable {
             // at once (FIX 3). Streak starts un-escalated (task #14 loop-guard).
             last_rearm_micros: AtomicI64::new(0),
             rearm_streak: AtomicU32::new(0),
+            // Eager convergence eligibility: a long-lived host/infra peer
+            // (`fd5a:1f00:…`) re-arms its expired Tunn on the brisk 5 s base; an
+            // ephemeral runner-FC (`fd5a:1f02:…`) keeps the 90 s default.
+            eager_convergence: AtomicBool::new(!crate::peer::is_ephemeral_peer(info.ula)),
             tunn: Mutex::new(tunn),
         });
         // Re-apply any app-ULAs this peer already hosts onto the FRESH
@@ -766,6 +810,18 @@ impl SessionTable {
         }
         self.by_ula.insert(info.ula, session.clone());
         self.by_pubkey.insert(info.wg_public_key, session.clone());
+        // Eager-relay-convergence: a genuinely-NEW, non-ephemeral peer is
+        // enqueued for ONE relay-floored handshake kick so a passive/far peer
+        // converges without waiting on the ~25s persistent-keepalive bootstrap.
+        // A same-pubkey re-upsert returned early via `update_in_place`, so it
+        // never reaches here (I11 — no per-heartbeat micro-storm); ephemeral
+        // runner-FCs stay lazy. Enqueue BEFORE the `by_endpoint` move below.
+        if is_new
+            && !crate::peer::is_ephemeral_peer(info.ula)
+            && let Some(tx) = &self.convergence_tx
+        {
+            let _ = tx.send(session.clone());
+        }
         if let Some(addr) = info.listen_endpoint {
             self.by_endpoint.insert(addr, session);
         }
@@ -970,6 +1026,92 @@ mod liveness_tests {
         let t = SessionTable::new();
         t.upsert(&me, &info);
         t
+    }
+
+    /// Build a `PeerInfo` keyed by a single-byte pubkey seed `pk`.
+    fn mk_info(ula: &str, pk: u8, endpoint: Option<&str>) -> crate::peer::PeerInfo {
+        crate::peer::PeerInfo {
+            peer_id: uuid::Uuid::nil(),
+            wg_public_key: *PublicKey::from(&StaticSecret::from([pk; 32])).as_bytes(),
+            ula: ula.parse().unwrap(),
+            listen_endpoint: endpoint.map(|e| e.parse().unwrap()),
+            display_name: "peer".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            software_version: None,
+            mesh_version: None,
+            joined_at_micros: 0,
+        }
+    }
+
+    /// Eager-relay-convergence: a genuinely-NEW, non-ephemeral peer is enqueued
+    /// onto the convergence channel so `convergence_loop` can fire its kick.
+    #[test]
+    fn eager_upsert_enqueues_new_session() {
+        let me = StaticSecret::from([9u8; 32]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let t = SessionTable::new().with_convergence_tx(tx);
+        let info = mk_info("fd5a:1f00:1::1", 1, Some("127.0.0.1:51820"));
+        t.upsert(&me, &info);
+        let got = rx
+            .try_recv()
+            .expect("a new non-ephemeral peer is enqueued for the convergence kick");
+        assert_eq!(got.ula, info.ula);
+    }
+
+    /// Relay-rendezvous: `request_convergence_kick` enqueues an EXISTING session
+    /// (looked up by ULA) for a relay-floored kick — the joiner's response to a
+    /// `RelayWake` naming that source. An unknown ULA is a safe no-op.
+    #[test]
+    fn request_convergence_kick_enqueues_known_peer_and_noops_unknown() {
+        let me = StaticSecret::from([9u8; 32]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let t = SessionTable::new().with_convergence_tx(tx);
+        let info = mk_info("fd5a:1f00:1::1", 1, Some("127.0.0.1:51820"));
+        t.upsert(&me, &info);
+        let _ = rx.try_recv(); // drain the eager upsert enqueue
+        // A wake naming this peer's ULA enqueues it for the kick-back.
+        t.request_convergence_kick(info.ula);
+        let got = rx
+            .try_recv()
+            .expect("a known peer is enqueued for the rendezvous kick");
+        assert_eq!(got.ula, info.ula);
+        // An unknown ULA is a safe no-op (no panic, no enqueue).
+        t.request_convergence_kick("fd5a:1f00:9::9".parse().unwrap());
+        assert!(rx.try_recv().is_err(), "unknown peer ⇒ no enqueue");
+    }
+
+    /// Invariant I11: a same-pubkey re-upsert (the ~20s `peer_updated` path)
+    /// hits `update_in_place` and must NEVER re-enqueue — else every heartbeat
+    /// would re-mint a handshake (a self-inflicted micro-storm).
+    #[test]
+    fn inplace_reupsert_does_not_enqueue() {
+        let me = StaticSecret::from([9u8; 32]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let t = SessionTable::new().with_convergence_tx(tx);
+        let info = mk_info("fd5a:1f00:1::1", 1, Some("127.0.0.1:51820"));
+        t.upsert(&me, &info); // is_new ⇒ enqueue
+        let _ = rx.try_recv(); // drain the first
+        t.upsert(&me, &info); // SAME pubkey ⇒ update_in_place, NO enqueue
+        assert!(
+            rx.try_recv().is_err(),
+            "a same-pubkey re-upsert must not re-enqueue (I11)"
+        );
+    }
+
+    /// Ephemeral runner-FCs (`fd5a:1f02:…`) stay on the LAZY path — numerous and
+    /// short-lived, they get no eager kick.
+    #[test]
+    fn ephemeral_upsert_does_not_enqueue() {
+        let me = StaticSecret::from([9u8; 32]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let t = SessionTable::new().with_convergence_tx(tx);
+        let info = mk_info("fd5a:1f02:abcd::1", 7, Some("127.0.0.1:51820"));
+        t.upsert(&me, &info);
+        assert!(
+            rx.try_recv().is_err(),
+            "an ephemeral runner-FC stays lazy — no eager convergence kick"
+        );
     }
 
     /// A node with NO peers is always healthy — there is nothing to be a black

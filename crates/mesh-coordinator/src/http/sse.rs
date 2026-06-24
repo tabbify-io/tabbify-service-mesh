@@ -6,7 +6,7 @@
 //! rather than blocking the coordinator.
 
 use crate::http::api::PeerInfo;
-use crate::roster::events::HolePunchInitiate;
+use crate::roster::events::{HolePunchInitiate, RelayWake};
 use serde::Serialize;
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
@@ -48,6 +48,11 @@ pub enum PeerEvent {
     /// the other's external endpoint. Carried on the same broadcast
     /// channel + stream as roster frames rather than a sibling endpoint.
     HolePunch(HolePunchInitiate),
+    /// Stage 3 — a relay-rendezvous wake. Like [`Self::HolePunch`] it is
+    /// addressed to a single peer: the per-viewer SSE filter forwards it only to
+    /// the peer whose id matches `recipient_peer_id`, who then fires a
+    /// relay-floored convergence kick toward `source_ula`.
+    RelayWake(RelayWake),
 }
 
 impl PeerEvent {
@@ -59,6 +64,7 @@ impl PeerEvent {
             Self::Updated(_) => "peer_updated",
             Self::Removed { .. } => "peer_removed",
             Self::HolePunch(_) => "holepunch_initiate",
+            Self::RelayWake(_) => "relay_wake",
         }
     }
 
@@ -73,6 +79,17 @@ impl PeerEvent {
         }
     }
 
+    /// The recipient peer id of a [`PeerEvent::RelayWake`] (the cold peer that
+    /// should wake and kick back), or `None` for other events. The per-viewer
+    /// SSE filter routes a wake frame to exactly this peer.
+    #[must_use]
+    pub fn relay_wake_recipient(&self) -> Option<&str> {
+        match self {
+            Self::RelayWake(rw) => Some(rw.recipient_peer_id.as_str()),
+            _ => None,
+        }
+    }
+
     /// The tags of the peer this event concerns — used by the SSE filter
     /// to decide whether a given viewer may receive this frame.
     #[must_use]
@@ -80,8 +97,8 @@ impl PeerEvent {
         match self {
             Self::Added(p) | Self::Updated(p) => &p.tags,
             Self::Removed { tags, .. } => tags,
-            // HolePunch is routed by initiator id, not tags.
-            Self::HolePunch(_) => &[],
+            // HolePunch / RelayWake are routed by peer id, not tags.
+            Self::HolePunch(_) | Self::RelayWake(_) => &[],
         }
     }
 
@@ -98,6 +115,7 @@ impl PeerEvent {
                 "peer_id": peer_id,
             })),
             Self::HolePunch(hp) => serde_json::to_string(hp),
+            Self::RelayWake(rw) => serde_json::to_string(rw),
         }
     }
 }
@@ -185,5 +203,28 @@ mod tests {
             tags: vec![],
         };
         assert_eq!(removed.holepunch_initiator(), None);
+    }
+
+    /// A `RelayWake` must surface as `relay_wake` with a JSON body that
+    /// round-trips (the joiner's SSE consumer parses against it) and expose its
+    /// recipient id for the per-viewer filter (and `None` for other events).
+    #[test]
+    fn relay_wake_event_name_payload_and_recipient() {
+        let rw = RelayWake {
+            recipient_peer_id: "bbbbbbbb-0000-7000-8000-000000000002".into(),
+            source_ula: "fd5a:1f00:0:2::1".into(),
+            timestamp_micros: 7,
+        };
+        let ev = PeerEvent::RelayWake(rw.clone());
+        assert_eq!(ev.event_name(), "relay_wake");
+        assert_eq!(ev.relay_wake_recipient(), Some(rw.recipient_peer_id.as_str()));
+        let payload = ev.data_payload().expect("payload serialises");
+        let decoded: RelayWake = serde_json::from_str(&payload).expect("payload round-trips");
+        assert_eq!(decoded, rw);
+        // A roster event has no relay-wake recipient.
+        assert_eq!(
+            PeerEvent::Removed { peer_id: "x".into(), tags: vec![] }.relay_wake_recipient(),
+            None
+        );
     }
 }

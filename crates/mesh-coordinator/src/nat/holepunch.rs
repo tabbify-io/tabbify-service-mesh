@@ -44,6 +44,7 @@ use crate::roster::coordinator::PEER_SEGMENT;
 use crate::roster::events::HolePunchInitiate;
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -65,6 +66,41 @@ pub const PUNCH_REEMIT_COOLDOWN_MICROS: i64 = 15_000_000; // 15s
 /// immediately). Set well above the cooldown so a merely-quiet-but-live pair is
 /// never reaped. This bounds the tracker's growth over a long-running mesh.
 pub const PUNCH_PAIR_TTL_MICROS: i64 = 300_000_000; // 5 min (≫ cooldown)
+
+/// CAP for the escalating re-emit cooldown (R4).
+///
+/// A pair that never confirms a direct path re-punches on a doubling schedule
+/// `BASE → 2·BASE → … → CAP`, so a
+/// permanently-stuck pair decays to one re-punch per CAP instead of forever
+/// every `BASE` — killing the permanent HI-lane handshake trickle across all
+/// un-confirmable pairs. Mirrors the joiner-side A-c back-off CAP. A pair that
+/// confirms direct resets to BASE via [`PunchTracker::note_confirmed`].
+pub const PUNCH_REEMIT_COOLDOWN_CAP_MICROS: i64 = 300_000_000; // 5 min
+
+/// Cold-start / mass-join throttle (R4).
+///
+/// At most this many genuinely-NEW pairs emit their FIRST punch per
+/// [`COLD_START_WINDOW_MICROS`]. Bounds the O(N²)
+/// first-emit wave when a freshly-restarted coordinator's tracker is empty and
+/// every peer's first heartbeat would otherwise claim every pair in one tick at
+/// peak relay load. Re-emits of already-tracked pairs are NOT throttled (they
+/// are already cooldown-bounded); only brand-new pairs draw from this budget.
+pub const MAX_NEW_EMITS_PER_WINDOW: u32 = 8;
+
+/// The rolling window over which [`MAX_NEW_EMITS_PER_WINDOW`] applies. A mass
+/// join of N pairs drains over ≈`N / MAX_NEW_EMITS_PER_WINDOW` windows.
+pub const COLD_START_WINDOW_MICROS: i64 = 1_000_000; // 1s
+
+/// The escalating re-emit cooldown for a consecutive-un-confirmed `streak`:
+/// `min(BASE << streak, CAP)`. `checked_shl` saturates a huge streak to CAP so
+/// the shift never overflows.
+#[must_use]
+pub fn reemit_cooldown(streak: u32) -> i64 {
+    PUNCH_REEMIT_COOLDOWN_MICROS
+        .checked_shl(streak)
+        .unwrap_or(i64::MAX)
+        .min(PUNCH_REEMIT_COOLDOWN_CAP_MICROS)
+}
 
 /// Pair tracking key. Stored in canonical (smaller, larger) form so
 /// heartbeats from either side hit the same entry. Single source of
@@ -90,69 +126,128 @@ pub struct PunchPeer {
     pub dial_endpoint: String,
 }
 
-/// Last `HolePunchInitiate` emit time (unix micros) per canonical pair.
+/// Per-pair emit state: last emit time (unix micros) + the consecutive
+/// un-confirmed re-emit `streak` that drives the escalating cooldown (R4).
+#[derive(Debug, Clone, Copy)]
+struct PunchState {
+    last_emit: i64,
+    /// Consecutive re-emits with no confirmed direct path. The next cooldown is
+    /// `reemit_cooldown(streak)` = `min(BASE << streak, CAP)`;
+    /// [`PunchTracker::note_confirmed`] resets it to 0.
+    streak: u32,
+}
+
+/// Shared rolling budget that bounds the cold-start first-emit wave (R4).
+/// Lock-free + best-effort: a benign race may let a couple extra emits through,
+/// which is fine — the goal is to break the unbounded N² burst, not exact rate.
+#[derive(Default)]
+struct ColdStartBudget {
+    window_start: AtomicI64,
+    count: AtomicU32,
+}
+
+/// Last `HolePunchInitiate` emit time + escalation streak per canonical pair,
+/// plus the shared cold-start budget.
 ///
-/// Tracks last-emit (not just presence) so a stuck pair is re-punched on a
-/// cooldown rather than emitted once-and-forgotten. Cheap to clone — wraps an
-/// `Arc` internally via `DashMap`.
+/// Tracks last-emit + streak (not just presence) so a stuck pair is re-punched
+/// on an ESCALATING cooldown rather than forever every `BASE`. Cheap to clone —
+/// `Arc` internally.
 #[derive(Default, Clone)]
 pub struct PunchTracker {
-    last_emit: Arc<DashMap<PunchPair, i64>>,
+    pairs: Arc<DashMap<PunchPair, PunchState>>,
+    cold_start: Arc<ColdStartBudget>,
 }
 
 impl PunchTracker {
     /// Empty tracker.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            last_emit: Arc::new(DashMap::new()),
-        }
+        Self::default()
     }
 
     /// Claim the right to emit a punch for this canonical pair at `now_micros`.
     ///
-    /// Returns `true` (and records `now_micros` as the new last-emit) when the
-    /// pair has never been emitted OR its last emit is at least
-    /// [`PUNCH_REEMIT_COOLDOWN_MICROS`] ago — i.e. it's time to (re-)punch.
-    /// Returns `false` within the cooldown window (deduped), so repeated
-    /// heartbeats don't spam a freshly-emitted pair.
+    /// Returns `true` (recording `now_micros` + escalating the streak) when it is
+    /// time to (re-)punch: a NEW pair (subject to the cold-start budget) OR a
+    /// tracked pair whose last emit is at least `reemit_cooldown(streak)` ago.
+    /// The cooldown GROWS per consecutive un-confirmed re-emit (`BASE << streak`,
+    /// capped) so a permanently-stuck pair re-punches ever less often (R4);
+    /// [`Self::note_confirmed`] resets the streak when the pair goes direct.
+    /// Returns `false` within the cooldown (deduped) or when the cold-start
+    /// budget for new pairs is exhausted this window.
     pub fn claim(&self, pair: PunchPair, now_micros: i64) -> bool {
         use dashmap::mapref::entry::Entry;
-        match self.last_emit.entry(pair) {
+        match self.pairs.entry(pair) {
             Entry::Occupied(mut e) => {
-                if now_micros - *e.get() >= PUNCH_REEMIT_COOLDOWN_MICROS {
-                    *e.get_mut() = now_micros;
+                let st = *e.get();
+                if now_micros - st.last_emit >= reemit_cooldown(st.streak) {
+                    e.insert(PunchState {
+                        last_emit: now_micros,
+                        // Escalate: another re-emit WITHOUT a confirmed path.
+                        streak: st.streak.saturating_add(1),
+                    });
                     true
                 } else {
                     false
                 }
             }
             Entry::Vacant(e) => {
-                e.insert(now_micros);
+                // Cold-start throttle: bound the first-emit wave on a fresh
+                // (restarted) tracker so a mass-join doesn't fire an N² burst.
+                if !self.take_cold_start_token(now_micros) {
+                    return false;
+                }
+                e.insert(PunchState {
+                    last_emit: now_micros,
+                    streak: 0,
+                });
                 true
             }
         }
     }
 
+    /// Reset a pair's escalation streak to BASE — called when the pair reports a
+    /// CONFIRMED direct path, so if it later FLAPS back to relay it re-punches
+    /// briskly at `BASE` again instead of at the decayed `CAP`. No-op for an
+    /// untracked pair.
+    pub fn note_confirmed(&self, pair: PunchPair) {
+        if let Some(mut e) = self.pairs.get_mut(&pair) {
+            e.streak = 0;
+        }
+    }
+
+    /// Draw one token from the rolling cold-start budget. Rolls the window when
+    /// [`COLD_START_WINDOW_MICROS`] has elapsed. Lock-free + best-effort; a
+    /// benign race only lets a couple of extra first-emits through.
+    fn take_cold_start_token(&self, now_micros: i64) -> bool {
+        let b = &self.cold_start;
+        let ws = b.window_start.load(Ordering::Relaxed);
+        if now_micros.saturating_sub(ws) >= COLD_START_WINDOW_MICROS {
+            b.window_start.store(now_micros, Ordering::Relaxed);
+            b.count.store(0, Ordering::Relaxed);
+        }
+        b.count.fetch_add(1, Ordering::Relaxed) < MAX_NEW_EMITS_PER_WINDOW
+    }
+
     /// Has this canonical pair ever been emitted?
     #[must_use]
     pub fn contains(&self, pair: PunchPair) -> bool {
-        self.last_emit.contains_key(&pair)
+        self.pairs.contains_key(&pair)
     }
 
     /// Forget the pair — used in tests / by future eviction logic.
     pub fn clear(&self, pair: PunchPair) -> bool {
-        self.last_emit.remove(&pair).is_some()
+        self.pairs.remove(&pair).is_some()
     }
 
     /// Remove every pair involving `peer_id`. Called when a peer deregisters or
     /// times out so its punch pairs are cleaned up immediately (the precise,
     /// non-TTL path). Returns the number of pairs removed.
     pub fn remove_peer(&self, peer_id: Uuid) -> usize {
-        let before = self.last_emit.len();
-        self.last_emit
+        let before = self.pairs.len();
+        self.pairs
             .retain(|&(a, b), _| a != peer_id && b != peer_id);
-        before - self.last_emit.len()
+        before - self.pairs.len()
     }
 
     /// Reap pairs whose last emit is older than `cutoff_micros` — a backstop for
@@ -160,21 +255,21 @@ impl PunchTracker {
     /// removed. A live pair keeps a fresh `last_emit` (re-claims on the cooldown
     /// while either side heartbeats), so only genuinely stale pairs age out.
     pub fn reap_older_than(&self, cutoff_micros: i64) -> usize {
-        let before = self.last_emit.len();
-        self.last_emit.retain(|_, &mut last| last >= cutoff_micros);
-        before - self.last_emit.len()
+        let before = self.pairs.len();
+        self.pairs.retain(|_, st| st.last_emit >= cutoff_micros);
+        before - self.pairs.len()
     }
 
     /// Number of pairs tracked.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.last_emit.len()
+        self.pairs.len()
     }
 
     /// Convenience predicate.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.last_emit.is_empty()
+        self.pairs.is_empty()
     }
 }
 
@@ -461,6 +556,82 @@ mod tests {
         assert!(
             tracker.claim(pair, 1_000 + PUNCH_REEMIT_COOLDOWN_MICROS),
             "cooldown elapsed -> re-claim"
+        );
+    }
+
+    /// R4: a pair that keeps re-emitting WITHOUT confirming a direct path backs
+    /// off on a doubling cooldown `BASE → 2·BASE → 4·BASE → …`, saturating at
+    /// `CAP` — so a permanently-stuck pair re-punches ever less often instead of
+    /// forever every `BASE` (the HI-lane trickle fix). The OLD fixed-cooldown
+    /// logic would (wrongly) re-emit every `BASE` here.
+    #[test]
+    fn stuck_pair_reemit_cooldown_escalates() {
+        let t = PunchTracker::new();
+        let p = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let base = PUNCH_REEMIT_COOLDOWN_MICROS;
+        let cap = PUNCH_REEMIT_COOLDOWN_CAP_MICROS;
+        let mut now = 0;
+        assert!(t.claim(p, now), "first emit");
+        // streak 0 ⇒ cooldown = BASE; re-emit AT base; streak → 1.
+        now += base;
+        assert!(t.claim(p, now));
+        // streak 1 ⇒ cooldown = 2·BASE: just under is deduped, AT re-emits.
+        assert!(!t.claim(p, now + 2 * base - 1), "escalated cooldown not elapsed");
+        now += 2 * base;
+        assert!(t.claim(p, now)); // streak → 2
+        // streak 2 ⇒ cooldown = 4·BASE.
+        assert!(!t.claim(p, now + 4 * base - 1));
+        now += 4 * base;
+        assert!(t.claim(p, now)); // streak → 3
+        // Drive the streak high — the cooldown SATURATES at CAP, never beyond.
+        for _ in 0..12 {
+            now += cap;
+            assert!(t.claim(p, now), "a chronic pair still re-punches once per CAP");
+        }
+        assert!(!t.claim(p, now + cap - 1), "cooldown never exceeds CAP");
+    }
+
+    /// R4: a CONFIRMED direct path resets the escalation streak, so if the pair
+    /// later flaps back to relay it re-punches briskly at `BASE` again rather
+    /// than at the decayed `CAP`.
+    #[test]
+    fn confirmed_pair_reemit_cooldown_resets() {
+        let t = PunchTracker::new();
+        let p = (Uuid::from_u128(3), Uuid::from_u128(4));
+        let base = PUNCH_REEMIT_COOLDOWN_MICROS;
+        let mut now = 0;
+        assert!(t.claim(p, now)); // streak 0
+        now += base;
+        assert!(t.claim(p, now)); // streak → 1
+        now += 2 * base;
+        assert!(t.claim(p, now)); // streak → 2 (cooldown now 4·BASE)
+        t.note_confirmed(p); // direct confirmed ⇒ streak back to 0
+        assert!(!t.claim(p, now + base - 1), "still within the reset BASE window");
+        now += base;
+        assert!(t.claim(p, now), "after confirm, re-punches at BASE again");
+    }
+
+    /// R4: a fresh (restarted) tracker must NOT fire every new pair's first punch
+    /// in one tick — the cold-start budget caps brand-new first-emits per window,
+    /// breaking the O(N²) mass-join burst. The OLD logic emitted them all at once.
+    #[test]
+    fn cold_start_punch_wave_is_throttled() {
+        let t = PunchTracker::new();
+        let now = 5_000_000; // past the first window ⇒ window rolls to `now`
+        let n = u128::from(MAX_NEW_EMITS_PER_WINDOW) * 3;
+        let emitted = (0..n)
+            .filter(|i| t.claim((Uuid::from_u128(1000 + i), Uuid::from_u128(9000 + i)), now))
+            .count();
+        assert_eq!(
+            u32::try_from(emitted).unwrap(),
+            MAX_NEW_EMITS_PER_WINDOW,
+            "cold-start caps brand-new first-emits per window"
+        );
+        // A fresh window admits more first-emits.
+        let later = now + COLD_START_WINDOW_MICROS;
+        assert!(
+            t.claim((Uuid::from_u128(77), Uuid::from_u128(88)), later),
+            "the next window admits fresh first-emits"
         );
     }
 }

@@ -323,6 +323,23 @@ pub(crate) struct Inner {
     /// whole store → every pair returns to relay (the SAFE direction — a restart
     /// never silently leaves a pair direct). Set only via the admin-gated API.
     pub(crate) direct_pair_flags: DirectPairFlags,
+    /// Global PROACTIVE gate (R7) — the always-direct kill-switch. OFF (the
+    /// default) suppresses every NON-`direct`-flagged pair's punch, so a fresh
+    /// deploy is byte-identical to today (only admin-flagged pairs punch). ON
+    /// makes every non-pinned, non-`relay_only` pair attempt direct, governed
+    /// ENTIRELY joiner-side (`force_resend`=false + A-c backoff + relay floor +
+    /// promote-on-DATA — none of which this gate touches). `AtomicBool` so it
+    /// flips LIVE for an instant Stage-4 rollback without dropping the roster.
+    /// Seeded from `TABBIFY_MESH_PROACTIVE` at startup (`main.rs`); default false.
+    pub(crate) proactive: Arc<std::sync::atomic::AtomicBool>,
+    /// Phase-5 observability counters (read-only; never affect any routing or
+    /// emit decision — pure atomic side-effects, exposed at `GET /metrics`).
+    /// `relay_forwarded_bytes` proves relay OFFLOAD drops as direct engages;
+    /// `holepunch_emitted` is the Stage-4 N²-punch alarm; `relay_wake_emitted`
+    /// tracks rendezvous nudges.
+    pub(crate) relay_forwarded_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) holepunch_emitted: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) relay_wake_emitted: Arc<std::sync::atomic::AtomicU64>,
     /// Ephemeral pubkey → live relay WS connection (Stage-3 relay floor).
     pub(crate) relay: crate::relay::RelayRegistry,
     /// Durable roster snapshot sink. Persisted on every membership change
@@ -412,6 +429,10 @@ impl Coordinator {
                 heartbeat_timeout,
                 punch_tracker: PunchTracker::new(),
                 direct_pair_flags: DirectPairFlags::new(),
+                proactive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                relay_forwarded_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                holepunch_emitted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                relay_wake_emitted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 relay: crate::relay::RelayRegistry::new(),
                 roster_store,
             }),
@@ -499,6 +520,70 @@ impl Coordinator {
         &self.inner.direct_pair_flags
     }
 
+    /// `true` iff the global proactive (always-direct) gate is ON. Read at every
+    /// `punch_peer_for_pair` decision; OFF suppresses all non-`direct`-flagged
+    /// punches (R7), so the gate is the global always-direct kill-switch.
+    #[must_use]
+    pub fn proactive_on(&self) -> bool {
+        self.inner
+            .proactive
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Flip the global proactive gate (R7). Seeded from `TABBIFY_MESH_PROACTIVE`
+    /// at startup; flippable LIVE for an instant Stage-4 rollback —
+    /// `set_proactive(false)` re-suppresses every non-flagged punch on the next
+    /// heartbeat with no restart and no roster churn.
+    pub fn set_proactive(&self, on: bool) {
+        self.inner
+            .proactive
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Phase-5 metrics: record `bytes` forwarded over the relay floor (read-only
+    /// side-effect; never affects routing).
+    pub fn note_relay_forwarded(&self, bytes: usize) {
+        self.inner
+            .relay_forwarded_bytes
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Phase-5 metrics: record one emitted `HolePunchInitiate` (the Stage-4
+    /// N²-punch alarm signal).
+    pub fn note_holepunch_emitted(&self) {
+        self.inner
+            .holepunch_emitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Phase-5 metrics: record one emitted `RelayWake` rendezvous nudge.
+    pub fn note_relay_wake_emitted(&self) {
+        self.inner
+            .relay_wake_emitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Render the Prometheus-style `/metrics` text exposition — counts only, no
+    /// secrets. A read-only snapshot of the observability counters.
+    #[must_use]
+    pub fn render_metrics(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bytes = self.inner.relay_forwarded_bytes.load(Relaxed);
+        let punches = self.inner.holepunch_emitted.load(Relaxed);
+        let wakes = self.inner.relay_wake_emitted.load(Relaxed);
+        format!(
+            "# HELP relay_forwarded_bytes_total Bytes forwarded over the relay floor.\n\
+             # TYPE relay_forwarded_bytes_total counter\n\
+             relay_forwarded_bytes_total {bytes}\n\
+             # HELP holepunch_emitted_total HolePunchInitiate directives emitted.\n\
+             # TYPE holepunch_emitted_total counter\n\
+             holepunch_emitted_total {punches}\n\
+             # HELP relay_wake_emitted_total RelayWake rendezvous nudges emitted.\n\
+             # TYPE relay_wake_emitted_total counter\n\
+             relay_wake_emitted_total {wakes}\n"
+        )
+    }
+
     /// Borrow the relay registry — the WS handler registers/forwards through it.
     #[must_use]
     pub fn relay(&self) -> &crate::relay::RelayRegistry {
@@ -510,6 +595,17 @@ impl Coordinator {
     #[must_use]
     pub fn is_registered_pubkey(&self, pk: &[u8]) -> bool {
         self.inner.by_pubkey.contains_key(pk)
+    }
+
+    /// Resolve a raw WG pubkey to `(peer_id, ula)` via the `by_pubkey` index +
+    /// roster. Used by the relay-rendezvous wake (`route_uplink`) to address the
+    /// wake to the cold destination (its `peer_id`) and to tell that destination
+    /// which source ULA to kick back toward. `None` for an unknown pubkey.
+    #[must_use]
+    pub fn peer_for_pubkey(&self, pk: &[u8]) -> Option<(Uuid, std::net::Ipv6Addr)> {
+        let peer_id = *self.inner.by_pubkey.get(pk)?;
+        let entry = self.inner.roster.get(&peer_id)?;
+        Some((peer_id, entry.ula))
     }
 
     /// Snapshot the entire roster, ordered by `peer_index` for stable output.
@@ -610,6 +706,16 @@ impl Coordinator {
             for p in paths {
                 if let Ok(target) = Uuid::parse_str(&p.peer_id) {
                     edges.insert(target, (p.direct, p.last_rx_age_ms));
+                    // R4: a CONFIRMED direct edge resets this pair's punch
+                    // re-emit escalation streak, so a later flap back to relay
+                    // re-punches briskly at BASE again instead of the decayed
+                    // CAP. Reuses the existing per-pair `direct` signal — no new
+                    // wire field. Canonical key so either reporter hits the same.
+                    if p.direct {
+                        self.inner
+                            .punch_tracker
+                            .note_confirmed(crate::nat::holepunch::canonical_pair(reporter, target));
+                    }
                 }
             }
             entry.paths = edges;
