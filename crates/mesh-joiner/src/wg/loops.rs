@@ -621,8 +621,10 @@ pub(crate) async fn timer_loop(
                 // RX clock, the UNCHANGED `dataplane_healthy` verdict can detect
                 // a genuine black hole within the 90s window — closing the
                 // fail-open idle blind spot a trickle of relay control frames
-                // exploited on 2026-06-21. Rate-limited to one frame /
-                // IDLE_PROBE_INTERVAL_MICROS (no busy-loop).
+                // exploited on 2026-06-21. Rate-limited with an ESCALATING
+                // back-off (BASE→…→CAP, doubling per un-answered probe; reset on
+                // real RX) so a chronic black hole is not hammered (no busy-loop,
+                // no fixed-interval pulse — task #13).
                 maybe_idle_probe(&socket, &sessions, now).await;
             }
         }
@@ -657,7 +659,8 @@ async fn maybe_idle_probe(socket: &UdpSocket, sessions: &SessionTable, now: i64)
     if !sessions.should_emit_idle_probe(
         now,
         crate::wg::session::IDLE_PROBE_AFTER_MICROS,
-        crate::wg::session::IDLE_PROBE_INTERVAL_MICROS,
+        crate::wg::session::IDLE_PROBE_INTERVAL_BASE_MICROS,
+        crate::wg::session::IDLE_PROBE_INTERVAL_CAP_MICROS,
     ) {
         return;
     }
@@ -729,10 +732,15 @@ async fn maybe_rearm_expired_session(
     if sessions.relay().is_none() {
         return false;
     }
-    // Step 3: rate-limit the re-arm to WG attempt-window cadence.
-    if !session
-        .should_rearm_expired(now, crate::wg::session::peer_session::EXPIRED_REARM_BACKOFF_MICROS)
-    {
+    // Step 3: rate-limit the re-arm to an ESCALATING WG-attempt-window cadence
+    // (task #14 loop-guard): BASE on the first re-arm, doubling per still-failing
+    // re-arm up to CAP, reset on a valid inbound rx — so a chronically dead peer
+    // is not re-handshaked at a fixed rate forever.
+    if !session.should_rearm_expired(
+        now,
+        crate::wg::session::peer_session::EXPIRED_REARM_BACKOFF_MICROS,
+        crate::wg::session::peer_session::EXPIRED_REARM_BACKOFF_CAP_MICROS,
+    ) {
         return false;
     }
     tracing::info!(
@@ -896,6 +904,7 @@ mod tests {
             failed_handshake_count: std::sync::atomic::AtomicU32::new(0),
             direct_suppressed_until: std::sync::atomic::AtomicI64::new(0),
             last_rearm_micros: std::sync::atomic::AtomicI64::new(0),
+            rearm_streak: std::sync::atomic::AtomicU32::new(0),
             tunn: tokio::sync::Mutex::new(boringtun::noise::Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),

@@ -40,7 +40,8 @@ pub const DIRECT_BACKOFF_BASE_MICROS: i64 = 2_000_000;
 /// still periodically re-checking in case the NAT mapping changes.
 pub const DIRECT_BACKOFF_CAP_MICROS: i64 = 300_000_000;
 
-/// Minimum spacing between automatic expired-`Tunn` RE-ARMS (FIX 3).
+/// BASE spacing between automatic expired-`Tunn` RE-ARMS (FIX 3 + task #14
+/// loop-guard).
 ///
 /// boringtun gives up on a handshake after `REKEY_ATTEMPT_TIME` (90 s of
 /// retransmitting the init every `REKEY_TIMEOUT`=5 s with no response): it calls
@@ -49,10 +50,36 @@ pub const DIRECT_BACKOFF_CAP_MICROS: i64 = 300_000_000;
 /// relay-only ⇄ relay-only peer (the lifeline `fc22:6::1`) whose first 90 s
 /// window lapses without a completed relayed handshake is then permanently
 /// wedged. The timer loop detects the expired `Tunn` and re-arms it (a fresh
-/// handshake-init over the relay floor); this gates the re-arm so a genuinely
-/// unreachable peer retries at WG cadence (~one fresh 90 s attempt-window after
-/// the last), NOT in a tight 200 ms-tick loop. Matches `REKEY_ATTEMPT_TIME`.
+/// handshake-init over the relay floor). The FIRST re-arm is gated at this
+/// BASE cadence (~one fresh WG attempt-window after the last); each consecutive
+/// STILL-FAILING re-arm doubles the wait ([`PeerSession::should_rearm_expired`])
+/// up to [`EXPIRED_REARM_BACKOFF_CAP_MICROS`] — the loop-guard that stops a
+/// chronically-dead peer (MSI's flaky WAN) from re-handshaking at a fixed 90 s
+/// rate forever. Matches `REKEY_ATTEMPT_TIME`.
 pub const EXPIRED_REARM_BACKOFF_MICROS: i64 = 90_000_000;
+
+/// CAP on the escalating expired-`Tunn` re-arm back-off (task #14 loop-guard).
+///
+/// A permanently-wedged session (chronic WAN black hole) re-arms at most once
+/// per cap interval (10 min) instead of every 90 s — a BOUNDED-retry schedule
+/// that still periodically re-attempts a relayed bootstrap (the path may
+/// recover) without churning a re-handshake every attempt-window. The streak
+/// resets the instant a valid inbound datagram proves the path is alive
+/// ([`PeerSession::note_direct_rx`]), so a transient wedge drops straight back
+/// to the responsive BASE cadence.
+pub const EXPIRED_REARM_BACKOFF_CAP_MICROS: i64 = 600_000_000;
+
+/// The escalating expired-`Tunn` re-arm interval for a consecutive-failure
+/// `streak` (task #14 loop-guard).
+///
+/// `min(BASE << streak, CAP)`: `streak == 0` (the first re-arm, or right after a
+/// real RX reset the counter) yields BASE; each subsequent still-failing re-arm
+/// doubles the wait up to CAP. Overflow-safe, pure + `const`; delegates to the
+/// shared [`super::table::escalating_backoff`].
+#[must_use]
+pub const fn rearm_interval(streak: u32, base_micros: i64, cap_micros: i64) -> i64 {
+    super::table::escalating_backoff(streak, base_micros, cap_micros)
+}
 
 /// One peer's encryption state + routing metadata.
 pub struct PeerSession {
@@ -126,10 +153,21 @@ pub struct PeerSession {
     /// timer loop re-arms a `Tunn` boringtun gave up on (`set_expired` after
     /// `REKEY_ATTEMPT_TIME`) so a wedged relay-only ⇄ relay-only session can
     /// bootstrap; this clock rate-limits the re-arm to one per
-    /// `EXPIRED_REARM_BACKOFF_MICROS` (WG attempt-window cadence) so a
-    /// genuinely-unreachable peer retries at WG speed instead of every 200 ms
-    /// tick. `0` = never re-armed → the first detected expiry re-arms at once.
+    /// the ESCALATING `EXPIRED_REARM_BACKOFF_MICROS` window (task #14 loop-guard,
+    /// see `rearm_streak`) so a genuinely-unreachable peer retries at an ever
+    /// SLOWER WG cadence instead of every 200 ms tick. `0` = never re-armed →
+    /// the first detected expiry re-arms at once.
     pub last_rearm_micros: AtomicI64,
+    /// Count of consecutive automatic expired-`Tunn` re-arms WITHOUT a valid
+    /// inbound datagram arriving since (task #14 loop-guard). Drives the
+    /// escalating re-arm back-off in [`Self::should_rearm_expired`]:
+    /// `min(BASE << streak, CAP)`, so a chronically black-holed peer re-arms
+    /// ever less often — a bounded retry schedule, NOT a fixed 90 s loop. Reset
+    /// to `0` on ANY valid inbound datagram ([`Self::note_direct_rx`]): the
+    /// instant the relayed handshake completes (RX resumes), re-arming returns
+    /// to the responsive BASE cadence. Relaxed like the other counters — an
+    /// off-by-one in a racing increment only nudges the back-off by one step.
+    pub rearm_streak: AtomicU32,
     /// Boringtun session state. Wrapped in a tokio Mutex so async
     /// send + receive halves can serialise access without holding a
     /// guard across socket I/O.
@@ -174,8 +212,11 @@ impl PeerSession {
         self.last_direct_rx_micros
             .store(now_micros, Ordering::Relaxed);
         // A valid inbound datagram proves this candidate is alive → drop any
-        // accumulated handshake-failure penalty so it is probed freely again.
+        // accumulated handshake-failure penalty so it is probed freely again,
+        // AND collapse the escalating expired-Tunn re-arm back-off (task #14
+        // loop-guard) so a recovered session re-arms at BASE cadence again.
         self.clear_handshake_backoff();
+        self.rearm_streak.store(0, Ordering::Relaxed);
     }
 
     /// THE upgrade signal: a decrypted DATA packet arrived over UDP,
@@ -256,20 +297,41 @@ impl PeerSession {
         self.direct_suppressed_until.store(0, Ordering::Relaxed);
     }
 
-    /// Rate-limit gate for the automatic expired-`Tunn` RE-ARM (FIX 3):
-    /// returns `true` at most once per `backoff_micros`, stamping the clock when
-    /// it does. The timer loop calls this only after it has already observed
-    /// `Tunn::is_expired()`, so a `true` means "this expired session is due for
-    /// a fresh handshake-init now". The first call (clock = `0`) re-arms
-    /// immediately so a just-wedged session bootstraps without waiting a full
-    /// back-off; subsequent re-arms are spaced at WG attempt-window cadence so a
-    /// genuinely-unreachable peer is not re-armed every 200 ms tick. A relaxed
-    /// load/store is fine — a racing double-read at worst fires one extra init,
-    /// which boringtun's own retransmit logic would emit anyway.
-    pub fn should_rearm_expired(&self, now_micros: i64, backoff_micros: i64) -> bool {
+    /// Snapshot the consecutive un-answered expired-`Tunn` re-arm streak (task
+    /// #14 loop-guard — diagnostics + tests). Reset to `0` on a valid inbound rx.
+    #[must_use]
+    pub fn rearm_streak(&self) -> u32 {
+        self.rearm_streak.load(Ordering::Relaxed)
+    }
+
+    /// Rate-limit gate for the automatic expired-`Tunn` RE-ARM (FIX 3 + task #14
+    /// loop-guard): returns `true` at most once per ESCALATING back-off window,
+    /// stamping the clock + bumping the streak when it does. The timer loop calls
+    /// this only after it has already observed `Tunn::is_expired()`, so a `true`
+    /// means "this expired session is due for a fresh handshake-init now".
+    ///
+    /// The first call (clock = `0`, streak = `0`) re-arms immediately so a
+    /// just-wedged session bootstraps without waiting a full back-off. Each
+    /// consecutive STILL-FAILING re-arm doubles the required wait —
+    /// `min(base << streak, cap)` ([`rearm_interval`]) — so a chronically
+    /// unreachable peer (MSI's flaky WAN) re-arms ever LESS often instead of
+    /// re-handshaking at a fixed 90 s rate forever (THE loop-guard). A valid
+    /// inbound datagram resets the streak ([`Self::note_direct_rx`]) so a
+    /// transient wedge recovers at BASE cadence. A relaxed load/store is fine — a
+    /// racing double-read at worst fires one extra init (boringtun's own
+    /// retransmit would emit it anyway) or mis-steps the back-off by one
+    /// doubling.
+    pub fn should_rearm_expired(&self, now_micros: i64, base_micros: i64, cap_micros: i64) -> bool {
+        let streak = self.rearm_streak.load(Ordering::Relaxed);
+        let backoff = rearm_interval(streak, base_micros, cap_micros);
         let last = self.last_rearm_micros.load(Ordering::Relaxed);
-        if now_micros.saturating_sub(last) >= backoff_micros {
+        if now_micros.saturating_sub(last) >= backoff {
             self.last_rearm_micros.store(now_micros, Ordering::Relaxed);
+            // Bump the streak so the NEXT still-failing window doubles; a valid
+            // inbound rx resets it to 0. Saturating so a pathological run never
+            // wraps (the window is capped regardless).
+            self.rearm_streak
+                .store(streak.saturating_add(1), Ordering::Relaxed);
             true
         } else {
             false
@@ -386,6 +448,7 @@ impl std::fmt::Debug for PeerSession {
                 "last_rearm_micros",
                 &self.last_rearm_micros.load(Ordering::Relaxed),
             )
+            .field("rearm_streak", &self.rearm_streak.load(Ordering::Relaxed))
             .field("tunn", &"<Tunn>")
             .finish()
     }
@@ -414,6 +477,7 @@ mod tests {
             failed_handshake_count: AtomicU32::new(0),
             direct_suppressed_until: AtomicI64::new(0),
             last_rearm_micros: AtomicI64::new(0),
+            rearm_streak: AtomicU32::new(0),
             tunn: Mutex::new(Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
@@ -610,33 +674,82 @@ mod tests {
 
     /// FIX 3 re-arm gate: `should_rearm_expired` fires the FIRST time (clock = 0
     /// ⇒ a just-wedged session re-arms immediately), is suppressed for a full
-    /// `EXPIRED_REARM_BACKOFF_MICROS` window afterwards (so the 200 ms timer
-    /// tick can NOT tight-loop the re-arm), and fires again once that WG
-    /// attempt-window cadence elapses — so a genuinely-unreachable expired peer
-    /// retries at WG speed, not every tick.
+    /// BASE window afterwards (so the 200 ms timer tick can NOT tight-loop the
+    /// re-arm), and fires again once that WG attempt-window cadence elapses — so
+    /// a genuinely-unreachable expired peer retries at WG speed, not every tick.
     #[test]
     fn should_rearm_expired_rate_limits() {
         let s = bare_session();
-        let backoff = EXPIRED_REARM_BACKOFF_MICROS;
+        let base_w = EXPIRED_REARM_BACKOFF_MICROS;
+        let cap_w = EXPIRED_REARM_BACKOFF_CAP_MICROS;
         // Use a realistic wall-clock baseline (≫ backoff) so the first call —
         // with `last_rearm_micros == 0` — always satisfies `now - 0 >= backoff`,
         // matching the live `now_micros()` magnitude the timer loop feeds in.
         let base = 1_700_000_000_000_000;
         assert!(
-            s.should_rearm_expired(base, backoff),
+            s.should_rearm_expired(base, base_w, cap_w),
             "first re-arm fires immediately (clock starts at 0)"
         );
+        assert_eq!(s.rearm_streak(), 1, "first re-arm bumps the streak");
         assert!(
-            !s.should_rearm_expired(base + 1, backoff),
+            !s.should_rearm_expired(base + 1, base_w, cap_w),
             "a re-arm 1µs later is suppressed (no tight-loop)"
         );
+        // The streak is now 1 ⇒ the next window is 2·BASE. A re-arm exactly one
+        // BASE later is therefore STILL suppressed — proving the loop-guard
+        // back-off escalated, not a fixed-cadence retry.
         assert!(
-            !s.should_rearm_expired(base + backoff - 1, backoff),
-            "still suppressed just under the back-off window"
+            !s.should_rearm_expired(base + base_w, base_w, cap_w),
+            "one BASE later is still suppressed — the re-arm window doubled (loop-guard)"
         );
         assert!(
-            s.should_rearm_expired(base + backoff, backoff),
-            "re-arms again once a full WG attempt-window has elapsed"
+            s.should_rearm_expired(base + 2 * base_w, base_w, cap_w),
+            "re-arms again once the DOUBLED window has elapsed"
+        );
+        assert_eq!(s.rearm_streak(), 2, "second re-arm bumps the streak again");
+    }
+
+    /// THE loop-guard contract (task #14): the expired-`Tunn` re-arm window
+    /// climbs `min(BASE << streak, CAP)` and never exceeds CAP — so a chronically
+    /// black-holed peer (MSI WAN) re-handshakes ever LESS often, not at a fixed
+    /// 90 s rate forever. A valid inbound rx (`note_direct_rx`) collapses the
+    /// streak so a recovered/transient wedge drops straight back to BASE cadence.
+    #[test]
+    fn rearm_backoff_escalates_caps_and_resets_on_rx() {
+        let base_w = EXPIRED_REARM_BACKOFF_MICROS;
+        let cap_w = EXPIRED_REARM_BACKOFF_CAP_MICROS;
+        // Pure interval: doubles per step, clamps at CAP, monotonic, no overflow.
+        assert_eq!(rearm_interval(0, base_w, cap_w), base_w, "streak 0 ⇒ BASE");
+        assert_eq!(rearm_interval(1, base_w, cap_w), 2 * base_w, "streak 1 ⇒ 2·BASE");
+        let mut prev = 0;
+        for streak in 0..64u32 {
+            let w = rearm_interval(streak, base_w, cap_w);
+            assert!(w >= base_w, "never below BASE");
+            assert!(w <= cap_w, "re-arm window {w} must never exceed CAP {cap_w}");
+            assert!(w >= prev, "monotonic non-decreasing");
+            prev = w;
+        }
+        assert_eq!(
+            rearm_interval(u32::MAX, base_w, cap_w),
+            cap_w,
+            "a pathological streak saturates at CAP, never overflows"
+        );
+        // Live: drive the streak up, then a real rx collapses it to BASE cadence.
+        let s = bare_session();
+        let mut now = 1_700_000_000_000_000;
+        assert!(s.should_rearm_expired(now, base_w, cap_w)); // streak 0→1
+        now += 2 * base_w;
+        assert!(s.should_rearm_expired(now, base_w, cap_w)); // streak 1→2
+        now += 4 * base_w;
+        assert!(s.should_rearm_expired(now, base_w, cap_w)); // streak 2→3
+        assert_eq!(s.rearm_streak(), 3, "three un-answered re-arms");
+        // RX returns: the streak collapses.
+        s.note_direct_rx(now);
+        assert_eq!(s.rearm_streak(), 0, "a valid inbound rx resets the re-arm back-off");
+        // The next re-arm is due at BASE cadence again (one BASE after the last).
+        assert!(
+            s.should_rearm_expired(now + base_w, base_w, cap_w),
+            "after a reset the next re-arm is due at BASE cadence"
         );
     }
 

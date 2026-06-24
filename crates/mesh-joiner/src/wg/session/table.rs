@@ -76,17 +76,26 @@ pub struct SessionTable {
     /// judged a black hole (no TX ⇒ no expectation of RX). `0` = "never sent".
     last_send_attempt_ts: Arc<AtomicI64>,
     /// Unix-micros of the LAST active IDLE LIVENESS PROBE the timer loop fired
-    /// (B-fix-1). Rate-limits that probe to one frame per
-    /// [`IDLE_PROBE_INTERVAL_MICROS`] so an ambiguously-idle node emits ONE
-    /// keepalive-sized frame per interval (advancing `last_send_attempt_ts`)
-    /// instead of a busy-loop. The probe's ONLY job is to break the fail-open
-    /// idle rule in `dataplane_healthy`: once it advances the send clock past
-    /// the RX clock, the UNCHANGED black-hole verdict can detect a node whose
-    /// data plane is wedged (no real RX in the 90s window) — the 2026-06-21 MSI
-    /// signature where a trickle of relay control frames masked a black hole.
-    /// `0` = "never probed". `Arc<AtomicI64>` like the other clocks so the
-    /// rate-limit is process-global across the cheap-clone table.
+    /// (B-fix-1). Rate-limits that probe so an ambiguously-idle node emits ONE
+    /// keepalive-sized frame per (escalating) interval (advancing
+    /// `last_send_attempt_ts`) instead of a busy-loop. The probe's ONLY job is to
+    /// break the fail-open idle rule in `dataplane_healthy`: once it advances the
+    /// send clock past the RX clock, the UNCHANGED black-hole verdict can detect
+    /// a node whose data plane is wedged (no real RX in the 90s window) — the
+    /// 2026-06-21 MSI signature where a trickle of relay control frames masked a
+    /// black hole. `0` = "never probed". `Arc<AtomicI64>` like the other clocks
+    /// so the rate-limit is process-global across the cheap-clone table.
     last_idle_probe_ts: Arc<AtomicI64>,
+    /// Count of consecutive idle liveness probes emitted WITHOUT a real inbound
+    /// frame arriving since (B-fix-1 ESCALATING back-off — task #13). The probe
+    /// interval grows `min(BASE << streak, CAP)` so a chronically black-holed
+    /// peer (MSI's flaky WAN) is probed ever LESS often — a bounded retry
+    /// schedule, NOT a fixed-interval hammer. Reset to `0` the instant a real
+    /// inbound data frame lands ([`Self::note_inbound_data_frame`]): the moment
+    /// the path recovers, probing returns to the responsive BASE cadence.
+    /// `Arc<AtomicU32>` so the streak is process-global across the cheap-clone
+    /// table, like the liveness clocks.
+    idle_probe_streak: Arc<AtomicU32>,
 }
 
 /// How long a node may be AMBIGUOUSLY IDLE before the active idle liveness
@@ -100,12 +109,61 @@ pub struct SessionTable {
 /// round-tripping) never trips it.
 pub const IDLE_PROBE_AFTER_MICROS: i64 = 45_000_000;
 
-/// Minimum spacing between consecutive active idle liveness probes (B-fix-1).
+/// BASE spacing between consecutive active idle liveness probes (B-fix-1,
+/// escalating back-off — task #13).
 ///
-/// At most one keepalive-sized frame per 30s — cheap, yet frequent enough that
-/// the send clock stays ahead of the RX clock across the 90s freshness window
-/// once a black hole sets in, so `dataplane_healthy` reliably flips unhealthy.
-pub const IDLE_PROBE_INTERVAL_MICROS: i64 = 30_000_000;
+/// The FIRST probe after the path goes silent fires at this cadence (30s):
+/// frequent enough that the send clock stays ahead of the RX clock across the
+/// 90s freshness window, so `dataplane_healthy` reliably flips unhealthy on a
+/// genuine black hole within the first window. Each subsequent un-answered probe
+/// doubles the wait ([`SessionTable::idle_probe_interval`]) up to
+/// [`IDLE_PROBE_INTERVAL_CAP_MICROS`] — a chronically dead peer is NOT hammered
+/// at a fixed 30s rate.
+pub const IDLE_PROBE_INTERVAL_BASE_MICROS: i64 = 30_000_000;
+
+/// CAP on the escalating idle-probe interval (B-fix-1 — task #13).
+///
+/// The doubling back-off saturates here (10 min) so a permanently black-holed
+/// peer still gets an occasional liveness probe (the path may recover) without
+/// ever returning to a tight loop. Once a real inbound frame lands the streak
+/// resets and the cadence drops straight back to
+/// [`IDLE_PROBE_INTERVAL_BASE_MICROS`].
+pub const IDLE_PROBE_INTERVAL_CAP_MICROS: i64 = 600_000_000;
+
+/// The escalating idle-probe interval for a consecutive-failure `streak`
+/// (B-fix-1 — task #13).
+///
+/// `min(BASE << streak, CAP)`: `streak == 0` (the first probe, or right after a
+/// real RX reset the counter) yields BASE; each subsequent un-answered probe
+/// doubles the wait up to CAP. Overflow-safe, pure + `const`; delegates to the
+/// shared [`escalating_backoff`].
+#[must_use]
+pub const fn idle_probe_interval(streak: u32, base_micros: i64, cap_micros: i64) -> i64 {
+    escalating_backoff(streak, base_micros, cap_micros)
+}
+
+/// Shared overflow-safe exponential back-off: `min(base << streak, cap)`.
+///
+/// Computed by iterative doubling so a large `streak` saturates at `cap` instead
+/// of overflowing (`i64::checked_shl` guards only the shift COUNT, not the
+/// resulting VALUE — a wide shift silently yields garbage, so it is unsuitable
+/// here). Returns `cap` the instant the doubled value reaches or exceeds it.
+/// Used by both the idle-probe (task #13) and the expired-`Tunn` re-arm (task
+/// #14) loop-guards.
+#[must_use]
+pub const fn escalating_backoff(streak: u32, base_micros: i64, cap_micros: i64) -> i64 {
+    let mut window = base_micros;
+    let mut i = 0u32;
+    while i < streak {
+        // Double; saturate to cap on the first step that reaches/overflows it.
+        match window.checked_mul(2) {
+            Some(doubled) if doubled < cap_micros => window = doubled,
+            _ => return cap_micros,
+        }
+        i += 1;
+    }
+    if window < cap_micros { window } else { cap_micros }
+}
 
 /// Pure trigger for the active idle liveness probe (B-fix-1). Returns `true`
 /// when the node is AMBIGUOUSLY IDLE and should emit ONE keepalive frame to
@@ -184,6 +242,10 @@ impl std::fmt::Debug for SessionTable {
                 "last_idle_probe_ts",
                 &self.last_idle_probe_ts.load(Ordering::Relaxed),
             )
+            .field(
+                "idle_probe_streak",
+                &self.idle_probe_streak.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -246,6 +308,12 @@ impl SessionTable {
     /// staleness threshold.
     pub fn note_inbound_data_frame(&self, now_micros: i64) {
         store_max(&self.last_inbound_data_frame_ts, now_micros);
+        // A real inbound frame means the path is alive again — collapse the
+        // escalating idle-probe back-off so probing returns to BASE cadence the
+        // instant the black hole clears (B-fix-1 — task #13). Relaxed: a racing
+        // probe at worst reads a one-step-stale streak, which only shifts the
+        // next interval by one doubling — inert against the seconds-scale gate.
+        self.idle_probe_streak.store(0, Ordering::Relaxed);
     }
 
     /// Stamp `now_micros` as the time of the last `send_wire` attempt
@@ -309,28 +377,42 @@ impl SessionTable {
         self.last_idle_probe_ts.load(Ordering::Relaxed)
     }
 
+    /// Snapshot the consecutive un-answered idle-probe streak (B-fix-1 —
+    /// diagnostics + tests). Reset to `0` the instant a real inbound frame lands.
+    #[must_use]
+    pub fn idle_probe_streak(&self) -> u32 {
+        self.idle_probe_streak.load(Ordering::Relaxed)
+    }
+
     /// Decide whether the timer loop should fire ONE active idle liveness probe
     /// THIS tick (B-fix-1), CLAIMING the rate-limit slot when it returns `true`.
     ///
     /// Two gates compose:
     /// 1. [`idle_probe_due`] — the pure ambiguous-idle trigger (peers present,
     ///    idle, RX aged past `after_micros`).
-    /// 2. A per-table interval limiter (`interval_micros`): at most one probe
-    ///    per window, so an ambiguously-idle node emits ONE keepalive per
-    ///    interval — never a busy-loop. The first ever probe fires immediately
-    ///    (clock starts at `0`); thereafter the slot is claimed by stamping
-    ///    `last_idle_probe_ts` (relaxed CAS-free store, same rationale as the
-    ///    other liveness clocks — a racing double-read at worst emits one extra
-    ///    keepalive, which WG anti-replay / the relay floor make harmless).
+    /// 2. A per-table ESCALATING interval limiter (task #13): at most one probe
+    ///    per window, and the window GROWS with the consecutive un-answered
+    ///    streak — `min(base << streak, cap)` ([`idle_probe_interval`]). An
+    ///    ambiguously-idle node emits ONE keepalive at BASE cadence, then ever
+    ///    less often if no RX returns, so a chronically dead peer is never
+    ///    hammered at a fixed rate. The first ever probe fires immediately (clock
+    ///    starts at `0`, streak `0` ⇒ BASE window already elapsed); each emit
+    ///    bumps the streak so the NEXT window doubles. The slot is claimed by
+    ///    stamping `last_idle_probe_ts` + incrementing `idle_probe_streak`
+    ///    (relaxed, same rationale as the other liveness clocks — a racing
+    ///    double-read at worst emits one extra keepalive / mis-steps the back-off
+    ///    by one doubling, which WG anti-replay / the relay floor make harmless).
+    ///    [`Self::note_inbound_data_frame`] resets the streak to `0` on real RX.
     ///
     /// Read-then-claim is intentional: the caller emits the probe only when this
     /// returns `true`, so claiming here keeps the side effect bounded to one
-    /// frame per interval regardless of the 200ms timer cadence.
+    /// frame per (escalating) interval regardless of the 200ms timer cadence.
     pub fn should_emit_idle_probe(
         &self,
         now_micros: i64,
         after_micros: i64,
-        interval_micros: i64,
+        base_interval_micros: i64,
+        cap_interval_micros: i64,
     ) -> bool {
         if !idle_probe_due(
             now_micros,
@@ -341,10 +423,18 @@ impl SessionTable {
         ) {
             return false;
         }
-        // Rate-limit: claim the slot iff a full interval has elapsed.
+        // Escalating rate-limit: the required spacing grows with the un-answered
+        // streak, so claim the slot iff that (doubling, capped) window elapsed.
+        let streak = self.idle_probe_streak.load(Ordering::Relaxed);
+        let interval = idle_probe_interval(streak, base_interval_micros, cap_interval_micros);
         let last = self.last_idle_probe_ts.load(Ordering::Relaxed);
-        if now_micros.saturating_sub(last) >= interval_micros {
+        if now_micros.saturating_sub(last) >= interval {
             self.last_idle_probe_ts.store(now_micros, Ordering::Relaxed);
+            // Bump the streak so the NEXT un-answered window doubles. Saturating
+            // so a pathological run can never wrap (the interval is capped
+            // anyway). A real inbound frame resets this to 0.
+            let next = streak.saturating_add(1);
+            self.idle_probe_streak.store(next, Ordering::Relaxed);
             true
         } else {
             false
@@ -654,8 +744,9 @@ impl SessionTable {
             failed_handshake_count: AtomicU32::new(0),
             direct_suppressed_until: AtomicI64::new(0),
             // Never re-armed yet — the first detected `Tunn` expiry re-arms
-            // at once (FIX 3).
+            // at once (FIX 3). Streak starts un-escalated (task #14 loop-guard).
             last_rearm_micros: AtomicI64::new(0),
+            rearm_streak: AtomicU32::new(0),
             tunn: Mutex::new(tunn),
         });
         // Re-apply any app-ULAs this peer already hosts onto the FRESH
@@ -934,6 +1025,11 @@ mod liveness_tests {
     /// [`IDLE_PROBE_AFTER_MICROS`]).
     const AFTER: i64 = IDLE_PROBE_AFTER_MICROS;
 
+    /// BASE / CAP idle-probe intervals for the escalating-back-off tests (task
+    /// #13). Mirror the production constants.
+    const BASE: i64 = IDLE_PROBE_INTERVAL_BASE_MICROS;
+    const CAP: i64 = IDLE_PROBE_INTERVAL_CAP_MICROS;
+
     /// THE ambiguous-idle case the probe exists for: peers present, NO send
     /// since the last inbound (idle ⇒ `dataplane_healthy` would fail-OPEN), and
     /// the RX clock aged PAST the probe-after window. `idle_probe_due` ⇒ true.
@@ -1009,11 +1105,38 @@ mod liveness_tests {
         ));
     }
 
+    // ---- task #13: escalating idle-probe interval (pure) ----
+
+    /// `idle_probe_interval` doubles per streak step and saturates at CAP:
+    /// streak 0 ⇒ BASE, 1 ⇒ 2·BASE, 2 ⇒ 4·BASE, … then clamps to CAP and never
+    /// exceeds it — the bounded-retry schedule that replaces the fixed pulse.
+    #[test]
+    fn idle_probe_interval_doubles_then_caps() {
+        assert_eq!(idle_probe_interval(0, BASE, CAP), BASE, "streak 0 ⇒ BASE");
+        assert_eq!(idle_probe_interval(1, BASE, CAP), 2 * BASE, "streak 1 ⇒ 2·BASE");
+        assert_eq!(idle_probe_interval(2, BASE, CAP), 4 * BASE, "streak 2 ⇒ 4·BASE");
+        // Climb until the doubling would exceed CAP, then stay clamped.
+        let mut prev = 0;
+        for streak in 0..64u32 {
+            let w = idle_probe_interval(streak, BASE, CAP);
+            assert!(w >= BASE, "never below BASE");
+            assert!(w <= CAP, "back-off {w} must never exceed CAP {CAP}");
+            assert!(w >= prev, "monotonic non-decreasing across the streak");
+            prev = w;
+        }
+        assert_eq!(
+            idle_probe_interval(u32::MAX, BASE, CAP),
+            CAP,
+            "a pathological streak saturates at CAP, never overflows"
+        );
+    }
+
     /// The end-to-end table gate composes the trigger with the per-table
-    /// interval limiter: an ambiguously-idle table emits the FIRST probe
-    /// immediately (clock starts at 0), then SUPPRESSES a second probe within
-    /// `IDLE_PROBE_INTERVAL_MICROS`, then ALLOWS one again past the interval —
-    /// one keepalive per window, never a busy-loop.
+    /// ESCALATING interval limiter (task #13): an ambiguously-idle table emits
+    /// the FIRST probe immediately (clock starts at 0, streak 0 ⇒ BASE window
+    /// already elapsed), then SUPPRESSES a second probe within the (now DOUBLED)
+    /// window, then ALLOWS one again only past the LARGER window — one keepalive
+    /// per escalating window, never a busy-loop.
     #[test]
     fn should_emit_idle_probe_is_rate_limited() {
         let t = table_with_one_peer();
@@ -1021,20 +1144,50 @@ mod liveness_tests {
         t.note_inbound_data_frame(10_000_000);
         let base = 10_000_000 + AFTER; // first moment the probe is due
         assert!(
-            t.should_emit_idle_probe(base, AFTER, IDLE_PROBE_INTERVAL_MICROS),
+            t.should_emit_idle_probe(base, AFTER, BASE, CAP),
             "first probe fires once the ambiguity window is reached"
         );
+        assert_eq!(t.idle_probe_streak(), 1, "first emit bumps the streak to 1");
+        // After the first emit the streak is 1 ⇒ the next required window is
+        // 2·BASE. A probe at base + BASE (one BASE later) is therefore STILL
+        // suppressed — proving the back-off escalated, not a fixed BASE pulse.
         assert!(
-            !t.should_emit_idle_probe(base + 1, AFTER, IDLE_PROBE_INTERVAL_MICROS),
-            "a second probe within the interval is suppressed"
+            !t.should_emit_idle_probe(base + BASE, AFTER, BASE, CAP),
+            "a second probe one BASE later is suppressed — the window doubled"
         );
+        // Past the doubled window (2·BASE) the next probe fires.
         assert!(
-            t.should_emit_idle_probe(
-                base + IDLE_PROBE_INTERVAL_MICROS,
-                AFTER,
-                IDLE_PROBE_INTERVAL_MICROS
-            ),
-            "a probe fires again once a full interval has elapsed"
+            t.should_emit_idle_probe(base + 2 * BASE, AFTER, BASE, CAP),
+            "a probe fires again once the DOUBLED interval has elapsed"
+        );
+        assert_eq!(t.idle_probe_streak(), 2, "second emit bumps the streak to 2");
+    }
+
+    /// A real inbound frame COLLAPSES the escalating back-off (task #13): after
+    /// several un-answered probes the streak is high (long window), but the
+    /// instant `note_inbound_data_frame` lands the streak resets to 0 so probing
+    /// returns to the responsive BASE cadence — the moment the black hole clears.
+    #[test]
+    fn real_rx_resets_idle_probe_backoff() {
+        let t = table_with_one_peer();
+        t.note_inbound_data_frame(10_000_000);
+        let mut now = 10_000_000 + AFTER;
+        // Emit three escalating probes (no RX between them): streak climbs.
+        assert!(t.should_emit_idle_probe(now, AFTER, BASE, CAP)); // streak 0→1
+        now += 2 * BASE;
+        assert!(t.should_emit_idle_probe(now, AFTER, BASE, CAP)); // streak 1→2
+        now += 4 * BASE;
+        assert!(t.should_emit_idle_probe(now, AFTER, BASE, CAP)); // streak 2→3
+        assert_eq!(t.idle_probe_streak(), 3, "three un-answered probes");
+        // RX returns: the streak collapses to 0.
+        t.note_inbound_data_frame(now);
+        assert_eq!(t.idle_probe_streak(), 0, "real RX resets the back-off");
+        // The path goes silent again; the very next due probe fires at BASE
+        // cadence (not the long pre-reset window), proving recovery is snappy.
+        let due = now + AFTER; // RX aged past the ambiguity window again
+        assert!(
+            t.should_emit_idle_probe(due, AFTER, BASE, CAP),
+            "after a reset the next probe is due at BASE cadence again"
         );
     }
 
@@ -1047,10 +1200,11 @@ mod liveness_tests {
         let t = table_with_one_peer();
         t.note_inbound_data_frame(10_000_000);
         // Fresh RX ⇒ not due ⇒ must not claim the slot.
-        assert!(!t.should_emit_idle_probe(10_000_000 + AFTER / 2, AFTER, IDLE_PROBE_INTERVAL_MICROS));
+        assert!(!t.should_emit_idle_probe(10_000_000 + AFTER / 2, AFTER, BASE, CAP));
         assert_eq!(t.last_idle_probe_ts(), 0, "a not-due call must not stamp");
+        assert_eq!(t.idle_probe_streak(), 0, "a not-due call must not bump the streak");
         // Now genuinely due → fires immediately (slot was never consumed).
-        assert!(t.should_emit_idle_probe(10_000_000 + AFTER, AFTER, IDLE_PROBE_INTERVAL_MICROS));
+        assert!(t.should_emit_idle_probe(10_000_000 + AFTER, AFTER, BASE, CAP));
     }
 
     /// END-TO-END liveness chain (the whole point of B-fix-1): an
@@ -1069,7 +1223,7 @@ mod liveness_tests {
             "the fail-open idle rule masks the black hole before any probe"
         );
         // The probe fires (ambiguous-idle) and stamps the send clock.
-        assert!(t.should_emit_idle_probe(now, AFTER, IDLE_PROBE_INTERVAL_MICROS));
+        assert!(t.should_emit_idle_probe(now, AFTER, BASE, CAP));
         t.note_send_attempt(now); // the probe's send_wire would do this
         // AFTER the probe: sending + stale RX ⇒ UNHEALTHY (black hole exposed).
         assert!(
