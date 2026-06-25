@@ -108,6 +108,15 @@ struct Args {
     /// behind a firewall — NEVER for a multi-tenant deployment.
     #[arg(long, env = "AUTH_URL")]
     auth_url: Option<String>,
+
+    /// UDP address for the co-located STUN BINDING responder (RFC 5389), e.g.
+    /// `0.0.0.0:3478`. When set, NAT'd joiners pointed at this address (their
+    /// `--mesh-stun-server`) discover their reflexive WG endpoint — the punch
+    /// target governed-direct needs. When UNSET (default), no STUN server runs
+    /// and behaviour is unchanged (joiners fall back to the coordinator's
+    /// reflexive guess; relay always remains the floor).
+    #[arg(long, env = "TABBIFY_MESH_STUN_BIND")]
+    stun_bind: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -170,6 +179,20 @@ async fn main() -> Result<()> {
     coordinator.restore().await;
 
     let _sweeper = timeout::spawn(coordinator.clone());
+
+    // Optional co-located STUN BINDING responder (R1). Spawned only when
+    // `--stun-bind` is set; absent ⇒ no STUN server, behaviour unchanged. It
+    // ONLY discovers a joiner's reflexive WG endpoint — never touches any
+    // relay/punch decision (direct is still adopted only on real DATA).
+    if let Some(stun_bind) = args.stun_bind {
+        tokio::spawn(async move {
+            if let Err(e) =
+                tabbify_mesh_coordinator::nat::stun_server::run_stun_server(stun_bind).await
+            {
+                tracing::error!(error = %e, "STUN server exited");
+            }
+        });
+    }
 
     let router = build_router_with_admin(coordinator, args.admin_token);
     // `into_make_service_with_connect_info` lets the heartbeat handler

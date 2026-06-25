@@ -198,4 +198,26 @@ mod tests {
             "a response to a different transaction id must be rejected"
         );
     }
+
+    /// SAFETY (relay floor): an unreachable / silent STUN server must yield
+    /// `None` *bounded by the timeout* — never a hang, never a panic. This is
+    /// what makes `joiner.rs` fall through to the relay floor when STUN is down
+    /// or unset: no reflexive mapping is adopted, `relay_enabled` is untouched,
+    /// and the advertised endpoint stays exactly what it already was. Direct is
+    /// purely additive; its failure can never cost connectivity.
+    #[tokio::test]
+    async fn unreachable_stun_yields_none_and_does_not_hang() {
+        // The joiner's WG socket (the one a real join issues STUN from).
+        let wg = UdpSocket::bind("127.0.0.1:0").await.expect("bind wg socket");
+        // A bound-but-SILENT peer models a dead/unreachable STUN responder
+        // deterministically: it consumes our datagram and never answers (no
+        // routing, no ICMP races). `recv` must hit the timeout → `None`.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.expect("bind silent peer");
+        let dead = silent.local_addr().expect("silent addr");
+        let got = discover_wg_mapping(&wg, dead, Duration::from_millis(200)).await;
+        assert!(
+            got.is_none(),
+            "an unreachable STUN server must yield None — the caller keeps the relay floor"
+        );
+    }
 }
