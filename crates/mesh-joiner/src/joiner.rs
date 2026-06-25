@@ -748,6 +748,7 @@ fn spawn_background_tasks(ctx: SpawnContext) -> Vec<JoinHandle<()>> {
         socket.clone(),
         sessions.clone(),
         our_private.clone(),
+        my_ula,
         shutdown_rx.clone(),
     )));
 
