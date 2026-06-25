@@ -70,6 +70,9 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
     // Clone again for the Track A-a per-pair direct-flag sub-router.
     let direct_state_coord = coordinator.clone();
     let direct_state_token = admin_token.clone();
+    // Clone again for the Stage-4 fleet-wide proactive-gate sub-router.
+    let proactive_state_coord = coordinator.clone();
+    let proactive_state_token = admin_token.clone();
 
     let peer_routes = Router::new()
         .route("/v1/mesh/register", post(register_handler))
@@ -121,10 +124,27 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
         )
         .with_state(direct_state);
 
+    // Stage-4 fleet-wide proactive gate: admin-gated runtime toggle, same
+    // fail-closed `MESH_ADMIN_TOKEN` gate. Its own state type → a fifth
+    // sub-router merged below. Exposes the startup-only `--proactive` atomic as
+    // a reachable runtime knob (the coordinator has no operator shell).
+    let proactive_state = crate::http::proactive_api::ProactiveApiState {
+        coordinator: proactive_state_coord,
+        admin_token: proactive_state_token,
+    };
+    let proactive_routes = Router::new()
+        .route(
+            "/v1/mesh/proactive",
+            get(crate::http::proactive_api::get_proactive_handler)
+                .post(crate::http::proactive_api::post_proactive_handler),
+        )
+        .with_state(proactive_state);
+
     peer_routes
         .merge(policy_routes)
         .merge(command_routes)
         .merge(direct_routes)
+        .merge(proactive_routes)
         // Swagger UI at `/swagger-ui` + the raw spec at `/openapi.json`.
         // Unauthenticated, so operators can browse the contract before
         // they hold a join token / admin token.
