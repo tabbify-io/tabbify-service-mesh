@@ -136,9 +136,9 @@ async fn main() -> Result<()> {
     );
 
     // Load the ACL policy from disk if configured, else start with the
-    // Phase-2 bootstrap policy (the two system rules — infra serves tenants,
-    // tenants stay isolated by default-deny; per-network self-rules are
-    // PUT by the auth service at runtime).
+    // bootstrap policy (the single system self-rule — strict default-deny:
+    // tenants are isolated and infra reaches them only via explicit rules the
+    // auth service PUTs at runtime).
     let policy_store = if let Some(path) = &args.policy_file {
         let store =
             PolicyStore::load_from_file(path).map_err(|e| anyhow!("load policy file: {e}"))?;

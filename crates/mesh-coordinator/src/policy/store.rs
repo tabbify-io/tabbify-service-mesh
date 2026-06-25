@@ -287,15 +287,24 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_store_carries_the_two_system_rules() {
+    fn bootstrap_store_carries_only_the_system_self_rule() {
         let store = PolicyStore::bootstrap();
         let policy = store.current();
-        assert_eq!(policy.acls.len(), 2, "bootstrap store must have two rules");
-        // Infra serves a tenant runner; distinct tenants stay isolated.
+        assert_eq!(
+            policy.acls.len(),
+            1,
+            "bootstrap store must carry only the system self-rule"
+        );
+        // Strict default-deny: infra does NOT reach a tenant runner without an
+        // explicit rule, and distinct tenants stay isolated.
         let system = vec!["tag:system".to_owned()];
         let net_x = vec!["tag:net-n_x".to_owned()];
         let net_y = vec!["tag:net-n_y".to_owned()];
-        assert!(policy.can_see(&system, &net_x), "system serves tenant net");
+        assert!(policy.can_see(&system, &system), "system sees itself");
+        assert!(
+            !policy.can_see(&system, &net_x),
+            "system must not serve a tenant net without an explicit rule"
+        );
         assert!(!policy.can_see(&net_x, &net_y), "tenant nets isolated");
     }
 
@@ -339,8 +348,8 @@ mod tests {
             matches!(err, PolicyReplaceError::Invalid(_)),
             "expected Invalid, got {err:?}"
         );
-        // The store is unchanged: still the bootstrap two rules, same ETag.
-        assert_eq!(store.current().acls.len(), 2);
+        // The store is unchanged: still the single bootstrap rule, same ETag.
+        assert_eq!(store.current().acls.len(), 1);
         assert_eq!(
             store.etag(),
             etag,
@@ -370,7 +379,8 @@ mod tests {
         let snap = store
             .replace(&etag, Policy::new(acls))
             .expect("a concrete per-network self-rule is valid");
-        assert_eq!(snap.policy.acls.len(), 3);
+        // The single bootstrap rule plus the appended per-network self-rule.
+        assert_eq!(snap.policy.acls.len(), 2);
     }
 
     #[test]

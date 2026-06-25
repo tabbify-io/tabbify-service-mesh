@@ -69,10 +69,13 @@ pub const TAG_SYSTEM: &str = "tag:system";
 
 /// Prefix wildcard matching every per-tenant network tag.
 ///
-/// E.g. `tag:net-n_jpegxik72nng`. Used only as a *destination* in the
-/// bootstrap policy so `tag:system` can reach any tenant runner; it is
-/// deliberately **never** used as a source paired with this same destination,
-/// which would (under symmetric `can_see`) collapse cross-tenant isolation.
+/// E.g. `tag:net-n_jpegxik72nng`. Legal **only as a destination** (an
+/// externally-authored policy may use it that way); it is deliberately
+/// **forbidden as a source** by [`Policy::validate`], which — under the
+/// symmetric `can_see` — would collapse cross-tenant isolation. It is no
+/// longer used by [`Policy::bootstrap`] (strict default-deny): infra→tenant
+/// reachability is now an explicit auth-managed `tag:system → tag:net-<slug>`
+/// rule, not a wildcard in the bootstrap policy.
 pub const TAG_NET_WILDCARD: &str = "tag:net-*";
 
 impl AclRule {
@@ -110,30 +113,27 @@ impl Policy {
         Self { acls }
     }
 
-    /// The Phase-2 mesh **bootstrap** policy — the default a coordinator
-    /// starts with when no `--policy-file` is supplied. EXACTLY two rules
-    /// and nothing else:
+    /// The mesh **bootstrap** policy — the default a coordinator starts with
+    /// when no `--policy-file` is supplied. **Strict default-deny:** EXACTLY
+    /// ONE rule and nothing else:
     ///
     /// 1. `tag:system → tag:system` — shared infra peers (supervisor, node,
     ///    registry, auth, coordinator) talk among themselves.
-    /// 2. `tag:system → tag:net-*` — infra can reach *any* tenant runner so
-    ///    it can serve it; being symmetric, the runner can also reach infra.
     ///
-    /// Crucially there is **no** `tag:net-* → tag:net-*` (or `tag:net-* ↔
-    /// tag:net-*`) edge: that glob would, under the symmetric
-    /// [`Self::can_see`], let `net-A` reach `net-B` and break tenant
-    /// isolation. Per-tenant intra-network visibility comes from per-network
-    /// self-rules (`tag:net-<slug> ↔ tag:net-<slug>`) that the auth service
-    /// PUTs on network-create — NOT from the bootstrap policy.
+    /// There is deliberately **no** broad `tag:system → tag:net-*` rule and
+    /// **no** `tag:net-* ↔ tag:net-*` glob. Infra→tenant reachability (serving
+    /// a deployed app) is now an **explicit** per-network rule that the auth
+    /// service writes — e.g. `tag:system → tag:net-<slug>`, created when the
+    /// user picks a runner for an app. Per-tenant intra-network visibility
+    /// likewise comes from per-network self-rules (`tag:net-<slug> ↔
+    /// tag:net-<slug>`) that auth manages — NOT from the bootstrap policy.
     ///
-    /// Default-deny + these two system rules + per-network self-rules =
-    /// isolation, while infra can still serve every tenant's FC runner.
+    /// Default-deny + this one system self-rule + auth-managed explicit rules
+    /// = strict isolation: nothing reaches a tenant network until an owner
+    /// creates a rule for it.
     #[must_use]
     pub fn bootstrap() -> Self {
-        Self::new(vec![
-            AclRule::accept(&[TAG_SYSTEM], &[TAG_SYSTEM]),
-            AclRule::accept(&[TAG_SYSTEM], &[TAG_NET_WILDCARD]),
-        ])
+        Self::new(vec![AclRule::accept(&[TAG_SYSTEM], &[TAG_SYSTEM])])
     }
 
     /// Does some `accept` rule have a source matching any of `src_tags`
@@ -162,10 +162,10 @@ impl Policy {
     ///
     /// [`Self::can_see`] is **symmetric**, so a single rule whose *source*
     /// wildcards over the whole `tag:net-` namespace (e.g. `tag:net-*`) would
-    /// let any tenant network reach any other — the exact failure mode the
-    /// Phase-2 bootstrap policy is built to avoid. The wildcard is legal as a
-    /// *destination* (the bootstrap `tag:system → tag:net-*` rule lets shared
-    /// infra serve every tenant), but never as a *source*.
+    /// let any tenant network reach any other — the exact failure mode strict
+    /// default-deny is built to avoid. The wildcard is legal as a *destination*
+    /// (an externally-authored policy may use `tag:system → tag:net-*` to let
+    /// shared infra serve every tenant), but never as a *source*.
     ///
     /// A concrete single-tenant source such as `tag:net-n_jpegxik72nng` (no
     /// trailing `*`) is fine — that is exactly the per-network self-rule the

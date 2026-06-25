@@ -128,37 +128,36 @@ fn action_defaults_to_accept() {
 // Phase-2 bootstrap policy (step 17): the coordinator's default.
 // -----------------------------------------------------------------
 
-/// The bootstrap policy is EXACTLY the two contract system rules — no
-/// more, no less. A drift here (e.g. someone adding a `net-* ↔ net-*`
-/// glob) is the exact failure mode this test exists to catch.
+/// The bootstrap policy is EXACTLY the single `tag:system → tag:system`
+/// self-rule — no more, no less. A drift here (e.g. someone re-adding the
+/// broad `tag:system → tag:net-*` rule, or a `net-* ↔ net-*` glob) is the
+/// exact failure mode this test exists to catch.
 #[test]
-fn bootstrap_is_exactly_the_two_system_rules() {
-    let policy = Policy::bootstrap();
+fn bootstrap_is_system_self_rule_only() {
+    let p = Policy::bootstrap();
     assert_eq!(
-        policy.acls.len(),
-        2,
-        "bootstrap must have EXACTLY two rules: {:?}",
-        policy.acls
+        p.acls.len(),
+        1,
+        "bootstrap must carry only the system self-rule: {:?}",
+        p.acls
     );
-    assert_eq!(
-        policy.acls[0],
-        AclRule::accept(&["tag:system"], &["tag:system"]),
-        "rule 0 must be system->system"
-    );
-    assert_eq!(
-        policy.acls[1],
-        AclRule::accept(&["tag:system"], &["tag:net-*"]),
-        "rule 1 must be system->net-*"
+    assert_eq!(p.acls[0].src, vec!["tag:system".to_string()]);
+    assert_eq!(p.acls[0].dst, vec!["tag:system".to_string()]);
+    // Infra no longer reaches tenants by default (strict default-deny).
+    let net = vec!["tag:net-n_aaaaaaaaaaaa".to_string()];
+    let sys = vec!["tag:system".to_string()];
+    assert!(
+        !p.can_see(&sys, &net),
+        "system must not see a tenant without an explicit rule"
     );
     // Belt-and-suspenders: assert NO rule has a tag:net-* source — that
     // would be the cross-tenant glob the contract forbids.
     assert!(
-        policy
-            .acls
+        p.acls
             .iter()
             .all(|r| !r.src.iter().any(|s| s.starts_with("tag:net-"))),
         "bootstrap must NOT carry any tag:net-* source rule: {:?}",
-        policy.acls
+        p.acls
     );
 }
 
@@ -169,20 +168,21 @@ fn bootstrap_system_sees_system() {
     assert!(policy.can_see(&tags(&["tag:system"]), &tags(&["tag:system"])));
 }
 
-/// Under bootstrap, infra (`tag:system`) sees a tenant runner
-/// (`tag:net-X`) so it can serve it — and, being symmetric, the runner
-/// reaches infra too.
+/// Under bootstrap ALONE, infra (`tag:system`) does NOT reach a tenant
+/// runner (`tag:net-X`): strict default-deny. Infra→tenant reachability
+/// (serving a deployed app) is now an EXPLICIT per-network rule that auth
+/// writes (`tag:system → tag:net-<slug>`), not a bootstrap concern.
 #[test]
-fn bootstrap_system_sees_tenant_net() {
+fn bootstrap_system_does_not_see_tenant_net() {
     let policy = Policy::bootstrap();
     assert!(
-        policy.can_see(&tags(&["tag:system"]), &tags(&["tag:net-n_jpegxik72nng"])),
-        "system must reach a tenant net peer"
+        !policy.can_see(&tags(&["tag:system"]), &tags(&["tag:net-n_jpegxik72nng"])),
+        "system must NOT reach a tenant net peer without an explicit rule"
     );
-    // Symmetric direction (runner -> infra).
+    // Symmetric direction (runner -> infra) is likewise denied.
     assert!(
-        policy.can_see(&tags(&["tag:net-n_jpegxik72nng"]), &tags(&["tag:system"])),
-        "tenant net peer must reach system (symmetric)"
+        !policy.can_see(&tags(&["tag:net-n_jpegxik72nng"]), &tags(&["tag:system"])),
+        "tenant net peer must NOT reach system without an explicit rule"
     );
 }
 
@@ -252,8 +252,9 @@ fn same_net_visibility_requires_an_added_per_network_rule() {
 // impossible). tag:net-* is fine as a destination, never as a source.
 // -----------------------------------------------------------------
 
-/// The bootstrap policy itself MUST pass validation: it uses `tag:net-*`
-/// only as a *destination*, which is allowed.
+/// The bootstrap policy itself MUST pass validation: under strict
+/// default-deny it is just the `tag:system → tag:system` self-rule, which
+/// carries no `tag:net-*` source and is trivially valid.
 #[test]
 fn validate_accepts_bootstrap() {
     assert!(Policy::bootstrap().validate().is_ok());
@@ -340,8 +341,8 @@ fn validate_allows_unrelated_wildcard_source() {
     assert!(policy.validate().is_ok());
 }
 
-/// `tag:net-*` is legal as a DESTINATION (the bootstrap shape) — only a
-/// source is forbidden.
+/// `tag:net-*` is legal as a DESTINATION in an externally-authored policy —
+/// only a source is forbidden.
 #[test]
 fn validate_allows_net_wildcard_destination() {
     let policy = Policy::new(vec![AclRule::accept(&["tag:system"], &[TAG_NET_WILDCARD])]);
