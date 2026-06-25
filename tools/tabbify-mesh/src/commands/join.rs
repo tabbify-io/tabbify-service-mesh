@@ -65,6 +65,18 @@ fn default_data_dir() -> std::path::PathBuf {
     status_file::status_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
+/// Strip ALL whitespace from a pasted join JWT. Terminal line-wrapping (a long
+/// single-quoted `--join-token 'eyJ…'` spanning several lines) folds newlines +
+/// indentation INTO the token string; that token then fails as an HTTP
+/// `Authorization: Bearer` header value with `InvalidHeaderValue` (a builder
+/// error), which is exactly the foot-gun that wasted an afternoon. A JWT is
+/// base64url segments joined by `.` — it has NO legitimate internal whitespace —
+/// so removing all of it is safe and makes a wrapped paste Just Work. (The old
+/// `str::trim` at the bearer-auth site only stripped the ENDS, not the wrap.)
+fn sanitize_join_token(token: &str) -> String {
+    token.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 /// Map the parsed [`JoinArgs`] onto a [`JoinConfig`]. `super_admin_pubkey` is
 /// NOT a config field (the sink + gate are SEPARATE `join_with_commands` args),
 /// so it is consumed by the caller, not here.
@@ -73,7 +85,7 @@ fn build_join_config(args: JoinArgs) -> JoinConfig {
         coordinator_url: args.coordinator,
         display_name: args.name,
         tags: args.tags,
-        join_token: args.join_token,
+        join_token: args.join_token.as_deref().map(sanitize_join_token),
         listen_port: args.listen_port,
         tun_name: args.tun_name,
         heartbeat_interval: Duration::from_secs(args.heartbeat_interval),
@@ -366,6 +378,23 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         let loaded: LifelineStatus = serde_json::from_slice(&bytes).expect("parse");
         assert_eq!(loaded, status);
+    }
+
+    /// A join token pasted across terminal line-wraps (internal newlines +
+    /// indentation folded INTO the single-quoted string) is sanitised to a clean
+    /// JWT, so it never fails as an HTTP `Authorization` header value (the
+    /// `builder error :: InvalidHeaderValue` foot-gun). A real JWT is base64url
+    /// segments joined by `.` with no internal whitespace, so stripping all of
+    /// it is lossless; a clean token is returned unchanged.
+    #[test]
+    fn sanitize_join_token_strips_paste_wrapping() {
+        let pasted = "eyJhbGc\n  iOiJFZERTQSJ9.\n  payload-seg.\n  sig_x";
+        assert_eq!(
+            sanitize_join_token(pasted),
+            "eyJhbGciOiJFZERTQSJ9.payload-seg.sig_x"
+        );
+        let clean = "eyJabc.def-ghi.jkl_mno";
+        assert_eq!(sanitize_join_token(clean), clean, "clean token untouched");
     }
 
     /// The persisted JSON carries exactly the operator-facing fields with their

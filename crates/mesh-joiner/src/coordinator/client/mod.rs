@@ -314,7 +314,10 @@ impl CoordinatorClient {
 
         let http = builder
             .build()
-            .map_err(|e| JoinerError::HttpTransport(e.to_string()))?;
+            // Debug-format ({e:?}) dumps reqwest's full internal Error struct
+            // incl. the hidden inner source (Display alone = a bare "builder
+            // error"). Needed to see the real cause (TLS provider / proxy / …).
+            .map_err(|e| JoinerError::HttpTransport(format!("{e} :: {e:?}")))?;
 
         Ok(Self {
             http,
@@ -418,7 +421,7 @@ impl CoordinatorClient {
         let resp = builder
             .send()
             .await
-            .map_err(|e| JoinerError::HttpTransport(e.to_string()))?;
+            .map_err(|e| JoinerError::HttpTransport(format!("{e} :: {e:?}")))?;
         ensure_success(&url, resp).await
     }
 
@@ -472,7 +475,7 @@ impl CoordinatorClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| JoinerError::HttpTransport(e.to_string()))?;
+            .map_err(|e| JoinerError::HttpTransport(format!("{e} :: {e:?}")))?;
         ensure_success(&url, resp).await
     }
 
@@ -490,7 +493,7 @@ impl CoordinatorClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| JoinerError::HttpTransport(e.to_string()))?;
+            .map_err(|e| JoinerError::HttpTransport(format!("{e} :: {e:?}")))?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());
