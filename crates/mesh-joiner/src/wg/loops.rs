@@ -830,11 +830,22 @@ async fn maybe_direct_data_probe(
         return;
     }
     let action: WgAction = {
+        let mut tunn = session.tunn.lock().await;
+        // Relay floor invariant: the DATA-probe only PROMOTES an already-established
+        // session. While the handshake is pending, `encapsulate` would mint a
+        // handshake-init (not DATA) and strand it direct-only with an ephemeral +
+        // sender-index rotation, resetting the relay-carried handshake (the
+        // 2026-06-04 storm root cause). Inits stay on the relay floor
+        // (`update_timers` / `send_wire` / the convergence kick); we return BEFORE
+        // `note_handshake_failure` so a skipped probe is never penalised — we sent
+        // nothing. (`time_since_last_handshake().is_some()` == established is the
+        // same idiom as `mesh-fabric::wireguard::transport` and `maybe_rearm…`.)
+        if tunn.time_since_last_handshake().is_none() {
+            return;
+        }
         let mut out = vec![0u8; MAX_UDP_FRAME];
         let probe = direct_probe_packet(my_ula, session.ula);
-        let mut tunn = session.tunn.lock().await;
-        // encapsulate yields a DATA frame once the handshake is up, or a
-        // handshake-init while it is still pending (which also helps the punch).
+        // Established ⇒ `encapsulate` yields a DATA frame that PROMOTES the pair.
         classify_tunn_result(tunn.encapsulate(&probe, &mut out))
     };
     if let WgAction::SendToPeer(bytes) = action {
@@ -1416,31 +1427,146 @@ mod tests {
     /// Change B / B3: two rapid timer probes emit exactly ONE datagram — the
     /// per-session rate-limit (`should_probe_direct`) + the post-emit back-off
     /// cap a black-hole candidate at ~1 probe/interval, never a duplicate stream.
+    ///
+    /// The session is first driven to ESTABLISHED over the simulated relay: the
+    /// relay-floor guard means a pending session emits NOTHING, so the rate-limit
+    /// is only observable on an established pair (the only state that probes).
     #[tokio::test]
     async fn maybe_direct_data_probe_is_rate_limited() {
-        let (relay, _rx) = crate::relay::RelayHandle::new(false);
-        let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let dst = receiver.local_addr().unwrap();
-        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
-        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
-        let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let now = now_micros();
-        let my_ula: Ipv6Addr = "fd5a:1f00:9::1".parse().unwrap();
+        let mut a = harness_node(1).await;
+        let mut b = harness_node(2).await;
+        let pub_a = *x25519_dalek::PublicKey::from(&a.priv_key).as_bytes();
+        let pub_b = *x25519_dalek::PublicKey::from(&b.priv_key).as_bytes();
+        let a_ula = "fd5a:1f00:a::1";
+        let b_ula = "fd5a:1f00:b::1";
+        let a_for_b = harness_upsert(&a, b_ula, pub_b);
+        let b_for_a = harness_upsert(&b, a_ula, pub_a);
 
-        maybe_direct_data_probe(&sender, &table, &session, my_ula, now).await;
-        maybe_direct_data_probe(&sender, &table, &session, my_ula, now).await;
+        let kicked = a.conv_rx.try_recv().expect("eager upsert enqueued the kick");
+        kick_convergence_handshake(&a.table, &kicked).await;
+        for _ in 0..8 {
+            let na = pump_relay(&mut a, &b, &b_for_a).await;
+            let nb = pump_relay(&mut b, &a, &a_for_b).await;
+            if na == 0 && nb == 0 {
+                break;
+            }
+        }
+        assert!(handshook(&a_for_b).await, "pair converged over the relay");
+
+        // PUNCH + two rapid probes at the SAME clock ⇒ the second is rate-limited.
+        *a_for_b.endpoint.write() = Some(b.socket.local_addr().unwrap());
+        let now = now_micros();
+        let my_ula: Ipv6Addr = a_ula.parse().unwrap();
+        maybe_direct_data_probe(&a.socket, &a.table, &a_for_b, my_ula, now).await;
+        maybe_direct_data_probe(&a.socket, &a.table, &a_for_b, my_ula, now).await;
 
         let mut buf = vec![0u8; MAX_UDP_FRAME];
-        let (n, _) = tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf))
+        let (n, _) = tokio::time::timeout(Duration::from_millis(500), b.socket.recv_from(&mut buf))
             .await
             .expect("first probe reaches the candidate")
             .expect("recv");
         assert!(n > 0);
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+            tokio::time::timeout(Duration::from_millis(200), b.socket.recv_from(&mut buf))
                 .await
                 .is_err(),
             "a second probe within the interval must not re-emit"
+        );
+    }
+
+    /// REGRESSION (the 2026-06-04 storm root cause): with the WG handshake still
+    /// PENDING (`time_since_last_handshake() == None`), `maybe_direct_data_probe`
+    /// must NOT mint anything. Pre-fix `encapsulate` on a pending session yielded a
+    /// handshake-INIT (not DATA), which `classify_tunn_result` collapsed into
+    /// `SendToPeer` and the probe shipped DIRECT-ONLY to the candidate — rotating
+    /// the boringtun ephemeral + sender index and resetting the init already
+    /// floored to the relay. The fix is a pre-encapsulate guard under the same
+    /// `tunn.lock()`: inits stay on the relay floor; the direct DATA-probe only
+    /// PROMOTES an already-established session.
+    #[tokio::test]
+    async fn maybe_direct_data_probe_does_not_mint_init_when_handshake_pending() {
+        let (relay, _rx) = crate::relay::RelayHandle::new(false); // non-relay_only
+        let candidate = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst = candidate.local_addr().unwrap();
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        // Fresh session: handshake PENDING (`time_since_last_handshake()==None`),
+        // unconfirmed, not suppressed, WITH a real loopback candidate endpoint —
+        // exactly the state where the pre-fix probe minted + shipped an init.
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
+        let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let my_ula: Ipv6Addr = "fd5a:1f00:9::1".parse().unwrap();
+
+        assert!(
+            session.tunn.lock().await.time_since_last_handshake().is_none(),
+            "precondition: the session handshake is still pending"
+        );
+
+        maybe_direct_data_probe(&sender, &table, &session, my_ula, now_micros()).await;
+
+        // (1) Nothing reached the candidate socket — no init was shipped direct.
+        let mut buf = vec![0u8; MAX_UDP_FRAME];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), candidate.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "a pending-handshake probe must NOT ship anything to the candidate"
+        );
+        // (2) The Tunn was not rotated — handshake state still pending.
+        assert!(
+            session.tunn.lock().await.time_since_last_handshake().is_none(),
+            "the probe must not mint an init / rotate the ephemeral while pending"
+        );
+        // (3) No penalty charged — we sent nothing, so nothing failed.
+        assert_eq!(
+            session.failed_handshake_count(),
+            0,
+            "skipping a pending-handshake probe must not charge note_handshake_failure"
+        );
+    }
+
+    /// The direct DATA-probe emits a WG type-4 (DATA) frame — and ONLY a DATA
+    /// frame — once the session is ESTABLISHED. Drives two real boringtun `Tunn`s
+    /// through init/response over the simulated relay to `established`, then probes
+    /// the punched candidate and asserts the on-wire message type is 4 (DATA),
+    /// never 1 (handshake-init).
+    #[tokio::test]
+    async fn maybe_direct_data_probe_emits_data_only_when_session_established() {
+        let mut a = harness_node(1).await;
+        let mut b = harness_node(2).await;
+        let pub_a = *x25519_dalek::PublicKey::from(&a.priv_key).as_bytes();
+        let pub_b = *x25519_dalek::PublicKey::from(&b.priv_key).as_bytes();
+        let a_ula = "fd5a:1f00:a::1";
+        let b_ula = "fd5a:1f00:b::1";
+        let a_for_b = harness_upsert(&a, b_ula, pub_b);
+        let b_for_a = harness_upsert(&b, a_ula, pub_a);
+
+        // Converge: full WG handshake over the simulated relay.
+        let kicked = a.conv_rx.try_recv().expect("eager upsert enqueued the kick");
+        kick_convergence_handshake(&a.table, &kicked).await;
+        for _ in 0..8 {
+            let na = pump_relay(&mut a, &b, &b_for_a).await;
+            let nb = pump_relay(&mut b, &a, &a_for_b).await;
+            if na == 0 && nb == 0 {
+                break;
+            }
+        }
+        assert!(handshook(&a_for_b).await, "pair converged over the relay");
+
+        // PUNCH: A learns B's real UDP endpoint, then the timer probe fires.
+        *a_for_b.endpoint.write() = Some(b.socket.local_addr().unwrap());
+        maybe_direct_data_probe(&a.socket, &a.table, &a_for_b, a_ula.parse().unwrap(), now_micros())
+            .await;
+
+        let mut buf = vec![0u8; MAX_UDP_FRAME];
+        let (n, _) = tokio::time::timeout(Duration::from_millis(500), b.socket.recv_from(&mut buf))
+            .await
+            .expect("an established session's DATA probe reaches the candidate")
+            .expect("B recv");
+        assert!(n >= 4, "a WG frame carries at least the 4-byte type header");
+        // WG message-type is the first byte (LE u32): 1=init, 2=response, 4=DATA.
+        assert_eq!(
+            buf[0], 4,
+            "an established session's probe must be a DATA frame (type 4), never an init"
         );
     }
 
@@ -1670,24 +1796,42 @@ mod tests {
     // NON-EMPTY inner-v6 DATA frame and sends it DIRECT to an unconfirmed
     // candidate, so the far side confirms without depending on app traffic.
 
-    /// EMIT: a non-`relay_only` node with an unconfirmed candidate endpoint
-    /// emits a (WG-encrypted) DATA probe DIRECT to that candidate when the
-    /// timer ticks — even with zero organic traffic.
+    /// EMIT: a non-`relay_only` node with an ESTABLISHED-but-direct-UNCONFIRMED
+    /// candidate (the punched-but-idle pair) emits a (WG-encrypted) DATA probe
+    /// DIRECT to that candidate when the timer ticks — even with zero organic
+    /// traffic. The handshake floor is mandatory: a pending session emits nothing
+    /// (relay-floor invariant); `direct_confirmed` is still the thing being driven.
     #[tokio::test]
     async fn maybe_direct_data_probe_emits_to_unconfirmed_candidate() {
-        let (relay, _rx) = crate::relay::RelayHandle::new(false); // NOT relay_only
-        let receiver = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let dst = receiver.local_addr().unwrap();
-        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
-        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some(&dst.to_string()));
-        assert!(!session.direct_confirmed(), "fresh session is unconfirmed");
-        let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let my_ula: Ipv6Addr = "fd5a:1f00:9::1".parse().unwrap();
+        let mut a = harness_node(1).await;
+        let mut b = harness_node(2).await;
+        let pub_a = *x25519_dalek::PublicKey::from(&a.priv_key).as_bytes();
+        let pub_b = *x25519_dalek::PublicKey::from(&b.priv_key).as_bytes();
+        let a_ula = "fd5a:1f00:a::1";
+        let b_ula = "fd5a:1f00:b::1";
+        let a_for_b = harness_upsert(&a, b_ula, pub_b);
+        let b_for_a = harness_upsert(&b, a_ula, pub_a);
 
-        maybe_direct_data_probe(&sender, &table, &session, my_ula, now_micros()).await;
+        // Converge over the relay (establish), but leave DIRECT unconfirmed.
+        let kicked = a.conv_rx.try_recv().expect("eager upsert enqueued the kick");
+        kick_convergence_handshake(&a.table, &kicked).await;
+        for _ in 0..8 {
+            let na = pump_relay(&mut a, &b, &b_for_a).await;
+            let nb = pump_relay(&mut b, &a, &a_for_b).await;
+            if na == 0 && nb == 0 {
+                break;
+            }
+        }
+        assert!(handshook(&a_for_b).await, "session established over the relay");
+        assert!(!a_for_b.direct_confirmed(), "direct candidate still unconfirmed");
+
+        // PUNCH + probe with zero organic traffic.
+        *a_for_b.endpoint.write() = Some(b.socket.local_addr().unwrap());
+        maybe_direct_data_probe(&a.socket, &a.table, &a_for_b, a_ula.parse().unwrap(), now_micros())
+            .await;
 
         let mut buf = vec![0u8; MAX_UDP_FRAME];
-        let (n, _) = tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf))
+        let (n, _) = tokio::time::timeout(Duration::from_millis(500), b.socket.recv_from(&mut buf))
             .await
             .expect("direct DATA probe must reach the candidate endpoint")
             .expect("candidate recv");
