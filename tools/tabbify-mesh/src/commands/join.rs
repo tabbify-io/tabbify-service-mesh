@@ -81,6 +81,13 @@ fn sanitize_join_token(token: &str) -> String {
 /// NOT a config field (the sink + gate are SEPARATE `join_with_commands` args),
 /// so it is consumed by the caller, not here.
 fn build_join_config(args: JoinArgs) -> JoinConfig {
+    // An EXPLICIT `--advertise-endpoint` literal is an operator override — we KEEP
+    // it (same-LAN peers can dial it for direct), but a private/unreachable value
+    // is broadcast to ALL peers and only same-LAN ones can use it, so warn loudly
+    // that off-LAN peers will fall back to relay.
+    if let Some(adv) = args.advertise_endpoint.as_deref() {
+        tabbify_mesh_joiner::net_reach::warn_if_private_advertise(adv);
+    }
     JoinConfig {
         coordinator_url: args.coordinator,
         display_name: args.name,

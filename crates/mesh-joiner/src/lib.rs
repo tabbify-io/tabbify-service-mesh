@@ -67,6 +67,7 @@ pub mod coordinator;
 pub mod error;
 pub mod joiner;
 pub mod nat;
+pub mod net_reach;
 pub mod peer;
 pub mod platform;
 pub mod relay;

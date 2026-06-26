@@ -84,3 +84,5 @@ async-trait = { workspace = true }
 # Generate throwaway self-signed certs in mTLS unit tests so we don't
 # need to ship PEM fixtures with the crate.
 rcgen      = "0.13"
+# Capture `tracing` events in-test to assert the private-advertise WARN fires.
+tracing-test = "0.2"

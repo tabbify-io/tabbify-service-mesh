@@ -214,10 +214,23 @@ impl Joiner {
             )
             .await
             {
-                Some(mapping) => {
-                    tracing::info!(%mapping, "joiner: STUN-discovered WG mapping (A-a)");
-                    config.advertise_endpoint = Some(mapping.to_string());
-                }
+                Some(mapping) => match crate::net_reach::stun_mapping_to_advertise(mapping) {
+                    Some(adv) => {
+                        tracing::info!(%mapping, "joiner: STUN-discovered WG mapping (A-a)");
+                        config.advertise_endpoint = Some(adv);
+                    }
+                    // A private/unreachable STUN mapping (double-NAT / hairpin
+                    // artefact) advertised to ALL peers would strand every off-LAN
+                    // peer on a black-hole. DROP it — keep the existing advertise
+                    // (reflexive / none); the relay floor carries the pair until a
+                    // real public mapping or a direct punch lands.
+                    None => {
+                        tracing::warn!(
+                            %mapping,
+                            "joiner: STUN mapping is private/unreachable for peers — DROPPING (relay floor remains)"
+                        );
+                    }
+                },
                 None => {
                     tracing::debug!(
                         "joiner: STUN discovery returned nothing, using reflexive/advertise"
