@@ -93,8 +93,13 @@ impl Coordinator {
         observed: Option<SocketAddr>,
     ) -> Result<(PeerEntry, RegisterOutcome), CoordinatorError> {
         // Authenticate FIRST, before touching the roster or allocator, so
-        // a rejected join has zero side effects.
-        let claims = self.authenticate(bearer).await?;
+        // a rejected join has zero side effects. The registering peer's
+        // base64 wg_public_key is forwarded to the auth service so it can
+        // merge that peer's user-assigned per-peer tags into the returned
+        // claims (P2-TAG-PLUMB). Purely additive: an empty key is treated as
+        // absent, preserving the prior validate behavior.
+        let pubkey_b64 = Some(req.wg_public_key.trim()).filter(|k| !k.is_empty());
+        let claims = self.authenticate(bearer, pubkey_b64).await?;
 
         let pubkey = decode_pubkey(&req.wg_public_key)?;
         if pubkey.len() != 32 {
@@ -219,6 +224,7 @@ impl Coordinator {
     async fn authenticate(
         &self,
         bearer: Option<&str>,
+        wg_public_key: Option<&str>,
     ) -> Result<Option<ValidatedClaims>, CoordinatorError> {
         // Escape hatch: no validator → no claims, trust the request later.
         let Some(validator) = self.inner.validator.as_ref() else {
@@ -233,7 +239,7 @@ impl Coordinator {
                 CoordinatorError::Unauthorized("missing join token (Authorization: Bearer)".into())
             })?;
 
-        match validator.validate(token).await {
+        match validator.validate(token, wg_public_key).await {
             // Token validated AND the auth service says it's live.
             Ok(claims) if claims.valid => Ok(Some(claims)),
             // Auth service reachable but token is expired / revoked /

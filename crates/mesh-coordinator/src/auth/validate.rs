@@ -2,7 +2,9 @@
 //!
 //! # Wire contract (mirrored from the auth service spec §5)
 //!
-//! Request body:  `{ "token": "<join-jwt>" }`
+//! Request body:  `{ "token": "<join-jwt>", "wg_public_key"?: "<b64>" }`
+//!                (`wg_public_key` is optional — present on register so the
+//!                 auth service can merge the peer's per-peer tags, §P2-TAG-PLUMB)
 //! Response body: `{ "valid": bool, "subject": str, "network": str,
 //!                   "tags": [str], "kind": str, "exp": i64 }`
 //!
@@ -67,9 +69,18 @@ pub enum ValidationError {
 }
 
 /// Body of `POST /v1/validate`.
+///
+/// `wg_public_key` is the registering peer's base64 X25519 key (P2-TAG-PLUMB).
+/// The auth service reads it as **optional**: when present it merges that
+/// peer's user-assigned per-peer tags into the returned claims; when absent
+/// (older coordinator, or no key at the call site) the auth service falls
+/// back to its prior behavior. Purely additive — `skip_serializing_if` keeps
+/// the wire shape `{ "token": ... }` when no key is supplied.
 #[derive(Debug, Serialize)]
 struct ValidateRequest<'a> {
     token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_public_key: Option<&'a str>,
 }
 
 /// Thin HTTP client for the auth service's validate endpoint.
@@ -113,14 +124,27 @@ impl AuthValidator {
     /// [`ValidationError::WrongKind`] so a user-auth token can never be
     /// used to join the mesh.
     ///
+    /// `wg_public_key` is the registering peer's base64 X25519 key. It is
+    /// forwarded to the auth service so it can merge that peer's
+    /// user-assigned per-peer tags into the returned claims (P2-TAG-PLUMB).
+    /// Pass `None` when no key is available at the call site — the auth
+    /// service then falls back to its pre-P2-TAG-PLUMB behavior.
+    ///
     /// # Errors
     /// See [`ValidationError`] — transport, non-2xx status, body decode, or
     /// wrong token kind.
-    pub async fn validate(&self, token: &str) -> Result<ValidatedClaims, ValidationError> {
+    pub async fn validate(
+        &self,
+        token: &str,
+        wg_public_key: Option<&str>,
+    ) -> Result<ValidatedClaims, ValidationError> {
         let resp = self
             .http
             .post(&self.validate_url)
-            .json(&ValidateRequest { token })
+            .json(&ValidateRequest {
+                token,
+                wg_public_key,
+            })
             .send()
             .await
             .map_err(|e| ValidationError::Transport(e.to_string()))?;
@@ -203,7 +227,7 @@ mod tests {
             .await;
 
         let validator = AuthValidator::new(server.uri()).unwrap();
-        let claims = validator.validate("good-join-jwt").await.unwrap();
+        let claims = validator.validate("good-join-jwt", None).await.unwrap();
         assert!(claims.valid);
         assert_eq!(claims.network, "alice");
         assert_eq!(
@@ -234,7 +258,7 @@ mod tests {
             .await;
 
         let validator = AuthValidator::new(server.uri()).unwrap();
-        let claims = validator.validate("revoked").await.unwrap();
+        let claims = validator.validate("revoked", None).await.unwrap();
         assert!(!claims.valid);
     }
 
@@ -250,7 +274,7 @@ mod tests {
             .await;
 
         let validator = AuthValidator::new(server.uri()).unwrap();
-        let err = validator.validate("x").await.unwrap_err();
+        let err = validator.validate("x", None).await.unwrap_err();
         match err {
             ValidationError::Status { status, body } => {
                 assert_eq!(status, 500);
@@ -272,7 +296,7 @@ mod tests {
             .await;
 
         let validator = AuthValidator::new(server.uri()).unwrap();
-        let err = validator.validate("x").await.unwrap_err();
+        let err = validator.validate("x", None).await.unwrap_err();
         assert!(matches!(err, ValidationError::Decode(_)), "{err:?}");
     }
 
@@ -295,7 +319,7 @@ mod tests {
             .await;
 
         let validator = AuthValidator::new(server.uri()).unwrap();
-        let err = validator.validate("user-token").await.unwrap_err();
+        let err = validator.validate("user-token", None).await.unwrap_err();
         assert!(
             matches!(err, ValidationError::WrongKind(ref k) if k == "auth"),
             "{err:?}"
@@ -307,7 +331,7 @@ mod tests {
     async fn validate_maps_transport_failure() {
         // Reserve a port then drop the listener so the connect refuses.
         let validator = AuthValidator::new("http://127.0.0.1:1").unwrap();
-        let err = validator.validate("x").await.unwrap_err();
+        let err = validator.validate("x", None).await.unwrap_err();
         assert!(matches!(err, ValidationError::Transport(_)), "{err:?}");
     }
 
@@ -315,5 +339,65 @@ mod tests {
     fn new_trims_trailing_slash_and_appends_path() {
         let v = AuthValidator::new("http://auth.example/").unwrap();
         assert_eq!(v.validate_url, "http://auth.example/v1/validate");
+    }
+
+    /// P2-TAG-PLUMB: the validate request body now carries the registering
+    /// peer's `wg_public_key` so the auth service can merge that peer's
+    /// user-assigned per-peer tags. Purely additive: when present it
+    /// serializes alongside `token`.
+    #[test]
+    fn validate_request_serializes_wg_public_key_when_present() {
+        let body = serde_json::to_value(ValidateRequest {
+            token: "good-join-jwt",
+            wg_public_key: Some("cGVlci1wdWJrZXk="),
+        })
+        .unwrap();
+        assert_eq!(body["token"], "good-join-jwt");
+        assert_eq!(body["wg_public_key"], "cGVlci1wdWJrZXk=");
+    }
+
+    /// Absent pubkey => the field is omitted entirely, preserving the old
+    /// `{ "token": ... }` wire shape (the auth side treats absence as the
+    /// pre-P2-TAG-PLUMB behavior).
+    #[test]
+    fn validate_request_omits_wg_public_key_when_absent() {
+        let body = serde_json::to_value(ValidateRequest {
+            token: "good-join-jwt",
+            wg_public_key: None,
+        })
+        .unwrap();
+        assert_eq!(body["token"], "good-join-jwt");
+        assert!(body.get("wg_public_key").is_none());
+    }
+
+    /// End-to-end over wiremock: a register-time validate that supplies a
+    /// pubkey sends both fields in the body.
+    #[tokio::test]
+    async fn validate_sends_wg_public_key_in_request_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/validate"))
+            .and(body_json(serde_json::json!({
+                "token": "good-join-jwt",
+                "wg_public_key": "cGVlci1wdWJrZXk=",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "valid": true,
+                "subject": "node-alice",
+                "network": "alice",
+                "tags": ["tag:user-alice"],
+                "kind": "join",
+                "exp": 1_900_000_000_i64,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let validator = AuthValidator::new(server.uri()).unwrap();
+        let claims = validator
+            .validate("good-join-jwt", Some("cGVlci1wdWJrZXk="))
+            .await
+            .unwrap();
+        assert!(claims.valid);
     }
 }
