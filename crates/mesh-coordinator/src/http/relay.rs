@@ -414,7 +414,7 @@ mod tests {
     }
 
     /// Stage-1 safety: with the proactive gate OFF (the default), a cold-dest
-    /// init produces NO RelayWake — a fresh coordinator deploy is byte-identical
+    /// init produces NO `RelayWake` — a fresh coordinator deploy is byte-identical
     /// to today and sends nothing new to not-yet-upgraded joiners. Convergence
     /// still works via the always-on joiner eager-kick; rendezvous is the
     /// accelerator that turns on WITH the gate.
