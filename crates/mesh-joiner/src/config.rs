@@ -202,6 +202,22 @@ pub struct JoinConfig {
     /// NOTE: this only ever affects the ADVERTISED endpoint; `relay_enabled`
     /// stays the floor, so a failed direct path always falls back to relay.
     pub stun_server: Option<SocketAddr>,
+    /// Routing metric every peer `/128` this joiner installs is given.
+    /// Defaults to [`crate::platform::DEFAULT_ROUTE_METRIC`] (1024 — the
+    /// kernel's own implicit default, so the PRIMARY/data-plane joiner's
+    /// routes are byte-for-byte unchanged).
+    ///
+    /// Raise it for a SECONDARY joiner that shares one network namespace
+    /// with the primary in `main`-table mode — the standalone crash-survival
+    /// LIFELINE. Both joiners install the same peer `/128`s; at an EQUAL
+    /// metric the kernel keeps only one per prefix (last-writer race) and the
+    /// secondary can steal the primary's route, sending that peer's return
+    /// traffic out the WRONG WG session → dropped. A WORSE (higher) metric
+    /// makes the two routes distinct, so the kernel always prefers the
+    /// lower-metric primary while its TUN is up and only falls back to the
+    /// secondary's routes when the primary is gone (a supervisord crash —
+    /// exactly the lifeline's purpose).
+    pub route_metric: u32,
 }
 
 impl Default for JoinConfig {
@@ -257,6 +273,12 @@ impl Default for JoinConfig {
             // behaviour. An operator opts in via `--mesh-stun-server` for a
             // symmetric-NAT-correct WG mapping. Relay stays the floor regardless.
             stun_server: None,
+            // Default route metric = the kernel's own implicit IPv6 default,
+            // so the primary joiner's `/128`s are byte-for-byte unchanged. A
+            // co-resident secondary (the lifeline) raises it via
+            // `--route-metric` so it loses the same-prefix route to the
+            // primary instead of racing the kernel's last-writer dedup.
+            route_metric: crate::platform::DEFAULT_ROUTE_METRIC,
         }
     }
 }
@@ -295,6 +317,14 @@ mod tests {
             !cfg.manage_firewall,
             "firewall self-management must default off"
         );
+        // The default metric must equal the kernel's implicit IPv6 default
+        // so the primary joiner's routes are byte-for-byte unchanged.
+        assert_eq!(
+            cfg.route_metric,
+            crate::platform::DEFAULT_ROUTE_METRIC,
+            "route metric must default to the kernel default (primary unchanged)"
+        );
+        assert_eq!(cfg.route_metric, 1024);
     }
 
     #[test]
@@ -326,6 +356,7 @@ mod tests {
             source_scoped_routes: true,
             manage_firewall: true,
             stun_server: Some("203.0.113.1:3478".parse().unwrap()),
+            route_metric: 4096,
         };
         let cloned = cfg.clone();
         assert_eq!(cloned.coordinator_url, cfg.coordinator_url);
@@ -351,6 +382,7 @@ mod tests {
         assert_eq!(cloned.source_scoped_routes, cfg.source_scoped_routes);
         assert_eq!(cloned.manage_firewall, cfg.manage_firewall);
         assert_eq!(cloned.stun_server, cfg.stun_server);
+        assert_eq!(cloned.route_metric, cfg.route_metric);
     }
 
     /// A-a: the optional STUN server (for symmetric-NAT-correct reflexive

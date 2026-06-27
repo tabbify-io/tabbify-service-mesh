@@ -47,8 +47,8 @@ pub mod route;
 // helpers back the multi-joiner-per-netns mode (`source_scoped_routes`);
 // [`firewall`] is the tailscaled-style TUN trust (`manage_firewall`).
 pub use route::{
-    SourceScope, TunRouteSink, add_peer_route, del_peer_route, install_source_rule,
-    remove_source_rule, stable_tun_name,
+    DEFAULT_ROUTE_METRIC, SourceScope, TunRouteSink, add_peer_route, del_peer_route,
+    install_source_rule, remove_source_rule, stable_tun_name,
 };
 
 /// The full overlay prefix covered by tabbify's coordinator.

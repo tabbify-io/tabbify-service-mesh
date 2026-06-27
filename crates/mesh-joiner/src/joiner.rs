@@ -347,10 +347,18 @@ impl Joiner {
             config.relay_only,
         );
 
-        let route_sink = Arc::new(source_scope.map_or_else(
-            || platform::TunRouteSink::new(iface_name.clone()),
-            |scope| platform::TunRouteSink::source_scoped(iface_name.clone(), scope),
-        ));
+        let route_sink = Arc::new(
+            source_scope
+                .map_or_else(
+                    || platform::TunRouteSink::new(iface_name.clone()),
+                    |scope| platform::TunRouteSink::source_scoped(iface_name.clone(), scope),
+                )
+                // Primary joiner keeps the default metric (config default
+                // 1024); a co-resident secondary (the lifeline) sets a worse
+                // metric via `--route-metric` so its routes lose to the
+                // primary's at the same prefix. See `JoinConfig::route_metric`.
+                .with_route_metric(config.route_metric),
+        );
         // Eager-relay-convergence: the kick queue. `upsert` (including the
         // initial-roster seed below) enqueues each genuinely-new, non-ephemeral
         // peer; `convergence_loop` drains it and fires one relay-floored kick so a
@@ -1166,6 +1174,7 @@ fn spawn_host_integration_loops(
         tasks.push(tokio::spawn(source_scope_reassert_loop(
             scope,
             iface_name.to_owned(),
+            config.route_metric,
             sessions.clone(),
             shutdown_tx.subscribe(),
         )));
@@ -1183,6 +1192,7 @@ fn spawn_host_integration_loops(
 async fn source_scope_reassert_loop(
     scope: platform::SourceScope,
     iface: String,
+    route_metric: u32,
     sessions: SessionTable,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -1198,9 +1208,13 @@ async fn source_scope_reassert_loop(
             _ = ticker.tick() => {
                 platform::route::reassert_source_rule(&scope).await;
                 for session in sessions.snapshot() {
-                    if let Err(e) =
-                        platform::route::add_peer_route_in_table(&iface, session.ula, scope.table)
-                            .await
+                    if let Err(e) = platform::route::add_peer_route_in_table(
+                        &iface,
+                        session.ula,
+                        scope.table,
+                        route_metric,
+                    )
+                    .await
                     {
                         tracing::debug!(error = %e, ula = %session.ula, "route: scoped re-assert failed");
                     }

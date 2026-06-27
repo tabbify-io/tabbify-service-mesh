@@ -206,6 +206,23 @@ pub struct JoinArgs {
     #[arg(long, env = "TABBIFY_MESH_MANAGE_FIREWALL")]
     pub manage_firewall: bool,
 
+    /// Routing metric every peer `/128` this joiner installs is given
+    /// (Linux). Defaults to the kernel's own implicit IPv6 default
+    /// (1024), so the PRIMARY/data-plane joiner's routes are byte-for-byte
+    /// unchanged.
+    ///
+    /// Raise it for a SECONDARY joiner that shares one network namespace
+    /// with the primary in `main`-table mode — the crash-survival LIFELINE
+    /// (e.g. `--route-metric 4096`). Both joiners install the same peer
+    /// `/128`s; at an EQUAL metric the kernel keeps only one per prefix
+    /// (last-writer race) and the secondary can steal the primary's route,
+    /// sending that peer's return traffic out the WRONG WG session →
+    /// dropped. A worse (higher) metric makes the two routes distinct, so
+    /// the kernel prefers the lower-metric primary while its TUN is up and
+    /// only falls back to the secondary's routes when the primary is gone.
+    #[arg(long, env = "TABBIFY_MESH_ROUTE_METRIC", default_value_t = tabbify_mesh_joiner::platform::DEFAULT_ROUTE_METRIC)]
+    pub route_metric: u32,
+
     /// Optional STUN server (`ip:port`) used to discover this node's
     /// `WireGuard` UDP mapping FROM the WG socket itself (Track A-a), correcting
     /// the symmetric-NAT port nuance the coordinator's TCP-observed reflexive
@@ -414,5 +431,35 @@ mod tests {
             args.relay_url.is_empty(),
             "omitted --relay-url must be an empty list (derive single)"
         );
+    }
+
+    /// Omitting `--route-metric` leaves it at the joiner's default (1024 — the
+    /// kernel's implicit IPv6 default), so a plain/primary join is byte-for-byte
+    /// unchanged.
+    #[test]
+    fn join_route_metric_defaults_to_kernel_default() {
+        let args = parse_join(&["join", "--coordinator", "http://u", "--name", "x"]);
+        assert_eq!(
+            args.route_metric,
+            tabbify_mesh_joiner::platform::DEFAULT_ROUTE_METRIC
+        );
+        assert_eq!(args.route_metric, 1024);
+    }
+
+    /// `--route-metric 4096` (the lifeline / secondary joiner) parses into
+    /// `JoinArgs::route_metric` so it can ride onto `JoinConfig` and install
+    /// the peer routes at the worse, lower-priority metric.
+    #[test]
+    fn join_parses_route_metric_override() {
+        let args = parse_join(&[
+            "join",
+            "--coordinator",
+            "http://u",
+            "--name",
+            "thinkpad-lifeline",
+            "--route-metric",
+            "4096",
+        ]);
+        assert_eq!(args.route_metric, 4096);
     }
 }

@@ -17,6 +17,25 @@ use crate::wg::session::RouteSink;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
+/// Default routing metric for a peer `/128` — the Linux kernel's OWN
+/// implicit default for an IPv6 route added with no `metric`.
+///
+/// Installing at this value EXPLICITLY is byte-for-byte equivalent to
+/// today's route, so the PRIMARY joiner (the one that owns the data plane)
+/// keeps exactly its current routes.
+///
+/// Why it exists as a knob: when TWO joiners share one network namespace
+/// in `main`-table mode (the supervisor's embedded joiner + the standalone
+/// crash-survival LIFELINE), each installs the SAME peer `/128`s. At an
+/// EQUAL metric the kernel keeps only one route per prefix (last-writer
+/// race), so the loser's tunnel can win a peer's route and that peer's
+/// return traffic egresses the WRONG WG session → dropped. Giving the
+/// SECONDARY joiner a WORSE (higher) metric makes the two routes distinct
+/// (distinct metric = distinct route, no dedup race) and the kernel always
+/// prefers the lower-metric PRIMARY while it is up; the secondary's routes
+/// only take effect as fallback when the primary's TUN disappears.
+pub const DEFAULT_ROUTE_METRIC: u32 = 1024;
+
 /// Source-scoped policy-routing parameters for ONE joiner instance
 /// (Linux).
 ///
@@ -274,20 +293,74 @@ fn tolerate_missing_route(e: JoinerError) -> Result<()> {
     Err(e)
 }
 
+/// Build the `ip -6 route <verb> <ula>/128 dev <iface> metric <N>
+/// [table <T>]` argument vector (everything AFTER the `ip` program name).
+///
+/// Pure + platform-independent so the EXACT argv is unit-testable on any
+/// host — the only Linux-gated thing is the `run_command("ip", …)`
+/// shell-out that consumes it. `metric` is ALWAYS emitted: the kernel's
+/// implicit default for an IPv6 route added with no metric is
+/// [`DEFAULT_ROUTE_METRIC`], so passing it explicitly at that value is
+/// byte-for-byte equivalent to today's route, while a secondary joiner can
+/// pass a WORSE metric so its `/128`s coexist with — and lose to — the
+/// primary's at the same prefix instead of racing the kernel's
+/// last-writer dedup. `table` appends `table <T>` for source-scoped mode.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn ip_route_args(
+    verb: &str,
+    peer_ula: Ipv6Addr,
+    iface: &str,
+    metric: u32,
+    table: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec![
+        "-6".to_owned(),
+        "route".to_owned(),
+        verb.to_owned(),
+        format!("{peer_ula}/128"),
+        "dev".to_owned(),
+        iface.to_owned(),
+        "metric".to_owned(),
+        metric.to_string(),
+    ];
+    if let Some(t) = table {
+        args.push("table".to_owned());
+        args.push(t.to_string());
+    }
+    args
+}
+
+/// Run `ip` with the given owned-string argv (the output of
+/// [`ip_route_args`]). Thin adapter so the Linux route paths can pass the
+/// builder's `Vec<String>` straight into the `&[&str]` shell-out.
+#[cfg(target_os = "linux")]
+async fn run_ip(args: &[String]) -> Result<()> {
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_command("ip", &argv).await
+}
+
 /// Install a per-peer `/128` host route for `peer_ula` via `iface`
-/// (spec §5.5 — TX route scoping).
+/// (spec §5.5 — TX route scoping), at routing `metric`.
 ///
 /// Idempotent: a duplicate add (route already present from a prior
-/// session) is treated as success by [`super::run_command`]'s
-/// `File exists` tolerance.
+/// session, SAME dev + SAME metric) is treated as success by
+/// [`super::run_command`]'s `File exists` tolerance. A SECOND joiner's
+/// route for the same prefix at a DIFFERENT metric is a DISTINCT route, so
+/// the `add` succeeds and both coexist (the kernel prefers the lower
+/// metric) — the route-priority fallback that keeps a co-resident lifeline
+/// joiner from stealing the primary's routes.
 ///
 /// # Errors
 ///
 /// Returns [`JoinerError::TunSetup`] on any non-idempotent failure
 /// (missing privileges, bad interface, etc.).
-pub async fn add_peer_route(iface: &str, peer_ula: Ipv6Addr) -> Result<()> {
+pub async fn add_peer_route(iface: &str, peer_ula: Ipv6Addr, metric: u32) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
+        // macOS `route(8)` has no Linux-style per-route metric and the dev
+        // box is never a co-resident lifeline host, so the metric is a
+        // no-op here — the command stays byte-for-byte unchanged.
+        let _ = metric;
         run_command(
             "route",
             &[
@@ -304,29 +377,23 @@ pub async fn add_peer_route(iface: &str, peer_ula: Ipv6Addr) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        run_command(
-            "ip",
-            &[
-                "-6",
-                "route",
-                "add",
-                &format!("{peer_ula}/128"),
-                "dev",
-                iface,
-            ],
-        )
-        .await
+        run_ip(&ip_route_args("add", peer_ula, iface, metric, None)).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (iface, peer_ula);
+        let _ = (iface, peer_ula, metric);
         Err(JoinerError::TunSetup(
             "unsupported platform — only macOS and Linux are wired".into(),
         ))
     }
 }
 
-/// Remove the per-peer `/128` host route for `peer_ula` from `iface`.
+/// Remove the per-peer `/128` host route for `peer_ula` from `iface` at
+/// routing `metric`.
+///
+/// The metric is part of the route key on Linux, so the delete targets the
+/// EXACT route this joiner installed — never a co-resident joiner's
+/// same-prefix route at a different metric.
 ///
 /// Idempotent: removing an absent route ("not in table" / "no such
 /// process") is treated as success.
@@ -334,9 +401,10 @@ pub async fn add_peer_route(iface: &str, peer_ula: Ipv6Addr) -> Result<()> {
 /// # Errors
 ///
 /// Returns [`JoinerError::TunSetup`] on any other failure.
-pub async fn del_peer_route(iface: &str, peer_ula: Ipv6Addr) -> Result<()> {
+pub async fn del_peer_route(iface: &str, peer_ula: Ipv6Addr, metric: u32) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
+        let _ = metric;
         run_command(
             "route",
             &[
@@ -362,31 +430,21 @@ pub async fn del_peer_route(iface: &str, peer_ula: Ipv6Addr) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        run_command(
-            "ip",
-            &[
-                "-6",
-                "route",
-                "del",
-                &format!("{peer_ula}/128"),
-                "dev",
-                iface,
-            ],
-        )
-        .await
-        .or_else(|e| {
-            if let JoinerError::TunSetup(ref msg) = e {
-                let lower = msg.to_lowercase();
-                if lower.contains("no such process") || lower.contains("not found") {
-                    return Ok(());
+        run_ip(&ip_route_args("del", peer_ula, iface, metric, None))
+            .await
+            .or_else(|e| {
+                if let JoinerError::TunSetup(ref msg) = e {
+                    let lower = msg.to_lowercase();
+                    if lower.contains("no such process") || lower.contains("not found") {
+                        return Ok(());
+                    }
                 }
-            }
-            Err(e)
-        })
+                Err(e)
+            })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (iface, peer_ula);
+        let _ = (iface, peer_ula, metric);
         Err(JoinerError::TunSetup(
             "unsupported platform — only macOS and Linux are wired".into(),
         ))
@@ -404,31 +462,36 @@ pub async fn del_peer_route(iface: &str, peer_ula: Ipv6Addr) -> Result<()> {
 /// Non-Linux: falls back to the plain main-table [`add_peer_route`]
 /// (macOS `route(8)` has no policy-routing tables).
 ///
+/// The route lands at `metric` like the `main`-table path. `replace` is
+/// safe here precisely because the table is PRIVATE to this joiner (derived
+/// from its own ULA): there is no co-tenant collision, so there is no
+/// last-writer race to lose — `replace` just keeps the single entry
+/// idempotently self-repaired across restarts.
+///
 /// # Errors
 ///
 /// Returns [`JoinerError::TunSetup`] on any non-idempotent failure.
-pub async fn add_peer_route_in_table(iface: &str, peer_ula: Ipv6Addr, table: u32) -> Result<()> {
+pub async fn add_peer_route_in_table(
+    iface: &str,
+    peer_ula: Ipv6Addr,
+    table: u32,
+    metric: u32,
+) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        run_command(
-            "ip",
-            &[
-                "-6",
-                "route",
-                "replace",
-                &format!("{peer_ula}/128"),
-                "dev",
-                iface,
-                "table",
-                &table.to_string(),
-            ],
-        )
+        run_ip(&ip_route_args(
+            "replace",
+            peer_ula,
+            iface,
+            metric,
+            Some(table),
+        ))
         .await
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = table;
-        add_peer_route(iface, peer_ula).await
+        add_peer_route(iface, peer_ula, metric).await
     }
 }
 
@@ -436,34 +499,28 @@ pub async fn add_peer_route_in_table(iface: &str, peer_ula: Ipv6Addr, table: u32
 /// `table`.
 ///
 /// Idempotent (absent route is success). Non-Linux falls back to the
-/// plain [`del_peer_route`].
+/// plain [`del_peer_route`]. The `metric` matches the install so the
+/// delete targets the exact route in the private table.
 ///
 /// # Errors
 ///
 /// Returns [`JoinerError::TunSetup`] on any other failure.
-pub async fn del_peer_route_in_table(iface: &str, peer_ula: Ipv6Addr, table: u32) -> Result<()> {
+pub async fn del_peer_route_in_table(
+    iface: &str,
+    peer_ula: Ipv6Addr,
+    table: u32,
+    metric: u32,
+) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        run_command(
-            "ip",
-            &[
-                "-6",
-                "route",
-                "del",
-                &format!("{peer_ula}/128"),
-                "dev",
-                iface,
-                "table",
-                &table.to_string(),
-            ],
-        )
-        .await
-        .or_else(tolerate_missing_route)
+        run_ip(&ip_route_args("del", peer_ula, iface, metric, Some(table)))
+            .await
+            .or_else(tolerate_missing_route)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = table;
-        del_peer_route(iface, peer_ula).await
+        del_peer_route(iface, peer_ula, metric).await
     }
 }
 
@@ -488,16 +545,24 @@ pub struct TunRouteSink {
     /// `Some` = source-scoped mode (Linux): peer `/128`s land in the
     /// scope's private table. `None` = plain `main`-table routes.
     scope: Option<SourceScope>,
+    /// Routing metric every peer `/128` is installed at. Defaults to
+    /// [`DEFAULT_ROUTE_METRIC`] (the primary / data-plane joiner). A
+    /// SECONDARY joiner sharing the netns (the crash-survival lifeline)
+    /// raises it via [`Self::with_route_metric`] so its routes lose to the
+    /// primary's at the same prefix instead of racing the kernel's
+    /// last-writer dedup.
+    route_metric: u32,
 }
 
 impl TunRouteSink {
     /// Build a plain (main-table) sink for the given overlay TUN
-    /// interface name.
+    /// interface name, at the default route metric.
     #[must_use]
     pub fn new(iface: impl Into<String>) -> Self {
         Self {
             iface: Arc::from(iface.into()),
             scope: None,
+            route_metric: DEFAULT_ROUTE_METRIC,
         }
     }
 
@@ -510,7 +575,18 @@ impl TunRouteSink {
         Self {
             iface: Arc::from(iface.into()),
             scope: Some(scope),
+            route_metric: DEFAULT_ROUTE_METRIC,
         }
+    }
+
+    /// Set the routing metric peer `/128`s are installed at (default
+    /// [`DEFAULT_ROUTE_METRIC`]). A co-resident SECONDARY joiner sets a
+    /// WORSE (higher) metric so its routes only win as fallback when the
+    /// primary's TUN is gone.
+    #[must_use]
+    pub const fn with_route_metric(mut self, metric: u32) -> Self {
+        self.route_metric = metric;
+        self
     }
 }
 
@@ -524,15 +600,16 @@ impl RouteSink for TunRouteSink {
     fn add_allowed(&self, ula: Ipv6Addr) {
         let iface = self.iface.clone();
         let scope = self.scope;
+        let metric = self.route_metric;
         tokio::spawn(async move {
             let res = match scope {
-                Some(s) => add_peer_route_in_table(&iface, ula, s.table).await,
-                None => add_peer_route(&iface, ula).await,
+                Some(s) => add_peer_route_in_table(&iface, ula, s.table, metric).await,
+                None => add_peer_route(&iface, ula, metric).await,
             };
             if let Err(e) = res {
                 tracing::warn!(error = %e, %ula, iface = %iface, "route: add /128 failed");
             } else {
-                tracing::debug!(%ula, iface = %iface, table = ?scope.map(|s| s.table), "route: installed peer /128");
+                tracing::debug!(%ula, iface = %iface, metric, table = ?scope.map(|s| s.table), "route: installed peer /128");
             }
         });
     }
@@ -540,15 +617,16 @@ impl RouteSink for TunRouteSink {
     fn remove_allowed(&self, ula: Ipv6Addr) {
         let iface = self.iface.clone();
         let scope = self.scope;
+        let metric = self.route_metric;
         tokio::spawn(async move {
             let res = match scope {
-                Some(s) => del_peer_route_in_table(&iface, ula, s.table).await,
-                None => del_peer_route(&iface, ula).await,
+                Some(s) => del_peer_route_in_table(&iface, ula, s.table, metric).await,
+                None => del_peer_route(&iface, ula, metric).await,
             };
             if let Err(e) = res {
                 tracing::warn!(error = %e, %ula, iface = %iface, "route: del /128 failed");
             } else {
-                tracing::debug!(%ula, iface = %iface, table = ?scope.map(|s| s.table), "route: removed peer /128");
+                tracing::debug!(%ula, iface = %iface, metric, table = ?scope.map(|s| s.table), "route: removed peer /128");
             }
         });
     }
@@ -565,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_route_surfaces_typed_error_on_bogus_iface() {
         let ula: Ipv6Addr = "fd5a:1f00:1::1".parse().unwrap();
-        match add_peer_route("tabbify-no-such-iface-xyzzy", ula).await {
+        match add_peer_route("tabbify-no-such-iface-xyzzy", ula, DEFAULT_ROUTE_METRIC).await {
             Err(JoinerError::TunSetup(_)) => {}
             Err(other) => panic!("expected TunSetup, got {other:?}"),
             Ok(()) => panic!("unexpectedly succeeded against bogus iface"),
@@ -578,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn del_peer_route_is_idempotent_or_typed_on_bogus_iface() {
         let ula: Ipv6Addr = "fd5a:1f00:1::1".parse().unwrap();
-        match del_peer_route("tabbify-no-such-iface-xyzzy", ula).await {
+        match del_peer_route("tabbify-no-such-iface-xyzzy", ula, DEFAULT_ROUTE_METRIC).await {
             Ok(()) | Err(JoinerError::TunSetup(_)) => {}
             Err(other) => panic!("expected TunSetup, got {other:?}"),
         }
@@ -593,6 +671,95 @@ mod tests {
         let _ = TunRouteSink::new(String::from("tabbify-mesh0"));
         let scope = SourceScope::for_ula("fd5a:1f02:5786:b2d4:bd64::1".parse().unwrap());
         let _ = TunRouteSink::source_scoped("tun1", scope);
+        // The builder overrides the metric without disturbing iface/scope.
+        let sink = TunRouteSink::new("utun7").with_route_metric(4096);
+        assert_eq!(sink.route_metric, 4096);
+        // The plain + scoped constructors default to the primary metric.
+        assert_eq!(
+            TunRouteSink::new("utun7").route_metric,
+            DEFAULT_ROUTE_METRIC
+        );
+        assert_eq!(
+            TunRouteSink::source_scoped("tun1", scope).route_metric,
+            DEFAULT_ROUTE_METRIC
+        );
+    }
+
+    /// DEFAULT-PATH (primary joiner): the main-table `add` argv carries the
+    /// route VERB `add` (NOT `replace`, so a co-resident secondary's
+    /// same-prefix route at another metric does not clobber it) and the
+    /// metric defaults to 1024 — byte-for-byte today's route.
+    #[test]
+    fn ip_route_args_default_main_table_add_is_metric_1024() {
+        let ula: Ipv6Addr = "fd5a:1f00:4ed8:1::1".parse().unwrap();
+        let args = ip_route_args("add", ula, "tun0", DEFAULT_ROUTE_METRIC, None);
+        assert_eq!(
+            args,
+            vec![
+                "-6",
+                "route",
+                "add",
+                "fd5a:1f00:4ed8:1::1/128",
+                "dev",
+                "tun0",
+                "metric",
+                "1024",
+            ]
+        );
+        assert_eq!(DEFAULT_ROUTE_METRIC, 1024, "primary metric must stay 1024");
+        // No `replace` on the main path — that would lose the coexistence race.
+        assert!(!args.iter().any(|a| a == "replace"));
+        // No `table` token on the main-table path.
+        assert!(!args.iter().any(|a| a == "table"));
+    }
+
+    /// OVERRIDE (secondary / lifeline joiner): `--route-metric 4096` rides
+    /// through to a WORSE metric in the same argv, so the route coexists
+    /// with — and loses to — the primary's 1024 route at the same prefix.
+    #[test]
+    fn ip_route_args_override_metric_rides_through() {
+        let ula: Ipv6Addr = "fd5a:1f00:4ed8:1::1".parse().unwrap();
+        let primary = ip_route_args("add", ula, "tun-primary", 1024, None);
+        let secondary = ip_route_args("add", ula, "tun-lifeline", 4096, None);
+        // Same prefix, DIFFERENT metric ⇒ two distinct kernel routes.
+        assert!(secondary.windows(2).any(|w| w == ["metric", "4096"]));
+        assert_ne!(primary, secondary);
+        // The prefix is identical; only dev + metric differ — exactly the
+        // pair that coexists with deterministic lower-metric preference.
+        assert_eq!(primary[3], secondary[3], "same /128 prefix");
+    }
+
+    /// Source-scoped mode appends `table <T>` and uses `replace` (safe in a
+    /// private per-ULA table — no co-tenant race), still honoring the metric.
+    #[test]
+    fn ip_route_args_scoped_replace_appends_table() {
+        let ula: Ipv6Addr = "fd5a:1f02:5786:b2d4:bd64::1".parse().unwrap();
+        let args = ip_route_args("replace", ula, "tun1", DEFAULT_ROUTE_METRIC, Some(5786));
+        assert_eq!(
+            args,
+            vec![
+                "-6",
+                "route",
+                "replace",
+                "fd5a:1f02:5786:b2d4:bd64::1/128",
+                "dev",
+                "tun1",
+                "metric",
+                "1024",
+                "table",
+                "5786",
+            ]
+        );
+    }
+
+    /// The delete argv mirrors the install (same metric in the route key),
+    /// so a teardown targets the exact route this joiner added.
+    #[test]
+    fn ip_route_args_del_mirrors_metric() {
+        let ula: Ipv6Addr = "fd5a:1f00:4ed8:1::1".parse().unwrap();
+        let args = ip_route_args("del", ula, "tun-lifeline", 4096, None);
+        assert_eq!(args[2], "del");
+        assert!(args.windows(2).any(|w| w == ["metric", "4096"]));
     }
 
     /// The derived scope is deterministic: the SAME ULA must yield the

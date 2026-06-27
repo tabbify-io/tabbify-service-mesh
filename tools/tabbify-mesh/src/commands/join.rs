@@ -127,6 +127,10 @@ fn build_join_config(args: JoinArgs) -> JoinConfig {
         // tailscaled-style firewall trust). Off by default.
         source_scoped_routes: args.source_scoped_routes,
         manage_firewall: args.manage_firewall,
+        // Route metric for this joiner's peer `/128`s. Default (1024) keeps
+        // the primary unchanged; the lifeline passes `--route-metric 4096` so
+        // its routes lose to the primary's at the same prefix (no dedup race).
+        route_metric: args.route_metric,
         // Track A-a: optional STUN server for a symmetric-NAT-correct WG
         // mapping. Unset (default) keeps coordinator-reflexive advertise.
         stun_server: args.mesh_stun_server,
