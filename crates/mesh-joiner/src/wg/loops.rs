@@ -757,9 +757,11 @@ pub(crate) async fn timer_loop(
                 // IDLE_PROBE_AFTER_MICROS) emit ONE real DATA frame so the peer's
                 // symmetric probe answers with DATA that keeps our reboot clock
                 // fresh — an idle-but-HEALTHY tunnel stays GREEN while a genuinely
-                // dead one still ages out. Rate-limited with an ESCALATING
-                // back-off (reset on real RX) so a chronic black hole is not
-                // hammered (no busy-loop — task #13).
+                // dead one still ages out. Rate-limited to a FIXED cadence (one
+                // DATA probe per IDLE_PROBE_AFTER_MICROS, independent of
+                // send-state) so a healthy idle pair keeps refreshing each other
+                // under the 90s threshold and a dropped probe self-heals next
+                // window — no busy-loop, no latch.
                 maybe_idle_probe(&socket, &sessions, my_ula, now).await;
             }
         }
@@ -790,15 +792,13 @@ pub(crate) async fn timer_loop(
 /// handshake converge). Routed through [`send_wire`], which preserves the relay
 /// floor for a `relay_only` node, rides a rate-limited direct probe for a
 /// direct-capable one, and stamps the DATA-send clock (`send_wire` skips only
-/// bare keepalives). Rate-limited + escalating-back-off via
-/// [`SessionTable::should_emit_idle_probe`]; real RX resets the streak.
+/// bare keepalives). Rate-limited to a FIXED per-window cadence via
+/// [`SessionTable::should_emit_idle_probe`] (no escalation, no send-state latch):
+/// a healthy idle pair keeps refreshing each other's reboot clock under the
+/// threshold, a dropped probe self-heals on the next window, and a dead peer is
+/// re-probed every window yet still reads UNHEALTHY.
 async fn maybe_idle_probe(socket: &UdpSocket, sessions: &SessionTable, my_ula: Ipv6Addr, now: i64) {
-    if !sessions.should_emit_idle_probe(
-        now,
-        crate::wg::session::IDLE_PROBE_AFTER_MICROS,
-        crate::wg::session::IDLE_PROBE_INTERVAL_BASE_MICROS,
-        crate::wg::session::IDLE_PROBE_INTERVAL_CAP_MICROS,
-    ) {
+    if !sessions.should_emit_idle_probe(now, crate::wg::session::IDLE_PROBE_AFTER_MICROS) {
         return;
     }
     let Some(session) = sessions.idle_probe_target() else {

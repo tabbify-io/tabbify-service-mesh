@@ -76,27 +76,23 @@ pub struct SessionTable {
     /// has NOT tried to send since the last sample is idle and must never be
     /// judged a black hole (no TX ⇒ no expectation of RX). `0` = "never sent".
     last_send_attempt_ts: Arc<AtomicI64>,
-    /// Unix-micros of the LAST active IDLE LIVENESS PROBE the timer loop fired
-    /// (B-fix-1). Rate-limits that probe so an ambiguously-idle node emits ONE
-    /// keepalive-sized frame per (escalating) interval (advancing
-    /// `last_send_attempt_ts`) instead of a busy-loop. The probe's ONLY job is to
-    /// break the fail-open idle rule in `dataplane_healthy`: once it advances the
-    /// send clock past the RX clock, the UNCHANGED black-hole verdict can detect
-    /// a node whose data plane is wedged (no real RX in the 90s window) — the
-    /// 2026-06-21 MSI signature where a trickle of relay control frames masked a
-    /// black hole. `0` = "never probed". `Arc<AtomicI64>` like the other clocks
-    /// so the rate-limit is process-global across the cheap-clone table.
+    /// Unix-micros of the LAST active IDLE LIVENESS PROBE the timer loop fired.
+    /// Rate-limits that probe to a FIXED cadence — at most one DATA probe per
+    /// [`IDLE_PROBE_AFTER_MICROS`] — so an idle node emits ONE probe per tick
+    /// window instead of a 200ms busy-loop. The probe's job under the
+    /// `DeliverToTun`-only reboot gate is to keep ELICITING the peer's RX at a
+    /// cadence well under the 90s silence threshold: because EVERY node runs
+    /// this probe, each node RECEIVES the peer's probe (a real `DeliverToTun` that
+    /// refreshes THIS node's reboot clock) every ≤ `IDLE_PROBE_AFTER_MICROS`,
+    /// phase-independently, so a healthy-but-idle tunnel stays GREEN while a
+    /// genuinely dead one still ages out. `0` = "never probed". `Arc<AtomicI64>`
+    /// like the other clocks so the rate-limit is process-global across the
+    /// cheap-clone table. NOTE: unlike the old escalating back-off, the cadence
+    /// is FIXED and INDEPENDENT of send-state — a truly-dead peer being probed
+    /// every window is cheap and correct (it still reads UNHEALTHY because no
+    /// `DeliverToTun` returns), while a healthy pair must NEVER stop probing (a
+    /// dropped probe must self-heal on the very next window — no latch).
     last_idle_probe_ts: Arc<AtomicI64>,
-    /// Count of consecutive idle liveness probes emitted WITHOUT a real inbound
-    /// frame arriving since (B-fix-1 ESCALATING back-off — task #13). The probe
-    /// interval grows `min(BASE << streak, CAP)` so a chronically black-holed
-    /// peer (MSI's flaky WAN) is probed ever LESS often — a bounded retry
-    /// schedule, NOT a fixed-interval hammer. Reset to `0` the instant a real
-    /// inbound data frame lands ([`Self::note_inbound_data_frame`]): the moment
-    /// the path recovers, probing returns to the responsive BASE cadence.
-    /// `Arc<AtomicU32>` so the streak is process-global across the cheap-clone
-    /// table, like the liveness clocks.
-    idle_probe_streak: Arc<AtomicU32>,
     /// Optional sender to the convergence-kick queue (eager-relay-convergence).
     /// When `Some` (the joiner wires it via [`Self::with_convergence_tx`]), a
     /// genuinely-NEW, non-ephemeral session is enqueued on [`Self::upsert`] so a
@@ -107,49 +103,28 @@ pub struct SessionTable {
     convergence_tx: Option<UnboundedSender<Arc<PeerSession>>>,
 }
 
-/// How long a node may be AMBIGUOUSLY IDLE before the active idle liveness
-/// probe starts firing (B-fix-1).
+/// FIXED cadence of the active idle liveness probe.
 ///
-/// "Ambiguously idle" = peers present, no send since the last inbound, RX clock
-/// not fresh. 45s sits BELOW the 90s `DATAPLANE_RX_SILENCE_THRESHOLD_MICROS` so
-/// the probe has time to advance the send clock and let a genuine black hole
-/// age the RX clock out within one 90s window. Above the ~20s heartbeat /
-/// keepalive cadence so a normally quiet-but-live node (keepalives still
-/// round-tripping) never trips it.
-pub const IDLE_PROBE_AFTER_MICROS: i64 = 45_000_000;
-
-/// BASE spacing between consecutive active idle liveness probes (B-fix-1,
-/// escalating back-off — task #13).
+/// A node whose reboot RX clock has aged past this window emits ONE real
+/// inner-v6 DATA probe, then again every `IDLE_PROBE_AFTER_MICROS` for as long
+/// as it stays idle.
 ///
-/// The FIRST probe after the path goes silent fires at this cadence (30s):
-/// frequent enough that the send clock stays ahead of the RX clock across the
-/// 90s freshness window, so `dataplane_healthy` reliably flips unhealthy on a
-/// genuine black hole within the first window. Each subsequent un-answered probe
-/// doubles the wait ([`SessionTable::idle_probe_interval`]) up to
-/// [`IDLE_PROBE_INTERVAL_CAP_MICROS`] — a chronically dead peer is NOT hammered
-/// at a fixed 30s rate.
-pub const IDLE_PROBE_INTERVAL_BASE_MICROS: i64 = 30_000_000;
-
-/// CAP on the escalating idle-probe interval (B-fix-1 — task #13).
-///
-/// The doubling back-off saturates here (10 min) so a permanently black-holed
-/// peer still gets an occasional liveness probe (the path may recover) without
-/// ever returning to a tight loop. Once a real inbound frame lands the streak
-/// resets and the cadence drops straight back to
-/// [`IDLE_PROBE_INTERVAL_BASE_MICROS`].
-pub const IDLE_PROBE_INTERVAL_CAP_MICROS: i64 = 600_000_000;
-
-/// The escalating idle-probe interval for a consecutive-failure `streak`
-/// (B-fix-1 — task #13).
-///
-/// `min(BASE << streak, CAP)`: `streak == 0` (the first probe, or right after a
-/// real RX reset the counter) yields BASE; each subsequent un-answered probe
-/// doubles the wait up to CAP. Overflow-safe, pure + `const`; delegates to the
-/// shared [`escalating_backoff`].
-#[must_use]
-pub const fn idle_probe_interval(streak: u32, base_micros: i64, cap_micros: i64) -> i64 {
-    escalating_backoff(streak, base_micros, cap_micros)
-}
+/// Set to `DATAPLANE_RX_SILENCE_THRESHOLD_MICROS / 4` (22.5s for the 90s
+/// threshold). This is the load-bearing margin under the `DeliverToTun`-only reboot
+/// gate: the probe elicits NO reply (its inner packet is next-header 59, No-Next-
+/// Header — the peer's TUN drops it), so a node cannot refresh its OWN reboot RX
+/// clock; refresh comes ONLY from the PEER independently probing. Because EVERY
+/// node probes every ≤ this window, each node RECEIVES the peer's DATA probe
+/// (a real `DeliverToTun` that refreshes its reboot clock) every ≤ this window,
+/// phase-independently — with an anti-phase transient bounded by 2× this window
+/// (45s) which still sits comfortably under the 90s silence threshold (~2× worst-
+/// case, ~4× steady-state margin). At the OLD 45s (= threshold/2) the anti-phase
+/// peer-to-peer RX-refresh interval reached 2×45s = 90s + relay RTT — the 90s
+/// threshold with ZERO margin, so a perfectly healthy idle pair drifted into a
+/// spurious FLEET-WIDE reboot every ~90s. Kept above the ~20s keepalive cadence
+/// only incidentally; correctness now rests on the < threshold-with-margin bound,
+/// not on out-racing keepalives.
+pub const IDLE_PROBE_AFTER_MICROS: i64 = crate::joiner::DATAPLANE_RX_SILENCE_THRESHOLD_MICROS / 4;
 
 /// Shared overflow-safe exponential back-off: `min(base << streak, cap)`.
 ///
@@ -157,8 +132,7 @@ pub const fn idle_probe_interval(streak: u32, base_micros: i64, cap_micros: i64)
 /// of overflowing (`i64::checked_shl` guards only the shift COUNT, not the
 /// resulting VALUE — a wide shift silently yields garbage, so it is unsuitable
 /// here). Returns `cap` the instant the doubled value reaches or exceeds it.
-/// Used by both the idle-probe (task #13) and the expired-`Tunn` re-arm (task
-/// #14) loop-guards.
+/// Used by the expired-`Tunn` re-arm (task #14) loop-guard.
 #[must_use]
 pub const fn escalating_backoff(streak: u32, base_micros: i64, cap_micros: i64) -> i64 {
     let mut window = base_micros;
@@ -174,21 +148,26 @@ pub const fn escalating_backoff(streak: u32, base_micros: i64, cap_micros: i64) 
     if window < cap_micros { window } else { cap_micros }
 }
 
-/// Pure trigger for the active idle liveness probe (B-fix-1). Returns `true`
-/// when the node is AMBIGUOUSLY IDLE and should emit ONE keepalive frame to
-/// keep the data-plane liveness signal honest:
+/// Pure trigger for the active idle liveness probe.
+///
+/// Returns `true` when there is a peer to probe AND the reboot RX clock has aged
+/// past `after_micros`, so the node must emit ONE real DATA probe to keep
+/// ELICITING the peer's RX:
 ///
 /// * **No peers** ⇒ `false` (nothing to probe toward — mirrors the
 ///   `dataplane_healthy` no-peers fail-open).
 /// * **Genuinely fresh RX** (`now - last_rx < after_micros`) ⇒ `false`. The
-///   data plane is demonstrably alive; no probe needed.
-/// * **Already sending after the last RX** (`last_send > last_rx`) ⇒ `false`.
-///   The node is NOT idle — `dataplane_healthy` already owns this case (it can
-///   see the stale RX while sending and flip unhealthy on its own).
-/// * **Ambiguously idle** (peers present AND `last_send <= last_rx` AND
-///   `now - last_rx >= after_micros`) ⇒ `true`. This is the exact fail-open
-///   blind spot: idle (so judged healthy) yet RX is no longer fresh. Emit a
-///   probe so the send clock advances and the black-hole verdict can act.
+///   data plane is demonstrably alive within this window; no probe needed.
+/// * **RX aged past the window** (`now - last_rx >= after_micros`) ⇒ `true`,
+///   REGARDLESS of send-state. This is deliberately INDEPENDENT of
+///   `last_send_attempt_ts`: the old `last_send <= last_rx` gate made a node
+///   STOP probing the instant it emitted a probe (which advances the send clock),
+///   so a single dropped-in-both-directions window LATCHED both ends — neither
+///   re-probed, RX froze, both aged out to a spurious reboot with no self-heal.
+///   A FIXED cadence that ignores send-state cannot latch: a healthy pair keeps
+///   refreshing each other every window; a dead peer is re-probed every window
+///   yet still reads UNHEALTHY (no `DeliverToTun` returns) so the reboot still
+///   fires on a real outage.
 ///
 /// Pure (`now` / clocks / threshold injected) and read-only, mirroring
 /// [`SessionTable::dataplane_healthy`]; the rate limit lives in
@@ -197,19 +176,14 @@ pub const fn escalating_backoff(streak: u32, base_micros: i64, cap_micros: i64) 
 pub const fn idle_probe_due(
     now_micros: i64,
     last_rx_micros: i64,
-    last_send_micros: i64,
     has_peers: bool,
     after_micros: i64,
 ) -> bool {
     if !has_peers {
         return false;
     }
-    // Not idle: a send already followed the last inbound — `dataplane_healthy`
-    // owns this case, no probe needed.
-    if last_send_micros > last_rx_micros {
-        return false;
-    }
-    // Idle: probe only once the RX clock has aged past the ambiguity window.
+    // Probe once the RX clock has aged past the window — send-state is
+    // intentionally IRRELEVANT (fixed cadence, no latch).
     now_micros.saturating_sub(last_rx_micros) >= after_micros
 }
 
@@ -254,10 +228,6 @@ impl std::fmt::Debug for SessionTable {
             .field(
                 "last_idle_probe_ts",
                 &self.last_idle_probe_ts.load(Ordering::Relaxed),
-            )
-            .field(
-                "idle_probe_streak",
-                &self.idle_probe_streak.load(Ordering::Relaxed),
             )
             .finish()
     }
@@ -348,12 +318,6 @@ impl SessionTable {
     /// staleness threshold.
     pub fn note_inbound_data_frame(&self, now_micros: i64) {
         store_max(&self.last_inbound_data_frame_ts, now_micros);
-        // A real inbound frame means the path is alive again — collapse the
-        // escalating idle-probe back-off so probing returns to BASE cadence the
-        // instant the black hole clears (B-fix-1 — task #13). Relaxed: a racing
-        // probe at worst reads a one-step-stale streak, which only shifts the
-        // next interval by one doubling — inert against the seconds-scale gate.
-        self.idle_probe_streak.store(0, Ordering::Relaxed);
     }
 
     /// Stamp `now_micros` as the time of the last `send_wire` attempt
@@ -417,64 +381,44 @@ impl SessionTable {
         self.last_idle_probe_ts.load(Ordering::Relaxed)
     }
 
-    /// Snapshot the consecutive un-answered idle-probe streak (B-fix-1 —
-    /// diagnostics + tests). Reset to `0` the instant a real inbound frame lands.
-    #[must_use]
-    pub fn idle_probe_streak(&self) -> u32 {
-        self.idle_probe_streak.load(Ordering::Relaxed)
-    }
-
     /// Decide whether the timer loop should fire ONE active idle liveness probe
-    /// THIS tick (B-fix-1), CLAIMING the rate-limit slot when it returns `true`.
+    /// THIS tick, CLAIMING the rate-limit slot when it returns `true`.
     ///
     /// Two gates compose:
-    /// 1. [`idle_probe_due`] — the pure ambiguous-idle trigger (peers present,
-    ///    idle, RX aged past `after_micros`).
-    /// 2. A per-table ESCALATING interval limiter (task #13): at most one probe
-    ///    per window, and the window GROWS with the consecutive un-answered
-    ///    streak — `min(base << streak, cap)` ([`idle_probe_interval`]). An
-    ///    ambiguously-idle node emits ONE keepalive at BASE cadence, then ever
-    ///    less often if no RX returns, so a chronically dead peer is never
-    ///    hammered at a fixed rate. The first ever probe fires immediately (clock
-    ///    starts at `0`, streak `0` ⇒ BASE window already elapsed); each emit
-    ///    bumps the streak so the NEXT window doubles. The slot is claimed by
-    ///    stamping `last_idle_probe_ts` + incrementing `idle_probe_streak`
-    ///    (relaxed, same rationale as the other liveness clocks — a racing
-    ///    double-read at worst emits one extra keepalive / mis-steps the back-off
-    ///    by one doubling, which WG anti-replay / the relay floor make harmless).
-    ///    [`Self::note_inbound_data_frame`] resets the streak to `0` on real RX.
+    /// 1. [`idle_probe_due`] — the pure trigger (peers present, RX aged past
+    ///    `after_micros`), INDEPENDENT of send-state (no latch — CRIT-2 fix).
+    /// 2. A per-table FIXED-cadence limiter: at most one probe per
+    ///    `after_micros`. An idle node emits ONE DATA probe per window and keeps
+    ///    doing so at that fixed cadence for as long as it stays idle — the
+    ///    probe must keep ELICITING the peer's RX (each end refreshes the OTHER's
+    ///    reboot clock), so the cadence must NOT escalate away from the < 90s
+    ///    threshold. A truly-dead peer probed every window is cheap and stays
+    ///    UNHEALTHY (no `DeliverToTun` returns); a healthy pair NEVER stops probing
+    ///    so a dropped probe self-heals on the very next window. The first ever
+    ///    probe fires immediately (clock starts at `0` ⇒ the window has elapsed).
+    ///    The slot is claimed by stamping `last_idle_probe_ts` (relaxed, same
+    ///    rationale as the other liveness clocks — a racing double-read at worst
+    ///    emits one extra DATA probe, which WG anti-replay / the relay floor make
+    ///    harmless).
     ///
     /// Read-then-claim is intentional: the caller emits the probe only when this
     /// returns `true`, so claiming here keeps the side effect bounded to one
-    /// frame per (escalating) interval regardless of the 200ms timer cadence.
-    pub fn should_emit_idle_probe(
-        &self,
-        now_micros: i64,
-        after_micros: i64,
-        base_interval_micros: i64,
-        cap_interval_micros: i64,
-    ) -> bool {
+    /// frame per `after_micros` regardless of the 200ms timer cadence.
+    pub fn should_emit_idle_probe(&self, now_micros: i64, after_micros: i64) -> bool {
         if !idle_probe_due(
             now_micros,
             self.last_inbound_data_frame_ts(),
-            self.last_send_attempt_ts(),
             !self.is_empty(),
             after_micros,
         ) {
             return false;
         }
-        // Escalating rate-limit: the required spacing grows with the un-answered
-        // streak, so claim the slot iff that (doubling, capped) window elapsed.
-        let streak = self.idle_probe_streak.load(Ordering::Relaxed);
-        let interval = idle_probe_interval(streak, base_interval_micros, cap_interval_micros);
+        // Fixed-cadence rate-limit: claim the slot iff a full `after_micros`
+        // window has elapsed since the last probe — one DATA probe per window,
+        // never a 200ms busy-loop, never an escalating back-off.
         let last = self.last_idle_probe_ts.load(Ordering::Relaxed);
-        if now_micros.saturating_sub(last) >= interval {
+        if now_micros.saturating_sub(last) >= after_micros {
             self.last_idle_probe_ts.store(now_micros, Ordering::Relaxed);
-            // Bump the streak so the NEXT un-answered window doubles. Saturating
-            // so a pathological run can never wrap (the interval is capped
-            // anyway). A real inbound frame resets this to 0.
-            let next = streak.saturating_add(1);
-            self.idle_probe_streak.store(next, Ordering::Relaxed);
             true
         } else {
             false
@@ -1161,77 +1105,88 @@ mod liveness_tests {
         assert!(t.dataplane_healthy(100_000_000 + TH / 2, TH));
     }
 
-    // ---- B-fix-1: active idle liveness probe trigger ----
+    // ---- active idle liveness probe: FIXED-cadence trigger ----
 
-    /// Probe-after threshold for the pure-trigger tests (45s, mirrors
-    /// [`IDLE_PROBE_AFTER_MICROS`]).
+    /// Probe-after window for the pure-trigger tests (mirrors
+    /// [`IDLE_PROBE_AFTER_MICROS`] = threshold/4 = 22.5s).
     const AFTER: i64 = IDLE_PROBE_AFTER_MICROS;
 
-    /// BASE / CAP idle-probe intervals for the escalating-back-off tests (task
-    /// #13). Mirror the production constants.
-    const BASE: i64 = IDLE_PROBE_INTERVAL_BASE_MICROS;
-    const CAP: i64 = IDLE_PROBE_INTERVAL_CAP_MICROS;
-
-    /// THE ambiguous-idle case the probe exists for: peers present, NO send
-    /// since the last inbound (idle ⇒ `dataplane_healthy` would fail-OPEN), and
-    /// the RX clock aged PAST the probe-after window. `idle_probe_due` ⇒ true.
-    /// This is the exact 2026-06-21 blind spot — a trickle of relay frames kept
-    /// RX < 90s while no data round-tripped, so the node read healthy forever.
+    /// The load-bearing MARGIN invariant (CRIT-1): the anti-phase peer-to-peer
+    /// RX-refresh interval is bounded by 2×AFTER (each node probes every AFTER,
+    /// so each RECEIVES the peer's probe every ≤AFTER, worst-case transient
+    /// 2×AFTER). That bound MUST stay strictly under the 90s silence threshold —
+    /// with margin — or a perfectly healthy idle pair spuriously reboots. At the
+    /// old AFTER=45s (threshold/2) the bound was exactly the threshold (ZERO
+    /// margin). threshold/4 gives ~4× steady / ~2× worst-case headroom.
     #[test]
-    fn idle_probe_due_when_ambiguously_idle_and_rx_aged() {
-        // last_rx at 10s, no later send (last_send <= last_rx), now well past
-        // the 45s ambiguity window.
+    #[allow(clippy::assertions_on_constants)]
+    fn idle_probe_cadence_has_margin_under_threshold() {
+        assert!(
+            2 * AFTER < TH,
+            "anti-phase RX-refresh bound 2×AFTER={} must stay under threshold {TH} (margin)",
+            2 * AFTER
+        );
+        assert!(
+            AFTER <= TH / 4,
+            "cadence AFTER={AFTER} must be ≤ threshold/4 for ≥4× steady-state margin"
+        );
+    }
+
+    /// THE trigger case: peers present and the RX clock aged PAST the window ⇒
+    /// `idle_probe_due` true. This is the 2026-06-21 blind spot — a trickle of
+    /// relay control frames kept RX < threshold while no DATA round-tripped, so
+    /// the node read healthy forever; the probe elicits real DATA to expose it.
+    #[test]
+    fn idle_probe_due_when_rx_aged() {
         assert!(idle_probe_due(
             10_000_000 + AFTER + 1,
             10_000_000, // last_rx
-            10_000_000, // last_send == last_rx ⇒ idle
             true,       // peers present
             AFTER,
         ));
     }
 
+    /// CRIT-2: the trigger is INDEPENDENT of send-state. A probe advances the
+    /// node's own DATA-send clock, but the node MUST keep probing at the fixed
+    /// cadence anyway — otherwise a single window where both ends drop each
+    /// other's probe latches both (`last_send` > `last_rx`) and neither re-probes,
+    /// freezing RX into a spurious reboot. The old `last_send <= last_rx` gate is
+    /// gone: due depends ONLY on RX age.
+    #[test]
+    fn idle_probe_due_even_when_already_sending() {
+        // last_send way after last_rx (a probe just went out) — still due, so the
+        // node re-probes and cannot latch.
+        assert!(
+            idle_probe_due(10_000_000 + AFTER + 1, 10_000_000, true, AFTER),
+            "RX aged past the window ⇒ due regardless of send-state (no latch)"
+        );
+    }
+
     /// RX returns FRESH (`now - last_rx < after`) ⇒ NO probe. The data plane is
-    /// demonstrably alive, so the idle probe must not fire — this is the
-    /// "+RX-returns ⇒ healthy" direction (the probe stops once real RX resumes).
+    /// demonstrably alive within this window (the "+RX-returns ⇒ no probe"
+    /// direction — probing stops once real RX resumes).
     #[test]
     fn idle_probe_not_due_when_rx_fresh() {
         assert!(!idle_probe_due(
             10_000_000 + AFTER / 2, // RX age < after ⇒ fresh
             10_000_000,
-            10_000_000,
             true,
             AFTER,
         ));
     }
 
-    /// Genuinely-fresh RX at the very edge (RX age just under the window) ⇒ no
-    /// probe; the same clocks one tick later (RX age == window) ⇒ probe due.
-    /// Pins the boundary so the 45s threshold is exact.
+    /// Boundary: RX age one micro under the window ⇒ not due; exactly at the
+    /// window ⇒ due. Pins the cadence threshold exact.
     #[test]
     fn idle_probe_boundary_is_exact() {
         assert!(
-            !idle_probe_due(10_000_000 + AFTER - 1, 10_000_000, 10_000_000, true, AFTER),
+            !idle_probe_due(10_000_000 + AFTER - 1, 10_000_000, true, AFTER),
             "one micro under the window is still fresh ⇒ no probe"
         );
         assert!(
-            idle_probe_due(10_000_000 + AFTER, 10_000_000, 10_000_000, true, AFTER),
+            idle_probe_due(10_000_000 + AFTER, 10_000_000, true, AFTER),
             "exactly at the window the probe is due"
         );
-    }
-
-    /// NOT idle — a send already followed the last inbound (`last_send >
-    /// last_rx`) ⇒ NO probe. `dataplane_healthy` already owns this case (it can
-    /// see the stale RX while sending and flip unhealthy itself), so the probe
-    /// must not double up.
-    #[test]
-    fn idle_probe_not_due_when_already_sending() {
-        assert!(!idle_probe_due(
-            10_000_000 + AFTER * 5,
-            10_000_000, // last_rx
-            20_000_000, // last_send AFTER rx ⇒ not idle
-            true,
-            AFTER,
-        ));
     }
 
     /// No peers ⇒ NO probe — mirrors the `dataplane_healthy` no-peers fail-open
@@ -1241,131 +1196,92 @@ mod liveness_tests {
         assert!(!idle_probe_due(
             10_000_000 + AFTER * 5,
             10_000_000,
-            10_000_000,
             false, // no peers
             AFTER,
         ));
     }
 
-    // ---- task #13: escalating idle-probe interval (pure) ----
-
-    /// `idle_probe_interval` doubles per streak step and saturates at CAP:
-    /// streak 0 ⇒ BASE, 1 ⇒ 2·BASE, 2 ⇒ 4·BASE, … then clamps to CAP and never
-    /// exceeds it — the bounded-retry schedule that replaces the fixed pulse.
-    #[test]
-    fn idle_probe_interval_doubles_then_caps() {
-        assert_eq!(idle_probe_interval(0, BASE, CAP), BASE, "streak 0 ⇒ BASE");
-        assert_eq!(idle_probe_interval(1, BASE, CAP), 2 * BASE, "streak 1 ⇒ 2·BASE");
-        assert_eq!(idle_probe_interval(2, BASE, CAP), 4 * BASE, "streak 2 ⇒ 4·BASE");
-        // Climb until the doubling would exceed CAP, then stay clamped.
-        let mut prev = 0;
-        for streak in 0..64u32 {
-            let w = idle_probe_interval(streak, BASE, CAP);
-            assert!(w >= BASE, "never below BASE");
-            assert!(w <= CAP, "back-off {w} must never exceed CAP {CAP}");
-            assert!(w >= prev, "monotonic non-decreasing across the streak");
-            prev = w;
-        }
-        assert_eq!(
-            idle_probe_interval(u32::MAX, BASE, CAP),
-            CAP,
-            "a pathological streak saturates at CAP, never overflows"
-        );
-    }
-
-    /// The end-to-end table gate composes the trigger with the per-table
-    /// ESCALATING interval limiter (task #13): an ambiguously-idle table emits
-    /// the FIRST probe immediately (clock starts at 0, streak 0 ⇒ BASE window
-    /// already elapsed), then SUPPRESSES a second probe within the (now DOUBLED)
-    /// window, then ALLOWS one again only past the LARGER window — one keepalive
-    /// per escalating window, never a busy-loop.
+    /// The table gate composes the trigger with a FIXED-cadence limiter: an idle
+    /// table emits the FIRST probe as soon as the window is reached (clock starts
+    /// at 0 ⇒ elapsed), SUPPRESSES a second within the SAME window, then ALLOWS
+    /// one again exactly one AFTER later — a steady one-probe-per-window pulse,
+    /// never a busy-loop, never an escalating back-off.
     #[test]
     fn should_emit_idle_probe_is_rate_limited() {
         let t = table_with_one_peer();
-        // Drive into ambiguous-idle: an inbound at 10s, no later send.
         t.note_inbound_data_frame(10_000_000);
         let base = 10_000_000 + AFTER; // first moment the probe is due
         assert!(
-            t.should_emit_idle_probe(base, AFTER, BASE, CAP),
-            "first probe fires once the ambiguity window is reached"
+            t.should_emit_idle_probe(base, AFTER),
+            "first probe fires once the window is reached"
         );
-        assert_eq!(t.idle_probe_streak(), 1, "first emit bumps the streak to 1");
-        // After the first emit the streak is 1 ⇒ the next required window is
-        // 2·BASE. A probe at base + BASE (one BASE later) is therefore STILL
-        // suppressed — proving the back-off escalated, not a fixed BASE pulse.
+        // Within the SAME window (half an AFTER later) ⇒ suppressed.
         assert!(
-            !t.should_emit_idle_probe(base + BASE, AFTER, BASE, CAP),
-            "a second probe one BASE later is suppressed — the window doubled"
+            !t.should_emit_idle_probe(base + AFTER / 2, AFTER),
+            "a second probe within the fixed window is suppressed (no busy-loop)"
         );
-        // Past the doubled window (2·BASE) the next probe fires.
+        // Exactly one AFTER later ⇒ fires again (FIXED cadence, not escalating).
         assert!(
-            t.should_emit_idle_probe(base + 2 * BASE, AFTER, BASE, CAP),
-            "a probe fires again once the DOUBLED interval has elapsed"
+            t.should_emit_idle_probe(base + AFTER, AFTER),
+            "a probe fires again exactly one window later — fixed cadence"
         );
-        assert_eq!(t.idle_probe_streak(), 2, "second emit bumps the streak to 2");
+        // And again, still at the same fixed spacing — it never doubles away.
+        assert!(
+            t.should_emit_idle_probe(base + 2 * AFTER, AFTER),
+            "the cadence stays fixed at AFTER — never escalates"
+        );
     }
 
-    /// A real inbound frame COLLAPSES the escalating back-off (task #13): after
-    /// several un-answered probes the streak is high (long window), but the
-    /// instant `note_inbound_data_frame` lands the streak resets to 0 so probing
-    /// returns to the responsive BASE cadence — the moment the black hole clears.
+    /// Fresh RX STOPS the probe until RX ages again — no back-off state to carry:
+    /// a fresh-RX tick is simply not-due, and once RX ages past the window the
+    /// next probe is due at the same cadence.
     #[test]
-    fn real_rx_resets_idle_probe_backoff() {
+    fn real_rx_stops_probe_until_aged_again() {
         let t = table_with_one_peer();
         t.note_inbound_data_frame(10_000_000);
-        let mut now = 10_000_000 + AFTER;
-        // Emit three escalating probes (no RX between them): streak climbs.
-        assert!(t.should_emit_idle_probe(now, AFTER, BASE, CAP)); // streak 0→1
-        now += 2 * BASE;
-        assert!(t.should_emit_idle_probe(now, AFTER, BASE, CAP)); // streak 1→2
-        now += 4 * BASE;
-        assert!(t.should_emit_idle_probe(now, AFTER, BASE, CAP)); // streak 2→3
-        assert_eq!(t.idle_probe_streak(), 3, "three un-answered probes");
-        // RX returns: the streak collapses to 0.
-        t.note_inbound_data_frame(now);
-        assert_eq!(t.idle_probe_streak(), 0, "real RX resets the back-off");
-        // The path goes silent again; the very next due probe fires at BASE
-        // cadence (not the long pre-reset window), proving recovery is snappy.
-        let due = now + AFTER; // RX aged past the ambiguity window again
+        // Fire once the window is reached.
+        assert!(t.should_emit_idle_probe(10_000_000 + AFTER, AFTER));
+        // A real inbound refreshes RX ⇒ the very next tick is not-due (fresh).
+        let rx2 = 10_000_000 + AFTER + 5_000_000;
+        t.note_inbound_data_frame(rx2);
         assert!(
-            t.should_emit_idle_probe(due, AFTER, BASE, CAP),
-            "after a reset the next probe is due at BASE cadence again"
+            !t.should_emit_idle_probe(rx2 + AFTER / 2, AFTER),
+            "fresh RX ⇒ not due (probing pauses while data flows)"
+        );
+        // RX ages past the window again ⇒ due once more at the fixed cadence.
+        assert!(
+            t.should_emit_idle_probe(rx2 + AFTER, AFTER),
+            "once RX ages past the window the probe is due again"
         );
     }
 
     /// The gate claims the rate-limit slot ONLY when it actually emits: a
     /// not-due call (fresh RX) must NOT stamp `last_idle_probe_ts`, so a later
-    /// genuinely-due tick still fires immediately. Guards against a fresh-RX
-    /// tick silently consuming the interval.
+    /// genuinely-due tick still fires immediately.
     #[test]
     fn should_emit_idle_probe_does_not_claim_when_not_due() {
         let t = table_with_one_peer();
         t.note_inbound_data_frame(10_000_000);
-        // Fresh RX ⇒ not due ⇒ must not claim the slot.
-        assert!(!t.should_emit_idle_probe(10_000_000 + AFTER / 2, AFTER, BASE, CAP));
+        assert!(!t.should_emit_idle_probe(10_000_000 + AFTER / 2, AFTER));
         assert_eq!(t.last_idle_probe_ts(), 0, "a not-due call must not stamp");
-        assert_eq!(t.idle_probe_streak(), 0, "a not-due call must not bump the streak");
-        // Now genuinely due → fires immediately (slot was never consumed).
-        assert!(t.should_emit_idle_probe(10_000_000 + AFTER, AFTER, BASE, CAP));
+        assert!(t.should_emit_idle_probe(10_000_000 + AFTER, AFTER));
     }
 
-    /// END-TO-END liveness chain (the whole point of B-fix-1): an
-    /// ambiguously-idle node reads HEALTHY under `dataplane_healthy` (the
-    /// fail-open blind spot). After the probe stamps the send clock, the
-    /// UNCHANGED verdict flips UNHEALTHY because RX is still stale — and once
+    /// END-TO-END liveness chain: an idle node whose probe went out (send clock
+    /// advanced) with NO RX back past the threshold reads UNHEALTHY, and once
     /// real RX returns it is healthy again.
     #[test]
     fn probe_then_no_rx_makes_dataplane_unhealthy() {
         let t = table_with_one_peer();
-        t.note_inbound_data_frame(10_000_000); // last RX at 10s, no send after
+        t.note_inbound_data_frame(10_000_000); // last RX at 10s
         let now = 10_000_000 + TH + 1; // past the 90s RX-silence threshold
         // BEFORE the probe: idle ⇒ fail-open ⇒ judged HEALTHY despite stale RX.
         assert!(
             t.dataplane_healthy(now, TH),
             "the fail-open idle rule masks the black hole before any probe"
         );
-        // The probe fires (ambiguous-idle) and stamps the send clock.
-        assert!(t.should_emit_idle_probe(now, AFTER, BASE, CAP));
+        // The probe fires and stamps the send clock.
+        assert!(t.should_emit_idle_probe(now, AFTER));
         t.note_send_attempt(now); // the probe's send_wire would do this
         // AFTER the probe: sending + stale RX ⇒ UNHEALTHY (black hole exposed).
         assert!(
@@ -1377,6 +1293,133 @@ mod liveness_tests {
         assert!(
             t.dataplane_healthy(now, TH),
             "once real RX resumes the node is healthy again"
+        );
+    }
+
+    // ---- coupled two-node dynamics (real elapsed-time simulation) ----
+
+    /// Decide + emit `node`'s idle probe for the FIXED cadence, advancing the
+    /// EMITTER's own DATA-send clock on a fire (as `send_wire` stamps it for a
+    /// real DATA frame). Returns whether it fired. DELIVERY to the peer (a
+    /// `DeliverToTun` that refreshes the PEER's reboot clock — a probe never
+    /// refreshes the emitter's OWN RX, it elicits no reply) is applied SEPARATELY
+    /// by the caller so two INDEPENDENT nodes decide on the SAME start-of-tick
+    /// state: a probe must not instantaneously suppress the peer's own tick
+    /// (frames cross with real latency, not mid-tick).
+    fn probe_emit(node: &SessionTable, now: i64) -> bool {
+        if node.should_emit_idle_probe(now, AFTER) {
+            node.note_send_attempt(now); // real DATA ⇒ advances own send clock
+            true
+        } else {
+            false
+        }
+    }
+
+    /// CRIT-1 REGRESSION — ANTI-PHASE HEALTHY PAIR. Two idle established peers
+    /// (one peer each) whose probe phases are offset by up to AFTER. Driven over
+    /// REAL elapsed time across >3 threshold windows, refreshing each other via
+    /// the fixed-cadence probe: BOTH must stay `dataplane_healthy` the WHOLE
+    /// time. At the old AFTER=45s (threshold/2) the anti-phase RX-refresh
+    /// interval reaches the 90s threshold with ZERO margin and the pair drifts
+    /// into a spurious fleet-wide reboot; at threshold/4 it never does.
+    #[test]
+    fn idle_pair_stays_healthy_across_windows_anti_phase() {
+        let a = table_with_one_peer();
+        let b = table_with_one_peer();
+        let base: i64 = 10_000_000_000; // 10_000s — larger than any offset
+        // Seed both reboot clocks (as the timer baseline seed would); B is offset
+        // by half a window so the two probe phases are ANTI-phase.
+        a.note_inbound_data_frame(base);
+        b.note_inbound_data_frame(base - AFTER / 2);
+
+        let step = 1_000_000; // 1s granularity
+        let end = base + 3 * TH + 2 * AFTER; // > 3 threshold windows
+        let mut now = base;
+        while now <= end {
+            // Both nodes decide on the SAME start-of-tick state (independent
+            // timers), THEN their probes cross — a fired probe refreshes the
+            // OTHER node's reboot clock.
+            let a_fired = probe_emit(&a, now);
+            let b_fired = probe_emit(&b, now);
+            if a_fired {
+                b.note_inbound_data_frame(now);
+            }
+            if b_fired {
+                a.note_inbound_data_frame(now);
+            }
+            assert!(
+                a.dataplane_healthy(now, TH),
+                "A: idle-but-healthy pair must stay GREEN the whole time (t={now})"
+            );
+            assert!(
+                b.dataplane_healthy(now, TH),
+                "B: idle-but-healthy pair must stay GREEN the whole time (t={now})"
+            );
+            now += step;
+        }
+    }
+
+    /// CRIT-2 REGRESSION — SINGLE-ROUND BIDIRECTIONAL LOSS RECOVERS. Both idle
+    /// peers probe in the same window but BOTH probes are dropped (no delivery),
+    /// so each has `last_send > last_rx`. The OLD `last_send <= last_rx` gate
+    /// would latch both here (neither re-probes ⇒ RX frozen ⇒ spurious reboot).
+    /// The fixed cadence CANNOT latch: on the very NEXT window both re-probe, the
+    /// re-probes are delivered, RX refreshes, and both read HEALTHY.
+    #[test]
+    fn bidirectional_probe_loss_recovers_no_latch() {
+        let a = table_with_one_peer();
+        let b = table_with_one_peer();
+        let base: i64 = 10_000_000_000;
+        a.note_inbound_data_frame(base);
+        b.note_inbound_data_frame(base);
+
+        // Window 1: both due, both probe, BOTH probes LOST (no delivery).
+        let t1 = base + AFTER;
+        assert!(probe_emit(&a, t1), "A probes in window 1");
+        assert!(probe_emit(&b, t1), "B probes in window 1");
+        // Both now have last_send > last_rx — the exact latch condition.
+        assert!(a.last_send_attempt_ts() > a.last_inbound_data_frame_ts());
+        assert!(b.last_send_attempt_ts() > b.last_inbound_data_frame_ts());
+
+        // Window 2: NO latch — both re-probe despite having just sent. Decide on
+        // the same start-of-tick state, then the re-probes cross (delivered).
+        let t2 = base + 2 * AFTER;
+        let a_fired = probe_emit(&a, t2);
+        let b_fired = probe_emit(&b, t2);
+        assert!(a_fired, "A must re-probe next window (no send-state latch — CRIT-2 fix)");
+        assert!(b_fired, "B must re-probe next window (no send-state latch — CRIT-2 fix)");
+        // The delivered re-probes refreshed each other's RX ⇒ both healthy again.
+        a.note_inbound_data_frame(t2); // B's re-probe lands on A
+        b.note_inbound_data_frame(t2); // A's re-probe lands on B
+        assert!(a.dataplane_healthy(t2, TH), "A recovers after one lost round");
+        assert!(b.dataplane_healthy(t2, TH), "B recovers after one lost round");
+    }
+
+    /// DEAD PEER STILL UNHEALTHY. An established peer that stops delivering DATA:
+    /// probes keep going out at the fixed cadence (advancing the send clock) but
+    /// NONE come back (deliver=false forever). Past the threshold the node reads
+    /// UNHEALTHY so the guarded reboot still fires on a real outage — and the
+    /// probe keeps firing every window (a dead peer is cheap to re-probe).
+    #[test]
+    fn dead_peer_ages_out_to_unhealthy() {
+        let node = table_with_one_peer();
+        let base: i64 = 10_000_000_000;
+        node.note_inbound_data_frame(base);
+
+        let step = 1_000_000;
+        let mut now = base + AFTER;
+        let mut probes = 0;
+        // Run past the threshold. The dead peer NEVER delivers DATA back.
+        while now <= base + TH + 2 * AFTER {
+            if probe_emit(&node, now) {
+                probes += 1;
+            }
+            now += step;
+        }
+        assert!(probes >= 3, "a dead peer is re-probed every window (fixed cadence)");
+        assert!(
+            !node.dataplane_healthy(base + TH + 1, TH),
+            "no DATA came back past the threshold ⇒ UNHEALTHY (reboot must fire)"
         );
     }
 
