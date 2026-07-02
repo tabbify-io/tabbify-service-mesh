@@ -67,6 +67,23 @@ pub(crate) fn now_micros() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
+/// Is `bytes` a bare `WireGuard` KEEPALIVE (a transport-data message carrying an
+/// EMPTY inner payload)?
+///
+/// `WireGuard` message type is the first byte (`u32` LE): 1 = handshake-init,
+/// 2 = response, 3 = cookie, 4 = transport DATA. A keepalive is a type-4 frame
+/// with zero plaintext: `4B type + 4B receiver-index + 8B counter + 16B
+/// Poly1305 tag = exactly 32 bytes`. A real DATA frame carries ≥1 plaintext
+/// byte → padded to a 16-byte boundary → ≥ 48 bytes. Handshake init/response
+/// are types 1/2. So `type == 4 && len == 32` uniquely identifies a keepalive.
+///
+/// The data-plane liveness gate must NOT count a keepalive as a data-send: an
+/// idle-but-healthy tunnel keepalives every ~25s, and counting those against a
+/// DeliverToTun-only RX clock would falsely read the tunnel as a black hole.
+fn is_wg_keepalive(bytes: &[u8]) -> bool {
+    bytes.len() == 32 && bytes.first() == Some(&4)
+}
+
 /// Send already-encapsulated `WireGuard` bytes to `session` over the best
 /// path:
 ///   * a CONFIRMED-direct UDP endpoint; else
@@ -92,11 +109,18 @@ async fn send_wire(
     session: &Arc<PeerSession>,
     bytes: Vec<u8>,
 ) {
-    // Track K: stamp the send-attempt clock at the single TX chokepoint so
-    // `dataplane_healthy` can tell an idle node (no TX) from a black hole (TX
-    // happening, zero RX). Read-only w.r.t. routing — this never changes the
-    // direct-vs-relay decision below.
-    sessions.note_send_attempt(now_micros());
+    // Stamp the DATA-send clock at the single TX chokepoint so `dataplane_healthy`
+    // can tell an idle node (no data TX) from a black hole (data TX happening,
+    // zero data RX). We EXCLUDE bare WireGuard keepalives: an idle-but-healthy
+    // tunnel emits a persistent keepalive every ~25s, and if those advanced the
+    // send clock while the RX clock only moves on real DeliverToTun data, an idle
+    // healthy tunnel would read "sending but RX stale" ⇒ UNHEALTHY ⇒ a spurious
+    // FLEET-WIDE reboot. A keepalive is not evidence we expect data back; a
+    // handshake-init (a node TRYING to converge) and real DATA both are, so those
+    // still stamp. Read-only w.r.t. routing.
+    if !is_wg_keepalive(&bytes) {
+        sessions.note_send_attempt(now_micros());
+    }
     if session.direct_confirmed() {
         if let Some(endpoint) = session.endpoint() {
             tracing::debug!(peer = %session.peer_id, %endpoint, len = bytes.len(), "send_wire: direct (confirmed)");
@@ -187,9 +211,14 @@ fn send_wire_relay_floored(
     session: &Arc<PeerSession>,
     bytes: Vec<u8>,
 ) {
-    // Track K: stamp the send-attempt clock so a kick / brisk re-arm counts
-    // toward `dataplane_healthy` exactly like `send_wire` does at its chokepoint.
-    sessions.note_send_attempt(now_micros());
+    // Stamp the DATA-send clock so a kick / brisk re-arm counts toward
+    // `dataplane_healthy` exactly like `send_wire` does at its chokepoint — a
+    // handshake-init IS a "we expect data back" send, so unlike a bare keepalive
+    // it advances the clock (the guard is a no-op here: kicks are inits, never
+    // 32-byte keepalives, but keep it for a single consistent rule).
+    if !is_wg_keepalive(&bytes) {
+        sessions.note_send_attempt(now_micros());
+    }
     // Relay floor ONLY — never the UDP socket, never a direct probe, regardless
     // of the local node's `relay_only` flag. A `--no-relay` node has no floor to
     // bootstrap over, so the kick is a no-op there (consistent with
@@ -280,15 +309,15 @@ pub(crate) async fn udp_recv_loop(
                             );
                             sessions.learn_endpoint(&session, peer_addr);
                             // A valid datagram just decapsulated over UDP →
-                            // refresh the staleness clock (mirrors the
-                            // fast-path `note_direct_rx`). This alone does
-                            // NOT confirm; a direct DeliverToTun does.
+                            // refresh the per-session STALENESS clock (mirrors
+                            // the fast-path `note_direct_rx`). This alone does
+                            // NOT confirm, and it does NOT stamp the table-global
+                            // reboot signal — `note_inbound_data_frame` is stamped
+                            // ONLY on a real DeliverToTun delivery inside
+                            // `apply_wg_action` (the slow path's own `attempt` +
+                            // drain both route through it, so a real data frame
+                            // arriving on the roam path still refreshes liveness).
                             session.note_direct_rx(now_micros());
-                            // Track K: the slow path inlines its own decap, so
-                            // refresh the table-global liveness clock here too
-                            // (the fast path does it inside
-                            // `process_inbound_datagram`).
-                            sessions.note_inbound_data_frame(now_micros());
                             // `via_direct = true`: slow path is still UDP.
                             apply_wg_action(&socket, relay, true, &tun, &sessions, &session, attempt).await;
                             // Drain any queued frames (mirrors process_inbound_datagram).
@@ -360,22 +389,15 @@ pub(crate) async fn process_inbound_datagram(
         "rx_decap"
     );
     // A valid WG packet (anything that isn't an error — handshake or data,
-    // incl. keepalives) arrived over UDP: refresh the staleness clock so a
-    // confirmed-but-idle path doesn't age out. This does NOT confirm; only
-    // a direct DeliverToTun (real data) does that, below in apply_wg_action.
+    // incl. keepalives) arrived over UDP: refresh the per-session STALENESS
+    // clock so a confirmed-but-idle DIRECT path doesn't age out. This is NOT
+    // the reboot gate — it feeds `downgrade_direct_if_stale` / DIRECT_PATH_TTL
+    // only, and by design a handshake/keepalive keeps a confirmed direct path
+    // alive. It does NOT confirm (only a direct DeliverToTun does) and it does
+    // NOT touch the table-global `note_inbound_data_frame` reboot signal — that
+    // is stamped ONLY on a real DeliverToTun delivery, inside `apply_wg_action`.
     if via_direct && !matches!(first, WgAction::Error(_)) {
         session.note_direct_rx(now_micros());
-    }
-    // KEYSTONE (Track K): a valid WG decap over ANY path — direct UDP OR
-    // relay — proves the data plane is alive. Refresh the TABLE-GLOBAL
-    // liveness clock for both. Distinct from the per-session `note_direct_rx`
-    // above (which is `via_direct`-gated because only a UDP datagram can prove
-    // a DIRECT path): a relayed frame must NOT confirm a direct path, but it
-    // DOES prove inbound data reaches us, so it refreshes the global
-    // black-hole signal. Fixes the `via_direct=false` blind spot
-    // (`relay/client.rs:391`).
-    if !matches!(first, WgAction::Error(_)) {
-        sessions.note_inbound_data_frame(now_micros());
     }
     apply_wg_action(socket, relay, via_direct, tun, sessions, session, first).await;
 
@@ -429,6 +451,22 @@ async fn apply_wg_action(
             if !inner_source_allowed(session, &bytes) {
                 return;
             }
+            // DeliverToTun-ONLY data-plane liveness (THE fix). A real inner DATA
+            // packet just reached the TUN — the ONLY proof the data plane is
+            // alive. Stamp the table-global liveness clock HERE, the single site
+            // every delivered frame funnels through: first decap AND the drain
+            // loop AND both the fast (`process_inbound_datagram`) and slow
+            // (`udp_recv_loop` roam branch) paths call `apply_wg_action`, so one
+            // stamp covers them all. A handshake (`SendToPeer`) or keepalive
+            // (`Nothing`) decap deliberately does NOT stamp — so a node stuck in
+            // a handshake re-arm loop, which keeps decapsulating the peer's
+            // relayed handshake frames but delivers ZERO data to the TUN, reads
+            // UNHEALTHY and the tier-2 reboot watchdog can finally fire on a
+            // truly-dead tunnel. Stamped REGARDLESS of `via_direct`: relayed DATA
+            // still proves inbound liveness (Track K, the `via_direct=false`
+            // black-hole signal), even though only DIRECT data `confirm_direct`s
+            // the direct PATH below.
+            sessions.note_inbound_data_frame(now_micros());
             // THE upgrade signal: a real DATA packet was delivered over a
             // DIRECT (non-relayed) UDP path. The sender only emits data
             // after ITS handshake completed — which required our response
@@ -698,49 +736,63 @@ pub(crate) async fn timer_loop(
                     // confirmed / suppressed / endpoint-less / not-yet-due sessions.
                     maybe_direct_data_probe(&socket, &sessions, &session, my_ula, now).await;
                 }
-                // B-fix-1: active idle liveness probe. After the per-session
-                // timer pass, if this node is AMBIGUOUSLY IDLE (peers present,
-                // no send since the last inbound, RX aged past
-                // IDLE_PROBE_AFTER_MICROS) emit ONE keepalive-sized frame so the
-                // send clock advances. With the send clock now ahead of a stale
-                // RX clock, the UNCHANGED `dataplane_healthy` verdict can detect
-                // a genuine black hole within the 90s window — closing the
-                // fail-open idle blind spot a trickle of relay control frames
-                // exploited on 2026-06-21. Rate-limited with an ESCALATING
-                // back-off (BASE→…→CAP, doubling per un-answered probe; reset on
-                // real RX) so a chronic black hole is not hammered (no busy-loop,
-                // no fixed-interval pulse — task #13).
-                maybe_idle_probe(&socket, &sessions, now).await;
+                // Liveness baseline: once we HAVE peers but have never recorded
+                // an inbound DATA frame, seed the reboot clock to `now`. Without
+                // this, `last_inbound_data_frame_ts` stays 0, so the FIRST
+                // non-keepalive send (a normal initial handshake-init) would make
+                // `now - 0` exceed the 90s threshold INSTANTLY ⇒ a healthy node
+                // mid-initial-handshake reads UNHEALTHY and reboots. Seeding
+                // measures the black-hole window from "we have someone to talk
+                // to". `store_max` makes it a one-shot: any real inbound DATA
+                // (larger ts) supersedes it and it is never revisited, so a true
+                // black hole (data never arrives) still ages out to UNHEALTHY
+                // after the 90s grace and the reboot fires.
+                if !sessions.is_empty() && sessions.last_inbound_data_frame_ts() == 0 {
+                    sessions.note_inbound_data_frame(now);
+                }
+                // Active idle liveness probe (coupled half of the
+                // DeliverToTun-only fix). After the per-session timer pass, if
+                // this node is ambiguously idle (peers present, no data-send
+                // since the last inbound DATA, RX aged past
+                // IDLE_PROBE_AFTER_MICROS) emit ONE real DATA frame so the peer's
+                // symmetric probe answers with DATA that keeps our reboot clock
+                // fresh — an idle-but-HEALTHY tunnel stays GREEN while a genuinely
+                // dead one still ages out. Rate-limited with an ESCALATING
+                // back-off (reset on real RX) so a chronic black hole is not
+                // hammered (no busy-loop — task #13).
+                maybe_idle_probe(&socket, &sessions, my_ula, now).await;
             }
         }
     }
 }
 
-/// Fire ONE active idle liveness probe when warranted (B-fix-1). GATED to a
-/// `relay_only` LOCAL node (Leo's default): a non-`relay_only` node with a live
-/// LAN/direct path keeps its RX clock fresh via WG keepalives, so it is never
-/// ambiguously idle in this sense and must not pay the extra probe. A
-/// `relay_only` node (the MSI black-hole case) rides the relay floor for every
-/// frame, so a trickle of relayed control frames can mask a wedged data plane —
-/// exactly what the probe forces into the open.
+/// Fire ONE active idle liveness probe when warranted. Runs on ALL node classes
+/// (`relay_only` AND direct) — the coupled half of the `DeliverToTun`-only fix.
 ///
-/// When [`SessionTable::should_emit_idle_probe`] claims the rate-limit slot,
-/// pick an anchor peer ([`SessionTable::idle_probe_target`], prefers a
-/// relay-anchored one), force a keepalive-sized frame out of its `Tunn`
-/// (`encapsulate(&[], …)` — the same empty-encapsulate boringtun turns into a
-/// keepalive / handshake-init), and route it through [`send_wire`]. `send_wire`
-/// preserves the relay floor AND stamps `last_send_attempt_ts` — the whole
-/// point of the probe. No-op (no claim, no frame) on a non-`relay_only` node, a
-/// peerless node, a fresh-RX node, or an already-sending node.
-async fn maybe_idle_probe(socket: &UdpSocket, sessions: &SessionTable, now: i64) {
-    // Gate: only a relay_only local node probes (see fn doc). No relay handle
-    // ⇒ direct-only / `--no-relay` ⇒ not the black-hole class this targets.
-    let Some(relay) = sessions.relay() else {
-        return;
-    };
-    if !relay.relay_only() {
-        return;
-    }
+/// Once the reboot gate (`note_inbound_data_frame`) stamps ONLY on real inbound
+/// DATA, an idle-but-healthy tunnel that carries no app traffic would let its RX
+/// clock go stale (WG keepalives decap to `Nothing`, never `DeliverToTun`) and,
+/// once it sends anything a keepalive is NOT, read UNHEALTHY ⇒ a spurious
+/// FLEET-WIDE reboot. To keep such a tunnel GREEN the probe must ELICIT a real
+/// inbound `DeliverToTun`. An empty keepalive cannot (it decaps to `Nothing` on
+/// the far side), so we send a NON-EMPTY inner-IPv6 DATA frame
+/// ([`direct_probe_packet`]): the peer decapsulates it as
+/// `WriteToTunnelV6 → DeliverToTun` and, because EVERY node runs this probe, the
+/// peer's own idle probe fires a DATA frame back at us — which lands here as an
+/// inbound `DeliverToTun` and refreshes our reboot clock. Both ends stamp on the
+/// OTHER's probe, so a live idle pair stays healthy; a genuinely dead pair gets
+/// no DATA back and correctly ages out to UNHEALTHY.
+///
+/// Reuses the EXISTING `direct_probe_packet` data-frame primitive (the same one
+/// `maybe_direct_data_probe` uses to promote to direct); when the session is not
+/// yet ESTABLISHED there is no DATA to send, so it falls back to the old empty
+/// keepalive/init (which advances nothing a keepalive isn't and lets the
+/// handshake converge). Routed through [`send_wire`], which preserves the relay
+/// floor for a `relay_only` node, rides a rate-limited direct probe for a
+/// direct-capable one, and stamps the DATA-send clock (`send_wire` skips only
+/// bare keepalives). Rate-limited + escalating-back-off via
+/// [`SessionTable::should_emit_idle_probe`]; real RX resets the streak.
+async fn maybe_idle_probe(socket: &UdpSocket, sessions: &SessionTable, my_ula: Ipv6Addr, now: i64) {
     if !sessions.should_emit_idle_probe(
         now,
         crate::wg::session::IDLE_PROBE_AFTER_MICROS,
@@ -750,24 +802,35 @@ async fn maybe_idle_probe(socket: &UdpSocket, sessions: &SessionTable, now: i64)
         return;
     }
     let Some(session) = sessions.idle_probe_target() else {
-        return; // peerless (already gated, but stay defensive)
+        return; // peerless (already gated by `should_emit_idle_probe`, but stay defensive)
     };
-    // Force a keepalive-sized frame: an empty-packet encapsulate yields a WG
-    // keepalive (or a handshake-init if no session is up yet) — small, and the
-    // exact shape the timer's own keepalives take.
     let action: WgAction = {
         let mut out = vec![0u8; MAX_UDP_FRAME];
         let mut tunn = session.tunn.lock().await;
-        classify_tunn_result(tunn.encapsulate(&[], &mut out))
+        if tunn.time_since_last_handshake().is_some() {
+            // ESTABLISHED → a real inner-v6 DATA frame the far side decaps as
+            // `DeliverToTun`, so its symmetric probe answers with DATA that keeps
+            // OUR reboot clock fresh. Sourced from `my_ula` so the peer's §5.5
+            // `inner_source_allowed` accepts it against our allowed-set.
+            let probe = direct_probe_packet(my_ula, session.ula);
+            classify_tunn_result(tunn.encapsulate(&probe, &mut out))
+        } else {
+            // Not yet established → nothing to carry as DATA. Emit the old empty
+            // keepalive/init (bootstraps the handshake); it does NOT stamp the
+            // DATA-send clock, so a still-converging session is never mistaken
+            // for a data-plane black hole.
+            classify_tunn_result(tunn.encapsulate(&[], &mut out))
+        }
     };
     if let WgAction::SendToPeer(bytes) = action {
         tracing::debug!(
             peer = %session.peer_id,
             ula = %session.ula,
-            "idle_probe: emitting keepalive to keep the liveness signal honest (B-fix-1)"
+            len = bytes.len(),
+            "idle_probe: emitting DATA liveness probe to keep the reboot signal honest"
         );
-        // Rides the relay floor (relay_only ⇒ no direct probe) and stamps
-        // `last_send_attempt_ts`, advancing the send clock past a stale RX.
+        // Rides the relay floor (relay_only) or a rate-limited direct probe
+        // (direct-capable), and stamps the DATA-send clock for a real DATA frame.
         send_wire(socket, sessions.relay(), sessions, &session, bytes).await;
     }
 }
@@ -2324,32 +2387,80 @@ mod tests {
         }
     }
 
-    /// KEYSTONE (Track K): an inbound decap over the RELAY path
-    /// (`via_direct = false`) MUST refresh the table-global
-    /// `last_inbound_data_frame_ts` — fixing the `via_direct=false` blind spot
-    /// (`relay/client.rs:391`) where relayed RX never touched any liveness
-    /// clock. The session's DIRECT clock must NOT confirm (a relayed frame
-    /// proves nothing about the direct path).
+    /// CORE BUG REGRESSION: an inbound HANDSHAKE frame (decaps to `SendToPeer`,
+    /// NOT `DeliverToTun`) must NOT stamp the table-global reboot clock. Pre-fix
+    /// ANY non-error decap stamped `last_inbound_data_frame_ts`, so a node stuck
+    /// in a handshake re-arm loop kept "proving" liveness off the peer's relayed
+    /// handshake frames while ZERO data reached the TUN — the reboot watchdog
+    /// never fired on a truly-dead tunnel (the MSI flap). Now only a real
+    /// `DeliverToTun` stamps, so the handshake leaves the clock untouched.
     #[tokio::test]
-    async fn relay_decap_refreshes_table_liveness_not_direct() {
+    async fn handshake_decap_does_not_stamp_liveness() {
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let tun: Arc<dyn TunDevice> = Arc::new(NoopTun);
         let table = SessionTable::new();
         let session = upsert_peer(&table, "fd5a:1f00:1::1", Some("127.0.0.1:51820"));
 
+        // A real WG handshake-init from the mirror peer Tunn → decaps to a
+        // `SendToPeer` response, never `DeliverToTun`.
         let datagram = make_valid_wg_datagram_for(&session);
 
         assert_eq!(table.last_inbound_data_frame_ts(), 0, "clock starts at 0");
-        // via_direct = false → the RELAY path.
+        // Drive it through the fast path (via_direct = true) …
+        process_inbound_datagram(&socket, None, true, &tun, &table, &session, &datagram).await;
+        assert_eq!(
+            table.last_inbound_data_frame_ts(),
+            0,
+            "a handshake decap must NOT stamp the reboot clock (only DeliverToTun does)"
+        );
+        // … and again over the RELAY path (via_direct = false): still no stamp.
         process_inbound_datagram(&socket, None, false, &tun, &table, &session, &datagram).await;
-
-        assert!(
-            table.last_inbound_data_frame_ts() > 0,
-            "a relay decap must refresh the table-global liveness clock"
+        assert_eq!(
+            table.last_inbound_data_frame_ts(),
+            0,
+            "a relayed handshake decap must NOT stamp the reboot clock either"
         );
         assert!(
             !session.direct_confirmed(),
-            "a relayed frame must NEVER confirm the direct path"
+            "a handshake must NEVER confirm the direct path"
+        );
+    }
+
+    /// The core-bug end-to-end at the table gate: a node whose ONLY inbound
+    /// traffic is handshake frames (a re-arm loop) while it keeps SENDING
+    /// (handshake-inits stamp the send clock) reads UNHEALTHY once the RX silence
+    /// passes the 90s threshold — the reboot watchdog can finally fire. Pre-fix
+    /// the handshake frames stamped the RX clock, masking the dead tunnel forever.
+    #[tokio::test]
+    async fn handshake_loop_with_no_data_reads_unhealthy() {
+        use crate::joiner::DATAPLANE_RX_SILENCE_THRESHOLD_MICROS as TH;
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tun: Arc<dyn TunDevice> = Arc::new(NoopTun);
+        let table = SessionTable::new();
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some("127.0.0.1:51820"));
+
+        // Seed the baseline the timer loop would install on first tick with peers.
+        let base = now_micros();
+        table.note_inbound_data_frame(base);
+
+        // Feed several inbound handshake frames — the re-arm loop's relayed
+        // handshakes. None is DeliverToTun, so none refreshes the reboot clock.
+        for _ in 0..3 {
+            let dg = make_valid_wg_datagram_for(&session);
+            process_inbound_datagram(&socket, None, false, &tun, &table, &session, &dg).await;
+        }
+        assert_eq!(
+            table.last_inbound_data_frame_ts(),
+            base,
+            "handshake frames left the reboot clock at the baseline — zero data proof"
+        );
+        // The node keeps sending handshake-inits (a re-arm loop): the send clock
+        // advances past the (now stale) RX clock.
+        table.note_send_attempt(base + 1_000);
+        // Past the 90s RX-silence window → UNHEALTHY (watchdog can reboot).
+        assert!(
+            !table.dataplane_healthy(base + TH + 1, TH),
+            "a truly-dead tunnel (sending, zero inbound DATA past the window) reads UNHEALTHY"
         );
     }
 
@@ -2389,61 +2500,57 @@ mod tests {
         (table, rx)
     }
 
-    /// THE fix, end to end at the timer seam: a `relay_only` node that is
-    /// AMBIGUOUSLY IDLE (peers present, no send since the last inbound, RX aged
-    /// past the window) emits ONE keepalive-sized frame over the relay when
-    /// `maybe_idle_probe` runs — advancing `last_send_attempt_ts` so the
-    /// black-hole verdict can act. The relayed payload is a real WG frame
-    /// (non-empty), and the send clock is stamped.
+    /// A canonical local ULA for the idle-probe seam tests (source of the
+    /// probe's inner-v6 DATA frame).
+    fn probe_my_ula() -> Ipv6Addr {
+        "fd5a:1f00:9::9".parse().unwrap()
+    }
+
+    /// THE coupled fix, at the timer seam: a `relay_only` node that is
+    /// AMBIGUOUSLY IDLE (peers present, no data-send since the last inbound, RX
+    /// aged past the window) emits ONE frame over the relay when
+    /// `maybe_idle_probe` runs. The peer here is not yet established, so the probe
+    /// is the empty keepalive/init fallback (a real WG frame), which still rides
+    /// the relay so the handshake can converge.
     #[tokio::test]
     async fn relay_only_idle_node_emits_probe() {
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let (table, mut rx) = ambiguously_idle_table(true, 10_000_000);
         let now = 10_000_000 + IDLE_PROBE_AFTER_MICROS + 1;
-        assert_eq!(table.last_send_attempt_ts(), 0, "idle: no send yet");
 
-        maybe_idle_probe(&socket, &table, now).await;
+        maybe_idle_probe(&socket, &table, probe_my_ula(), now).await;
 
         let out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
             .await
             .expect("an ambiguously-idle relay_only node must emit a probe")
             .expect("relay channel delivered the probe");
-        assert!(!out.payload.is_empty(), "the probe is a real WG keepalive/init");
-        assert!(
-            table.last_send_attempt_ts() >= now,
-            "the probe must advance the send clock (the whole point)"
-        );
+        assert!(!out.payload.is_empty(), "the probe is a real WG frame");
     }
 
-    /// NON-`relay_only` node: the active idle probe is GATED OFF (Leo's
-    /// default). A node with a live direct/LAN path keeps its RX clock fresh via
-    /// WG keepalives, so it is never ambiguously idle in this sense and must not
-    /// pay the extra probe. Even when driven into the same idle state, nothing
-    /// is relayed and the send clock stays `0`.
+    /// NON-`relay_only` node ALSO probes now (behaviour change): once liveness is
+    /// DeliverToTun-only, a direct-capable idle node's RX clock goes stale just
+    /// like a `relay_only` node's (WG keepalives never reach the TUN), so EVERY
+    /// node class must run the idle DATA probe — otherwise a healthy idle direct
+    /// tunnel would false-negative into a reboot. The probe rides `send_wire`
+    /// (relay floor, since this passive peer has no candidate endpoint).
     #[tokio::test]
-    async fn non_relay_only_idle_node_does_not_probe() {
+    async fn non_relay_only_idle_node_also_probes() {
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let (table, mut rx) = ambiguously_idle_table(false, 10_000_000);
         let now = 10_000_000 + IDLE_PROBE_AFTER_MICROS + 1;
 
-        maybe_idle_probe(&socket, &table, now).await;
+        maybe_idle_probe(&socket, &table, probe_my_ula(), now).await;
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), rx.recv())
-                .await
-                .is_err(),
-            "a non-relay_only node must never emit the idle probe"
-        );
-        assert_eq!(
-            table.last_send_attempt_ts(),
-            0,
-            "no probe ⇒ the send clock stays untouched"
-        );
+        let out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a non-relay_only idle node must ALSO emit the liveness probe")
+            .expect("relay channel delivered the probe");
+        assert!(!out.payload.is_empty(), "the probe is a real WG frame");
     }
 
-    /// A `relay_only` node with GENUINELY FRESH RX (a real frame round-tripped
-    /// within the window) must NOT probe — the data plane is provably alive.
-    /// This is the "+RX-returns ⇒ no probe" direction at the seam.
+    /// A node with GENUINELY FRESH RX (a real DATA frame landed within the
+    /// window) must NOT probe — the data plane is provably alive. This is the
+    /// "+RX-returns ⇒ no probe" direction at the seam.
     #[tokio::test]
     async fn relay_only_fresh_rx_node_does_not_probe() {
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -2451,7 +2558,7 @@ mod tests {
         // Now is WITHIN the ambiguity window ⇒ RX is fresh ⇒ no probe.
         let now = 10_000_000 + IDLE_PROBE_AFTER_MICROS / 2;
 
-        maybe_idle_probe(&socket, &table, now).await;
+        maybe_idle_probe(&socket, &table, probe_my_ula(), now).await;
 
         assert!(
             tokio::time::timeout(Duration::from_millis(200), rx.recv())
@@ -2477,7 +2584,7 @@ mod tests {
 
         // Pump the seam like the 200ms timer would in a single idle stretch.
         for i in 0..10 {
-            maybe_idle_probe(&socket, &table, now + i).await;
+            maybe_idle_probe(&socket, &table, probe_my_ula(), now + i).await;
         }
 
         // Exactly ONE frame relayed across all those ticks.
@@ -2668,7 +2775,7 @@ mod tests {
         table.note_inbound_data_frame(10_000_000);
         let now = 10_000_000 + IDLE_PROBE_AFTER_MICROS + 1;
 
-        maybe_idle_probe(&socket, &table, now).await;
+        maybe_idle_probe(&socket, &table, probe_my_ula(), now).await;
 
         assert!(
             tokio::time::timeout(Duration::from_millis(200), rx.recv())
@@ -2676,5 +2783,204 @@ mod tests {
                 .is_err(),
             "a peerless node must not probe"
         );
+    }
+
+    // ---- DeliverToTun-only liveness: the centralised stamp + coupled probe ----
+
+    /// The centralised stamp (`apply_wg_action`) advances the table-global reboot
+    /// clock ONLY on a real `DeliverToTun` delivery — covering the first decap,
+    /// the drain loop, and BOTH the fast and slow paths (all funnel here). A
+    /// relayed (`via_direct = false`) DATA delivery STILL stamps the reboot clock
+    /// (the black-hole signal is path-agnostic) yet must NOT confirm the DIRECT
+    /// path; a direct one both stamps AND confirms; a handshake `SendToPeer` /
+    /// internal `Nothing` stamp neither.
+    #[tokio::test]
+    async fn apply_wg_action_stamps_liveness_only_on_deliver_to_tun() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tun: Arc<dyn TunDevice> = Arc::new(NoopTun);
+        let ula = "fd5a:1f00:1::1";
+        let inner = ipv6_packet_from(ula.parse().unwrap());
+
+        // (1) Relayed DATA (via_direct = false): stamps the reboot clock, does
+        //     NOT confirm direct (req 4 — the relay black-hole fix stays intact).
+        let table = SessionTable::new();
+        let session = upsert_peer(&table, ula, Some("127.0.0.1:51820"));
+        assert_eq!(table.last_inbound_data_frame_ts(), 0, "starts at 0");
+        apply_wg_action(&socket, None, false, &tun, &table, &session, WgAction::DeliverToTun(inner.clone())).await;
+        assert!(table.last_inbound_data_frame_ts() > 0, "relayed DATA stamps the reboot clock");
+        assert!(!session.direct_confirmed(), "relayed DATA must NOT confirm the direct path");
+
+        // (2) A handshake `SendToPeer` must NOT stamp the reboot clock.
+        let table = SessionTable::new();
+        let session = upsert_peer(&table, ula, Some("127.0.0.1:51820"));
+        apply_wg_action(&socket, None, true, &tun, &table, &session, WgAction::SendToPeer(vec![1, 2, 3])).await;
+        assert_eq!(table.last_inbound_data_frame_ts(), 0, "a handshake must NOT stamp the reboot clock");
+
+        // (3) `Nothing` (keepalive / internal) must NOT stamp.
+        apply_wg_action(&socket, None, true, &tun, &table, &session, WgAction::Nothing).await;
+        assert_eq!(table.last_inbound_data_frame_ts(), 0, "a keepalive/Nothing must NOT stamp");
+
+        // (4) Direct DATA (via_direct = true): stamps AND confirms the direct path.
+        let table = SessionTable::new();
+        let session = upsert_peer(&table, ula, Some("127.0.0.1:51820"));
+        apply_wg_action(&socket, None, true, &tun, &table, &session, WgAction::DeliverToTun(inner)).await;
+        assert!(table.last_inbound_data_frame_ts() > 0, "direct DATA stamps the reboot clock");
+        assert!(session.direct_confirmed(), "direct DATA confirms the direct path");
+    }
+
+    /// A spoofed-source inner packet (dropped by the §5.5 `inner_source_allowed`
+    /// gate before `tun.write_packet`) must NOT stamp the reboot clock — only an
+    /// ACCEPTED delivery is liveness proof.
+    #[tokio::test]
+    async fn denied_source_delivery_does_not_stamp_liveness() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tun: Arc<dyn TunDevice> = Arc::new(NoopTun);
+        let table = SessionTable::new();
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some("127.0.0.1:51820"));
+        // Source OUTSIDE the peer's allowed-set → dropped by the RX gate.
+        let spoofed = ipv6_packet_from("fd5a:1f00:1::999".parse().unwrap());
+        apply_wg_action(&socket, None, true, &tun, &table, &session, WgAction::DeliverToTun(spoofed)).await;
+        assert_eq!(
+            table.last_inbound_data_frame_ts(),
+            0,
+            "a source-denied (dropped) delivery must NOT stamp the reboot clock"
+        );
+    }
+
+    /// `send_wire`: a real DATA frame advances the DATA-send clock; a bare WG
+    /// keepalive (type-4, exactly 32 bytes) does NOT. This is what keeps an
+    /// idle-but-healthy tunnel's 25s keepalives from falsely reading it as a
+    /// black hole once RX is DeliverToTun-only.
+    #[tokio::test]
+    async fn send_wire_stamps_for_data_but_not_for_keepalive() {
+        let (relay, _rx) = crate::relay::RelayHandle::new(false);
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", None); // passive → relay
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        // A bare keepalive: WG type-4, exactly 32 bytes.
+        let mut keepalive = vec![0u8; 32];
+        keepalive[0] = 4;
+        assert_eq!(table.last_send_attempt_ts(), 0, "no send yet");
+        send_wire(&socket, table.relay(), &table, &session, keepalive).await;
+        assert_eq!(
+            table.last_send_attempt_ts(),
+            0,
+            "a bare keepalive must NOT advance the DATA-send clock"
+        );
+
+        // A real DATA frame: WG type-4, larger than 32 bytes.
+        let mut data = vec![0u8; 80];
+        data[0] = 4;
+        send_wire(&socket, table.relay(), &table, &session, data).await;
+        assert!(
+            table.last_send_attempt_ts() > 0,
+            "a real DATA frame advances the DATA-send clock"
+        );
+    }
+
+    /// COUPLED-FIX HALVES over two real boringtun Tunns (harness):
+    ///   * the idle DATA probe from an ESTABLISHED node decapsulates on the peer
+    ///     as `DeliverToTun`, stamping the PEER's reboot clock (send side); and
+    ///   * a DATA frame received back keeps THIS node's reboot clock fresh so an
+    ///     idle-but-healthy tunnel reads HEALTHY (no false reboot, req 3).
+    #[tokio::test]
+    async fn idle_data_probe_round_trip_keeps_tunnel_healthy() {
+        use crate::joiner::DATAPLANE_RX_SILENCE_THRESHOLD_MICROS as TH;
+        let mut a = harness_node(1).await;
+        let mut b = harness_node(2).await;
+        let pub_a = *x25519_dalek::PublicKey::from(&a.priv_key).as_bytes();
+        let pub_b = *x25519_dalek::PublicKey::from(&b.priv_key).as_bytes();
+        let a_ula = "fd5a:1f00:a::1";
+        let b_ula = "fd5a:1f00:b::1";
+        let a_for_b = harness_upsert(&a, b_ula, pub_b);
+        let b_for_a = harness_upsert(&b, a_ula, pub_a);
+
+        // Converge: full WG handshake over the simulated relay (handshakes only —
+        // ZERO DeliverToTun, so both reboot clocks are still 0 afterwards).
+        let kicked = a.conv_rx.try_recv().expect("eager upsert enqueued the kick");
+        kick_convergence_handshake(&a.table, &kicked).await;
+        for _ in 0..8 {
+            let na = pump_relay(&mut a, &b, &b_for_a).await;
+            let nb = pump_relay(&mut b, &a, &a_for_b).await;
+            if na == 0 && nb == 0 {
+                break;
+            }
+        }
+        assert!(handshook(&a_for_b).await && handshook(&b_for_a).await, "pair converged");
+        assert_eq!(
+            b.table.last_inbound_data_frame_ts(),
+            0,
+            "convergence is handshakes only — no DeliverToTun stamped the reboot clock"
+        );
+
+        // Drive A into ambiguous-idle: seed its RX clock, then inject a `now`
+        // aged past the probe window so `maybe_idle_probe` fires a real DATA
+        // frame (the session is ESTABLISHED).
+        let base = now_micros();
+        a.table.note_inbound_data_frame(base);
+        let probe_now = base + IDLE_PROBE_AFTER_MICROS + 1;
+        maybe_idle_probe(&a.socket, &a.table, a_ula.parse().unwrap(), probe_now).await;
+
+        // The probe rides the relay to B, which decapsulates it as DeliverToTun →
+        // B's reboot clock is stamped (send side of the round trip).
+        let ferried = pump_relay(&mut a, &b, &b_for_a).await;
+        assert!(ferried >= 1, "the idle DATA probe rode the relay to B");
+        assert!(
+            b.table.last_inbound_data_frame_ts() > 0,
+            "the idle DATA probe decapsulated as DeliverToTun on the peer (elicits real data RX)"
+        );
+
+        // B answers with its own idle DATA probe (every node runs it); it lands
+        // on A as DeliverToTun, refreshing A's reboot clock. A's probe already
+        // stamped B's RX clock, so age `now` past THAT to make B's probe due.
+        let b_rx = b.table.last_inbound_data_frame_ts();
+        maybe_idle_probe(&b.socket, &b.table, b_ula.parse().unwrap(), b_rx + IDLE_PROBE_AFTER_MICROS + 1).await;
+        let ferried_back = pump_relay(&mut b, &a, &a_for_b).await;
+        assert!(ferried_back >= 1, "B's symmetric idle DATA probe rode the relay to A");
+        assert!(
+            a.table.last_inbound_data_frame_ts() > base,
+            "the answer refreshed A's reboot clock (RX advanced past the seed)"
+        );
+
+        // With the round trip complete, A reads HEALTHY at the current wall clock:
+        // the idle-but-healthy tunnel stays GREEN (no false fleet-wide reboot).
+        assert!(
+            a.table.dataplane_healthy(now_micros(), TH),
+            "an idle-but-healthy tunnel whose probe was answered with DATA stays HEALTHY"
+        );
+    }
+
+    /// The idle DATA probe from an ESTABLISHED node is a WG DATA frame (type 4),
+    /// not a keepalive — the only frame the peer decapsulates as `DeliverToTun`.
+    #[tokio::test]
+    async fn established_idle_probe_emits_data_frame() {
+        let mut a = harness_node(1).await;
+        let mut b = harness_node(2).await;
+        let pub_a = *x25519_dalek::PublicKey::from(&a.priv_key).as_bytes();
+        let pub_b = *x25519_dalek::PublicKey::from(&b.priv_key).as_bytes();
+        let a_ula = "fd5a:1f00:a::1";
+        let b_ula = "fd5a:1f00:b::1";
+        let a_for_b = harness_upsert(&a, b_ula, pub_b);
+        let b_for_a = harness_upsert(&b, a_ula, pub_a);
+
+        let kicked = a.conv_rx.try_recv().expect("eager upsert enqueued the kick");
+        kick_convergence_handshake(&a.table, &kicked).await;
+        for _ in 0..8 {
+            let na = pump_relay(&mut a, &b, &b_for_a).await;
+            let nb = pump_relay(&mut b, &a, &a_for_b).await;
+            if na == 0 && nb == 0 {
+                break;
+            }
+        }
+        assert!(handshook(&a_for_b).await, "pair converged");
+
+        let base = now_micros();
+        a.table.note_inbound_data_frame(base);
+        maybe_idle_probe(&a.socket, &a.table, a_ula.parse().unwrap(), base + IDLE_PROBE_AFTER_MICROS + 1).await;
+
+        let frame = a.relay_rx.try_recv().expect("the established idle probe emitted a frame");
+        assert!(frame.payload.len() > 32, "a DATA frame, not a 32-byte keepalive");
+        assert_eq!(frame.payload[0], 4, "WG message type 4 = transport DATA");
     }
 }
