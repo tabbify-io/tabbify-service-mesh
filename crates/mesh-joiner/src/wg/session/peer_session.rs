@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 /// next `downgrade_direct_if_stale` falls the session back to the relay.
 pub const DIRECT_PATH_TTL_MICROS: i64 = 35_000_000;
 
-/// How long a confirmed-direct path may carry ACTIVE non-keepalive TX with
+/// How long a confirmed-direct path may carry ACTIVE data-bearing TX with
 /// ZERO direct inbound DATA before it is declared a TX black hole.
 ///
 /// Fires [`PeerSession::downgrade_direct_if_tx_blackholed`] — the
@@ -33,18 +33,24 @@ pub const DIRECT_PATH_TTL_MICROS: i64 = 35_000_000;
 /// "fresh" forever even when OUR outbound direct path to it is dead — the
 /// asymmetric wedge (the MSI symmetric-NAT incident: their keepalives arrive,
 /// our frames vanish, the relay is never engaged). This TTL closes it: if we
-/// are actively transmitting on the confirmed path (a non-keepalive send
-/// within the window) yet no direct inbound DATA (`DeliverToTun`,
-/// `via_direct`) has arrived within the same window, the direct path has not
-/// proven our TX direction — fall back to the relay floor and let the
-/// governed probe re-confirm.
+/// are actively transmitting DATA on the confirmed path (a data-bearing send
+/// within the window — handshakes/keepalives do NOT count, see
+/// `is_wg_data_frame` at the TX chokepoint) yet no direct inbound DATA
+/// (`DeliverToTun`, `via_direct`) has arrived within the same window, the
+/// direct path has not proven our TX direction — fall back to the relay
+/// floor and let the governed probe re-confirm.
 ///
-/// 20 s is several WG retransmit cycles (5 s) and far above any WAN RTT, so
-/// an active healthy flow (whose return DATA arrives within milliseconds)
-/// never trips it; it stays below the 25 s keepalive/idle-probe cadences so
-/// a genuinely wedged path falls back before boringtun's 90 s handshake
-/// expiry compounds the outage.
-pub const DIRECT_TX_BLACKHOLE_TTL_MICROS: i64 = 20_000_000;
+/// 30 s is the load-bearing margin against the active idle DATA probe: every
+/// node emits — so every peer RECEIVES — one probe DATA frame per
+/// `IDLE_PROBE_AFTER_MICROS` (~22.5 s), so a healthy idle-but-confirmed pair
+/// refreshes its direct-DATA-RX clock inside this window and never
+/// false-trips. (At the original 20 s the probe cadence sat ABOVE the TTL ⇒
+/// a deterministic confirmed→relay flap machine on an idle mesh.) It stays
+/// below the 35 s staleness TTL so the direction-aware verdict lands first
+/// on a genuinely wedged path, and is far above WAN RTT so an active healthy
+/// flow (return DATA in milliseconds) is untouched. Pinned against the probe
+/// cadence by `tx_blackhole_ttl_sits_between_probe_cadence_and_staleness_ttl`.
+pub const DIRECT_TX_BLACKHOLE_TTL_MICROS: i64 = 30_000_000;
 
 /// Base back-off window after the FIRST failed direct handshake (A-c).
 ///
@@ -172,11 +178,16 @@ pub struct PeerSession {
     /// longer than `DIRECT_PATH_TTL_MICROS` is downgraded back to the
     /// relay. `0` means "never seen a valid direct datagram".
     pub last_direct_rx_micros: AtomicI64,
-    /// Unix-micros of the last NON-KEEPALIVE frame sent over the CONFIRMED
-    /// direct path (data or handshake — anything that creates an RX
-    /// expectation, the same rule as the table-global `note_send_attempt`).
-    /// Pairs with `last_direct_data_rx_micros` to drive the TX-black-hole
-    /// downgrade ([`Self::downgrade_direct_if_tx_blackholed`]). `0` = never.
+    /// Unix-micros of the last DATA-BEARING frame (WG transport type 4 with a
+    /// non-empty inner payload — `is_wg_data_frame` at the TX chokepoint) sent
+    /// over the CONFIRMED direct path. Handshake init/response/cookie do NOT
+    /// stamp: their reply is a handshake-response, never a `DeliverToTun`, so
+    /// they create no direct-DATA-RX expectation — counting them would
+    /// false-trip the TX-black-hole downgrade on every idle-pair rekey.
+    /// (Deliberately STRICTER than the table-global `note_send_attempt`,
+    /// where an init still counts toward the 90s process-liveness verdict.)
+    /// Pairs with `last_direct_data_rx_micros` to drive
+    /// [`Self::downgrade_direct_if_tx_blackholed`]. `0` = never.
     pub last_direct_data_tx_micros: AtomicI64,
     /// Unix-micros of the last inner DATA packet delivered from this peer over
     /// the DIRECT path (`DeliverToTun` with `via_direct` — the only proof the
@@ -313,29 +324,33 @@ impl PeerSession {
         self.endpoint_learned.load(Ordering::Relaxed)
     }
 
-    /// Stamp a NON-KEEPALIVE send over the CONFIRMED direct path (data or
-    /// handshake — anything that creates an RX expectation; bare keepalives are
-    /// excluded by the caller, mirroring the table-global `note_send_attempt`
-    /// rule). Feeds [`Self::downgrade_direct_if_tx_blackholed`].
+    /// Stamp a DATA-BEARING send over the CONFIRMED direct path. The caller
+    /// (the TX chokepoint's confirmed branch) gates on `is_wg_data_frame` —
+    /// transport type 4 with a non-empty payload — so handshakes and bare
+    /// keepalives never stamp: only a data send creates a direct-DATA-RX
+    /// expectation. Feeds [`Self::downgrade_direct_if_tx_blackholed`].
     pub fn note_direct_tx(&self, now_micros: i64) {
         self.last_direct_data_tx_micros
             .store(now_micros, Ordering::Relaxed);
     }
 
     /// Direction-aware downgrade (the asymmetric-wedge backstop): a CONFIRMED
-    /// direct path that is ACTIVELY transmitting (a non-keepalive send within
-    /// `ttl_micros`) yet has received ZERO direct inbound DATA within the same
-    /// window is a TX black hole — our frames vanish even though the peer's
-    /// own outbound path to us may still be refreshing the RX-staleness clock
-    /// (keepalives / handshakes keep `downgrade_direct_if_stale` from ever
-    /// firing). Fall back to the relay floor and let the governed probe
-    /// re-confirm. Returns `true` when it downgraded.
+    /// direct path that is ACTIVELY transmitting DATA (a data-bearing send
+    /// within `ttl_micros`) yet has received ZERO direct inbound DATA within
+    /// the same window is a TX black hole — our frames vanish even though the
+    /// peer's own outbound path to us may still be refreshing the
+    /// RX-staleness clock (keepalives / handshakes keep
+    /// `downgrade_direct_if_stale` from ever firing). Fall back to the relay
+    /// floor and let the governed probe re-confirm. Returns `true` when it
+    /// downgraded.
     ///
     /// Guards, in order:
     /// * not confirmed → `false` (the relay floor already carries TX);
-    /// * never sent (`last_direct_data_tx == 0`) → `false`;
-    /// * NOT actively sending (last non-keepalive TX older than the window) →
+    /// * never sent data (`last_direct_data_tx == 0`) → `false`;
+    /// * NOT actively sending (last data-bearing TX older than the window) →
     ///   `false` — an idle pair has no RX expectation and must never flap;
+    ///   idle-pair rekeys stay idle by construction: a handshake-init never
+    ///   stamps the TX clock (`is_wg_data_frame` gate at the chokepoint);
     /// * direct DATA arrived within the window → `false` — the path is proven.
     ///
     /// An actual downgrade counts as a handshake failure (the same
@@ -904,6 +919,29 @@ mod tests {
         assert!(
             s.should_rearm_expired(now + base_w, base_w, cap_w),
             "after a reset the next re-arm is due at BASE cadence"
+        );
+    }
+
+    /// Review IMPORTANT-1, part 2: the TX-black-hole TTL must sit ABOVE the
+    /// active idle DATA-probe cadence — the probe is the ONLY direct-DATA-RX
+    /// refresh a healthy idle-but-confirmed pair gets, so a TTL below its
+    /// cadence (the original 20 s vs ~22.5 s) deterministically false-fires
+    /// into a confirmed→relay flap machine on an idle mesh. It must also stay
+    /// BELOW the RX staleness TTL so the direction-aware verdict lands first
+    /// on a genuinely wedged path.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn tx_blackhole_ttl_sits_between_probe_cadence_and_staleness_ttl() {
+        assert!(
+            DIRECT_TX_BLACKHOLE_TTL_MICROS > crate::wg::session::IDLE_PROBE_AFTER_MICROS,
+            "TX-black-hole TTL ({DIRECT_TX_BLACKHOLE_TTL_MICROS}) must exceed the idle \
+             DATA-probe cadence ({}) or healthy idle pairs flap to the relay",
+            crate::wg::session::IDLE_PROBE_AFTER_MICROS
+        );
+        assert!(
+            DIRECT_TX_BLACKHOLE_TTL_MICROS < DIRECT_PATH_TTL_MICROS,
+            "TX-black-hole TTL must undercut the {DIRECT_PATH_TTL_MICROS} staleness TTL \
+             so the direction-aware downgrade fires first on a real wedge"
         );
     }
 

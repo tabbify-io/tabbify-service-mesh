@@ -84,6 +84,26 @@ fn is_wg_keepalive(bytes: &[u8]) -> bool {
     bytes.len() == 32 && bytes.first() == Some(&4)
 }
 
+/// Is `bytes` a DATA-BEARING `WireGuard` transport frame — type 4 with a
+/// NON-EMPTY inner payload (`len > 32`; a bare keepalive is exactly 32, see
+/// [`is_wg_keepalive`]; real data pads to ≥ 48)?
+///
+/// The per-session direct-TX clock (`PeerSession::note_direct_tx`) stamps
+/// ONLY on these frames — NOT on handshake init/response/cookie (types
+/// 1–3). A handshake's reply is a handshake-response, which decapsulates to
+/// `WriteToNetwork`/`Nothing` and can NEVER be a `DeliverToTun`, so a
+/// handshake send creates no direct-DATA-RX expectation. Counting it would
+/// make a healthy IDLE confirmed pair — whose periodic rekey emits inits
+/// with no data flowing — read "actively sending, zero data back" and
+/// false-trip `downgrade_direct_if_tx_blackholed` into a confirmed→relay
+/// flap on every rekey. (This is deliberately STRICTER than the
+/// table-global `note_send_attempt`, where a handshake-init still counts:
+/// that clock gates a 90s process-liveness verdict, this one a 30s
+/// path-selection verdict.)
+fn is_wg_data_frame(bytes: &[u8]) -> bool {
+    bytes.len() > 32 && bytes.first() == Some(&4)
+}
+
 /// Send already-encapsulated `WireGuard` bytes to `session` over the best
 /// path:
 ///   * a CONFIRMED-direct UDP endpoint; else
@@ -125,13 +145,16 @@ async fn send_wire(
     }
     if session.direct_confirmed() {
         if let Some(endpoint) = session.endpoint() {
-            // Stamp the per-session direct-TX clock (non-keepalive only, the
-            // same rule as `note_send_attempt`): this is the branch with NO
-            // relay floor, so it must feed the TX-black-hole downgrade
-            // (`downgrade_direct_if_tx_blackholed`) — active TX here with
-            // zero direct DATA back within the TTL means our frames are
-            // vanishing and the session must fall back to the floor.
-            if !keepalive {
+            // Stamp the per-session direct-TX clock for DATA-BEARING frames
+            // ONLY (`is_wg_data_frame`): this is the branch with NO relay
+            // floor, so it must feed the TX-black-hole downgrade
+            // (`downgrade_direct_if_tx_blackholed`) — data TX here with zero
+            // direct DATA back within the TTL means our frames are vanishing
+            // and the session must fall back to the floor. Handshake
+            // init/response/cookie deliberately do NOT stamp: their reply is
+            // never a `DeliverToTun`, so counting them false-trips the
+            // downgrade on every idle-pair rekey (see `is_wg_data_frame`).
+            if is_wg_data_frame(&bytes) {
                 session.note_direct_tx(send_now);
             }
             tracing::debug!(peer = %session.peer_id, %endpoint, len = bytes.len(), "send_wire: direct (confirmed)");
@@ -2272,6 +2295,69 @@ mod tests {
             .try_recv()
             .expect("after the TX-black-hole downgrade the frame must ride the relay floor");
         assert_eq!(relayed.dst_pubkey, session.peer_pubkey);
+    }
+
+    /// Idle-pair rekey regression (review IMPORTANT-1): a CONFIRMED idle pair
+    /// whose periodic WG rekey emits a handshake-init on the direct path must
+    /// NOT trip the TX-black-hole downgrade — a handshake's reply is a
+    /// handshake-response, which can NEVER be a `DeliverToTun`, so an init
+    /// creates no direct-DATA-RX expectation. Before the `is_wg_data_frame`
+    /// gate the init stamped the TX clock, and with the pair idle (no data
+    /// flowing, `last_direct_data_rx` stale) the downgrade fired within one
+    /// TTL of EVERY rekey — a fleet-wide confirmed→relay flap machine. A real
+    /// DATA frame through the same chokepoint must still stamp, so black-hole
+    /// DETECTION (the MSI wedge transmitted real HTTP data) is fully preserved.
+    #[tokio::test]
+    async fn idle_rekey_handshake_does_not_false_trip_tx_blackhole() {
+        let (relay, _rx) = crate::relay::RelayHandle::new(false);
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", Some("127.0.0.1:9"));
+        let ttl = crate::wg::session::peer_session::DIRECT_TX_BLACKHOLE_TTL_MICROS;
+        let t0 = now_micros();
+        session.confirm_direct(t0);
+        // Model the IDLE pair: the last direct DATA from the peer is long
+        // past (only keepalives/handshakes flow, none of which stamp the
+        // direct-DATA-RX clock).
+        session
+            .last_direct_data_rx_micros
+            .store(t0 - ttl, std::sync::atomic::Ordering::Relaxed);
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        // The rekey: a WG handshake-init (type 1, 148 bytes) rides the
+        // confirmed direct branch of the TX chokepoint.
+        let mut init = vec![0u8; 148];
+        init[0] = 1;
+        send_wire(&socket, table.relay(), &table, &session, init).await;
+        assert_eq!(
+            session
+                .last_direct_data_tx_micros
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a handshake-init must NOT stamp the direct-DATA-TX clock"
+        );
+        // With no data TX recorded the pair reads IDLE at any RX age — the
+        // downgrade must not fire no matter how long the rekey goes
+        // unanswered. (With the old any-non-keepalive stamp, the init above
+        // made `actively_sending` true against the stale RX clock and this
+        // fired — the deterministic idle flap.)
+        assert!(
+            !session.downgrade_direct_if_tx_blackholed(now_micros() + 1_000, ttl),
+            "an idle rekey (handshake TX, zero data RX) must never downgrade"
+        );
+        assert!(session.direct_confirmed(), "the idle pair stays confirmed");
+
+        // Detection preserved: a DATA-BEARING frame (type 4, non-empty
+        // payload) through the same chokepoint still stamps the TX clock.
+        let mut data = vec![0u8; 64];
+        data[0] = 4;
+        send_wire(&socket, table.relay(), &table, &session, data).await;
+        assert!(
+            session
+                .last_direct_data_tx_micros
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "a data-bearing frame must stamp the direct-DATA-TX clock (black-hole detection intact)"
+        );
     }
 
     /// A TUN device that swallows every write — lets the `DeliverToTun` path
