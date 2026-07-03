@@ -118,11 +118,22 @@ async fn send_wire(
     // FLEET-WIDE reboot. A keepalive is not evidence we expect data back; a
     // handshake-init (a node TRYING to converge) and real DATA both are, so those
     // still stamp. Read-only w.r.t. routing.
-    if !is_wg_keepalive(&bytes) {
-        sessions.note_send_attempt(now_micros());
+    let send_now = now_micros();
+    let keepalive = is_wg_keepalive(&bytes);
+    if !keepalive {
+        sessions.note_send_attempt(send_now);
     }
     if session.direct_confirmed() {
         if let Some(endpoint) = session.endpoint() {
+            // Stamp the per-session direct-TX clock (non-keepalive only, the
+            // same rule as `note_send_attempt`): this is the branch with NO
+            // relay floor, so it must feed the TX-black-hole downgrade
+            // (`downgrade_direct_if_tx_blackholed`) — active TX here with
+            // zero direct DATA back within the TTL means our frames are
+            // vanishing and the session must fall back to the floor.
+            if !keepalive {
+                session.note_direct_tx(send_now);
+            }
             tracing::debug!(peer = %session.peer_id, %endpoint, len = bytes.len(), "send_wire: direct (confirmed)");
             if let Err(e) = socket.send_to(&bytes, endpoint).await {
                 tracing::debug!(error = %e, %endpoint, "udp send failed");
@@ -687,6 +698,24 @@ pub(crate) async fn timer_loop(
                         now,
                         crate::wg::session::peer_session::DIRECT_PATH_TTL_MICROS,
                     );
+                    // Direction-aware sibling (the asymmetric-wedge backstop):
+                    // a confirmed path that is ACTIVELY transmitting yet has
+                    // received zero direct inbound DATA within the TTL is a
+                    // TX black hole — the peer's own inbound keepalives keep
+                    // the staleness clock above fresh, so only this check can
+                    // fall such a session back to the relay floor.
+                    if session.downgrade_direct_if_tx_blackholed(
+                        now,
+                        crate::wg::session::peer_session::DIRECT_TX_BLACKHOLE_TTL_MICROS,
+                    ) {
+                        tracing::info!(
+                            peer_id = %session.peer_id,
+                            ula = %session.ula,
+                            endpoint = ?session.endpoint(),
+                            event = "direct_tx_blackhole_downgrade",
+                            "timer: confirmed direct path is a TX black hole (active TX, no direct DATA rx) — falling back to the relay floor"
+                        );
+                    }
                     // FIX 3: detect + re-arm a boringtun `Tunn` that has gone
                     // PERMANENTLY EXPIRED. After `REKEY_ATTEMPT_TIME` (90s) of
                     // un-answered handshake-init retransmits boringtun calls
@@ -1214,8 +1243,11 @@ mod tests {
             peer_pubkey: [0u8; 32],
             allowed_ips: parking_lot::RwLock::new(HashSet::from([a, b])),
             endpoint: parking_lot::RwLock::new(None),
+            endpoint_learned: std::sync::atomic::AtomicBool::new(false),
             direct_confirmed: std::sync::atomic::AtomicBool::new(false),
             last_direct_rx_micros: std::sync::atomic::AtomicI64::new(0),
+            last_direct_data_tx_micros: std::sync::atomic::AtomicI64::new(0),
+            last_direct_data_rx_micros: std::sync::atomic::AtomicI64::new(0),
             last_probe_micros: std::sync::atomic::AtomicI64::new(0),
             failed_handshake_count: std::sync::atomic::AtomicU32::new(0),
             direct_suppressed_until: std::sync::atomic::AtomicI64::new(0),
@@ -2198,6 +2230,48 @@ mod tests {
             rx.try_recv().is_err(),
             "nothing relayed once the direct path is confirmed"
         );
+    }
+
+    /// The asymmetric-wedge backstop end-to-end at the TX chokepoint: a
+    /// CONFIRMED session whose direct TX gets no direct DATA back within the
+    /// TTL is downgraded by the timer check
+    /// (`downgrade_direct_if_tx_blackholed`), after which `send_wire` falls
+    /// back to the relay floor — the frame is RELAYED, never silently
+    /// black-holed at the dead endpoint again. (The MSI signature: the peer's
+    /// inbound keepalives keep the RX-staleness clock fresh, so only the
+    /// direction-aware check can rescue the pair.)
+    #[tokio::test]
+    async fn confirmed_tx_blackhole_downgrades_and_falls_back_to_relay() {
+        let (relay, mut rx) = crate::relay::RelayHandle::new(false);
+        let table = SessionTable::with_route_sink_and_relay(Arc::new(NoopSink), Some(relay));
+        // The confirmed endpoint is a black hole — nothing listens there.
+        let session = upsert_peer(&table, "fd5a:1f00:fc22:2::1", Some("127.0.0.1:9"));
+        let t0 = now_micros();
+        session.confirm_direct(t0);
+
+        // Simulate the wedge: we have been actively sending on the confirmed
+        // path (recent non-keepalive TX) while the last direct inbound DATA
+        // (stamped by confirm_direct at t0) has aged past the TTL. The peer's
+        // keepalives may keep refreshing the RX-staleness clock — irrelevant
+        // to this direction-aware check.
+        let ttl = crate::wg::session::peer_session::DIRECT_TX_BLACKHOLE_TTL_MICROS;
+        let now = t0 + ttl + 1_000_000;
+        session.note_direct_rx(now); // staleness clock fresh (the wedge!)
+        session.note_direct_tx(now); // actively transmitting
+        assert!(
+            session.downgrade_direct_if_tx_blackholed(now, ttl),
+            "active TX + silent direct-DATA RX past the TTL must downgrade"
+        );
+        assert!(!session.direct_confirmed());
+
+        // The next TX rides the relay floor instead of the dead endpoint.
+        let sender = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let packet = ipv6_packet_from("fd5a:1f00:1::9".parse().unwrap());
+        encapsulate_and_send(&sender, table.relay(), &table, &session, &packet).await;
+        let relayed = rx
+            .try_recv()
+            .expect("after the TX-black-hole downgrade the frame must ride the relay floor");
+        assert_eq!(relayed.dst_pubkey, session.peer_pubkey);
     }
 
     /// A TUN device that swallows every write — lets the `DeliverToTun` path

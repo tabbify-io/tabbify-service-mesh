@@ -23,6 +23,29 @@ use tokio::sync::Mutex;
 /// next `downgrade_direct_if_stale` falls the session back to the relay.
 pub const DIRECT_PATH_TTL_MICROS: i64 = 35_000_000;
 
+/// How long a confirmed-direct path may carry ACTIVE non-keepalive TX with
+/// ZERO direct inbound DATA before it is declared a TX black hole.
+///
+/// Fires [`PeerSession::downgrade_direct_if_tx_blackholed`] — the
+/// DIRECTION-AWARE sibling of [`DIRECT_PATH_TTL_MICROS`]: the
+/// staleness TTL measures only RX (any valid inbound datagram refreshes it),
+/// so a peer whose OUTBOUND path to us stays alive keeps a confirmed session
+/// "fresh" forever even when OUR outbound direct path to it is dead — the
+/// asymmetric wedge (the MSI symmetric-NAT incident: their keepalives arrive,
+/// our frames vanish, the relay is never engaged). This TTL closes it: if we
+/// are actively transmitting on the confirmed path (a non-keepalive send
+/// within the window) yet no direct inbound DATA (`DeliverToTun`,
+/// `via_direct`) has arrived within the same window, the direct path has not
+/// proven our TX direction — fall back to the relay floor and let the
+/// governed probe re-confirm.
+///
+/// 20 s is several WG retransmit cycles (5 s) and far above any WAN RTT, so
+/// an active healthy flow (whose return DATA arrives within milliseconds)
+/// never trips it; it stays below the 25 s keepalive/idle-probe cadences so
+/// a genuinely wedged path falls back before boringtun's 90 s handshake
+/// expiry compounds the outage.
+pub const DIRECT_TX_BLACKHOLE_TTL_MICROS: i64 = 20_000_000;
+
 /// Base back-off window after the FIRST failed direct handshake (A-c).
 ///
 /// Each consecutive failure roughly doubles the window (capped at
@@ -123,6 +146,17 @@ pub struct PeerSession {
     /// a packet from a new source address (`WireGuard`'s roaming
     /// behaviour — peer's NAT mapping changes, we follow).
     pub endpoint: parking_lot::RwLock<Option<SocketAddr>>,
+    /// `true` when the CURRENT `endpoint` was LEARNED from an authenticated
+    /// inbound datagram ([`super::SessionTable::learn_endpoint`] adoption) rather
+    /// than copied from the roster's advertised candidate. Provenance matters:
+    /// a LEARNED endpoint is the address the peer's packets ACTUALLY arrive
+    /// from (its live per-us NAT mapping), while the roster candidate is only
+    /// the coordinator-observed reflexive address — for a symmetric-NAT peer
+    /// (per-destination mappings) the candidate is a BLACK HOLE toward us. A
+    /// roster re-upsert must therefore never overwrite a learned endpoint
+    /// (`SessionTable::update_in_place`); the flag is cleared when the path is
+    /// downgraded (stale RX / TX black hole), re-opening the roster repoint.
+    pub endpoint_learned: AtomicBool,
     /// `true` once a CONFIRMED-working direct path to this peer exists —
     /// i.e. a decrypted DATA packet (`boringtun`'s `DeliverToTun`) has
     /// arrived over UDP, proving the direct path works BIDIRECTIONALLY (the
@@ -138,6 +172,17 @@ pub struct PeerSession {
     /// longer than `DIRECT_PATH_TTL_MICROS` is downgraded back to the
     /// relay. `0` means "never seen a valid direct datagram".
     pub last_direct_rx_micros: AtomicI64,
+    /// Unix-micros of the last NON-KEEPALIVE frame sent over the CONFIRMED
+    /// direct path (data or handshake — anything that creates an RX
+    /// expectation, the same rule as the table-global `note_send_attempt`).
+    /// Pairs with `last_direct_data_rx_micros` to drive the TX-black-hole
+    /// downgrade ([`Self::downgrade_direct_if_tx_blackholed`]). `0` = never.
+    pub last_direct_data_tx_micros: AtomicI64,
+    /// Unix-micros of the last inner DATA packet delivered from this peer over
+    /// the DIRECT path (`DeliverToTun` with `via_direct` — the only proof the
+    /// direct path works BIDIRECTIONALLY). Stamped by [`Self::confirm_direct`],
+    /// which is invoked on exactly that event. `0` = never.
+    pub last_direct_data_rx_micros: AtomicI64,
     /// Unix-micros of the last UNCONFIRMED direct PROBE we sent at this
     /// peer's candidate endpoint (see `send_wire`). Rate-limits the probe so
     /// a black-hole candidate (a reflexive endpoint that never works) costs
@@ -253,6 +298,70 @@ impl PeerSession {
         self.direct_confirmed.store(true, Ordering::Relaxed);
         self.last_direct_rx_micros
             .store(now_micros, Ordering::Relaxed);
+        // The confirming event IS a direct inbound DATA delivery — stamp the
+        // direction-aware clock the TX-black-hole downgrade compares against.
+        self.last_direct_data_rx_micros
+            .store(now_micros, Ordering::Relaxed);
+    }
+
+    /// `true` when the current `endpoint` was LEARNED from an authenticated
+    /// inbound datagram rather than copied from the roster (see the field doc).
+    /// Read by `SessionTable::update_in_place` to keep the roster's advertised
+    /// candidate from clobbering a live learned address.
+    #[must_use]
+    pub fn endpoint_learned(&self) -> bool {
+        self.endpoint_learned.load(Ordering::Relaxed)
+    }
+
+    /// Stamp a NON-KEEPALIVE send over the CONFIRMED direct path (data or
+    /// handshake — anything that creates an RX expectation; bare keepalives are
+    /// excluded by the caller, mirroring the table-global `note_send_attempt`
+    /// rule). Feeds [`Self::downgrade_direct_if_tx_blackholed`].
+    pub fn note_direct_tx(&self, now_micros: i64) {
+        self.last_direct_data_tx_micros
+            .store(now_micros, Ordering::Relaxed);
+    }
+
+    /// Direction-aware downgrade (the asymmetric-wedge backstop): a CONFIRMED
+    /// direct path that is ACTIVELY transmitting (a non-keepalive send within
+    /// `ttl_micros`) yet has received ZERO direct inbound DATA within the same
+    /// window is a TX black hole — our frames vanish even though the peer's
+    /// own outbound path to us may still be refreshing the RX-staleness clock
+    /// (keepalives / handshakes keep `downgrade_direct_if_stale` from ever
+    /// firing). Fall back to the relay floor and let the governed probe
+    /// re-confirm. Returns `true` when it downgraded.
+    ///
+    /// Guards, in order:
+    /// * not confirmed → `false` (the relay floor already carries TX);
+    /// * never sent (`last_direct_data_tx == 0`) → `false`;
+    /// * NOT actively sending (last non-keepalive TX older than the window) →
+    ///   `false` — an idle pair has no RX expectation and must never flap;
+    /// * direct DATA arrived within the window → `false` — the path is proven.
+    ///
+    /// An actual downgrade counts as a handshake failure (the same
+    /// anti-oscillation rule as the stale downgrade) and clears
+    /// `endpoint_learned` so the next roster upsert may repoint the candidate.
+    pub fn downgrade_direct_if_tx_blackholed(&self, now_micros: i64, ttl_micros: i64) -> bool {
+        if !self.direct_confirmed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let last_tx = self.last_direct_data_tx_micros.load(Ordering::Relaxed);
+        if last_tx == 0 {
+            return false;
+        }
+        let actively_sending = now_micros.saturating_sub(last_tx) <= ttl_micros;
+        let rx_silent = now_micros.saturating_sub(
+            self.last_direct_data_rx_micros.load(Ordering::Relaxed),
+        ) > ttl_micros;
+        if actively_sending && rx_silent {
+            self.direct_confirmed.store(false, Ordering::Relaxed);
+            self.endpoint_learned.store(false, Ordering::Relaxed);
+            // Anti-oscillation: same rule as the stale downgrade — the failed
+            // candidate serves out a back-off window before being re-probed.
+            self.note_handshake_failure(now_micros);
+            return true;
+        }
+        false
     }
 
     /// Rate-limit gate for the unconfirmed direct PROBE in `send_wire`:
@@ -373,6 +482,11 @@ impl PeerSession {
             && now_micros - self.last_direct_rx_micros.load(Ordering::Relaxed) > ttl_micros
         {
             self.direct_confirmed.store(false, Ordering::Relaxed);
+            // The learned endpoint went silent past the TTL — its NAT mapping
+            // is presumed dead, so surrender provenance: the next roster
+            // upsert may repoint the advertised candidate, and a live inbound
+            // source will re-learn.
+            self.endpoint_learned.store(false, Ordering::Relaxed);
             // Anti-oscillation: a path that confirmed then went silent is now
             // suspect. Count the downgrade as a handshake failure so the next
             // `send_wire` does NOT immediately re-probe and re-flap — the
@@ -453,11 +567,20 @@ impl std::fmt::Debug for PeerSession {
             .field("peer_pubkey", &"<pubkey>")
             .field("allowed_ips", &self.allowed_ips.read())
             .field("endpoint", &self.endpoint())
+            .field("endpoint_learned", &self.endpoint_learned())
             .field("direct_confirmed", &self.direct_confirmed())
             .field("eager_convergence", &self.eager_convergence())
             .field(
                 "last_direct_rx_micros",
                 &self.last_direct_rx_micros.load(Ordering::Relaxed),
+            )
+            .field(
+                "last_direct_data_tx_micros",
+                &self.last_direct_data_tx_micros.load(Ordering::Relaxed),
+            )
+            .field(
+                "last_direct_data_rx_micros",
+                &self.last_direct_data_rx_micros.load(Ordering::Relaxed),
             )
             .field(
                 "last_probe_micros",
@@ -498,8 +621,11 @@ mod tests {
             peer_pubkey: [0u8; 32],
             allowed_ips: parking_lot::RwLock::new(HashSet::new()),
             endpoint: parking_lot::RwLock::new(None),
+            endpoint_learned: AtomicBool::new(false),
             direct_confirmed: AtomicBool::new(false),
             last_direct_rx_micros: AtomicI64::new(0),
+            last_direct_data_tx_micros: AtomicI64::new(0),
+            last_direct_data_rx_micros: AtomicI64::new(0),
             last_probe_micros: AtomicI64::new(0),
             failed_handshake_count: AtomicU32::new(0),
             direct_suppressed_until: AtomicI64::new(0),
@@ -779,6 +905,75 @@ mod tests {
             s.should_rearm_expired(now + base_w, base_w, cap_w),
             "after a reset the next re-arm is due at BASE cadence"
         );
+    }
+
+    /// The asymmetric-wedge backstop (`downgrade_direct_if_tx_blackholed`):
+    /// a CONFIRMED path that keeps TRANSMITTING while receiving ZERO direct
+    /// inbound DATA within the window must downgrade — even though the
+    /// RX-staleness clock stays fresh (the peer's keepalives keep arriving,
+    /// so `downgrade_direct_if_stale` never fires). This is the MSI
+    /// signature: their outbound path to us is alive, ours to them is dead.
+    #[test]
+    fn tx_blackhole_downgrade_fires_when_sending_without_direct_data_rx() {
+        let s = bare_session();
+        let ttl = DIRECT_TX_BLACKHOLE_TTL_MICROS;
+        // Confirm at t0 — stamps both the staleness AND the direct-DATA-RX clocks.
+        s.confirm_direct(1_000_000);
+        // The peer's keepalives keep the STALENESS clock fresh (the wedge!):
+        let now = 1_000_000 + ttl + 5_000_000;
+        s.note_direct_rx(now);
+        // We are actively sending on the confirmed path…
+        s.note_direct_tx(now);
+        // …but no direct inbound DATA arrived within the window.
+        assert!(
+            s.downgrade_direct_if_tx_blackholed(now, ttl),
+            "active TX + silent direct-DATA RX past the TTL must downgrade"
+        );
+        assert!(!s.direct_confirmed(), "the path fell back to the relay floor");
+        assert!(
+            s.direct_suppressed(now),
+            "a TX-black-hole downgrade opens a back-off (anti-oscillation)"
+        );
+        assert!(
+            !s.endpoint_learned(),
+            "the downgrade surrenders endpoint provenance so the roster may repoint"
+        );
+    }
+
+    /// The TX-black-hole downgrade must be IDLE-SAFE: with no recent
+    /// non-keepalive TX there is no RX expectation, so a quiet confirmed pair
+    /// (arbitrarily old data clocks) never flaps to the relay.
+    #[test]
+    fn tx_blackhole_downgrade_is_idle_safe() {
+        let s = bare_session();
+        let ttl = DIRECT_TX_BLACKHOLE_TTL_MICROS;
+        s.confirm_direct(1_000_000);
+        // Never sent at all → no downgrade, no matter how old the RX clock.
+        assert!(!s.downgrade_direct_if_tx_blackholed(1_000_000 + 100 * ttl, ttl));
+        assert!(s.direct_confirmed());
+        // A flow that FINISHED long ago (last TX outside the window) is idle
+        // too — the unanswered final frame of a completed exchange must not
+        // downgrade a healthy path hours later.
+        s.note_direct_tx(2_000_000);
+        assert!(!s.downgrade_direct_if_tx_blackholed(2_000_000 + ttl + 1, ttl));
+        assert!(s.direct_confirmed(), "stale TX (idle) never downgrades");
+    }
+
+    /// Fresh direct inbound DATA within the window proves the path — an
+    /// active healthy flow (request out, response data back) never trips the
+    /// TX-black-hole downgrade.
+    #[test]
+    fn tx_blackhole_downgrade_spares_active_healthy_flow() {
+        let s = bare_session();
+        let ttl = DIRECT_TX_BLACKHOLE_TTL_MICROS;
+        let now = 10_000_000;
+        s.note_direct_tx(now - 1_000); // sending…
+        s.confirm_direct(now - 500); // …and direct DATA came back (stamps RX)
+        assert!(
+            !s.downgrade_direct_if_tx_blackholed(now, ttl),
+            "fresh direct DATA RX within the window keeps the path confirmed"
+        );
+        assert!(s.direct_confirmed());
     }
 
     /// A keepalive refresh (`note_direct_rx`) keeps a confirmed-but-idle

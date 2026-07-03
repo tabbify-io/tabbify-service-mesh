@@ -470,34 +470,34 @@ impl SessionTable {
     /// topologies where the peer's source port differs from its
     /// advertised endpoint.
     ///
-    /// IMPORTANT: a CONFIRMED-direct endpoint is never clobbered. Once a
-    /// decrypted data packet proved the path works bidirectionally, the
-    /// confirmed endpoint is authoritative and an ephemeral inbound source
-    /// (good only for keeping a transient NAT mapping alive) must not
-    /// regress it.
+    /// Adoption rule (classic `WireGuard` roaming): a source that just
+    /// AUTHENTICATED (the caller only invokes this after a successful
+    /// decapsulate under this peer's `Tunn`; boringtun's anti-replay +
+    /// handshake-timestamp checks make a replayed datagram fail decap) is
+    /// the address the peer VERIFIABLY transmits from right now — adopt it
+    /// as the outbound default whenever it differs, CONFIRMED OR NOT, and
+    /// mark the endpoint LEARNED (provenance for [`Self::update_in_place`]).
     ///
-    /// While the session is UNCONFIRMED, however, the "advertised"
-    /// endpoint the coordinator stored is only a CANDIDATE — and for a
-    /// no-inbound-port peer (a container netns, a symmetric-NAT peer whose
-    /// reflexive endpoint we can't actually reach) it may be a BLACK HOLE.
-    /// A real inbound datagram from a different source proves a live return
-    /// path exists, so we adopt that source as the outbound default. This
-    /// lets a relayed inbound repoint an unconfirmed session off a
-    /// hole-punch-written dead endpoint if a genuine direct path appears.
-    ///
-    /// Adoption rule: take the learned source as the outbound default when
-    /// the endpoint is unset, OR when the session is unconfirmed AND the
-    /// source differs from the current candidate. Passive peers (no
-    /// advertised endpoint) are the `is_none()` case.
+    /// This deliberately supersedes the old "a confirmed endpoint is
+    /// authoritative, never repoint it" rule: that guard was one leg of the
+    /// symmetric-NAT wedge (the MSI black hole). A symmetric-NAT peer's
+    /// roster-advertised reflexive endpoint is a per-destination BLACK HOLE
+    /// toward us; the only address that ever works is the one its packets
+    /// actually arrive from. If the outbound endpoint has been regressed onto
+    /// the dead candidate (roster churn, NAT rebind), refusing to re-adopt the
+    /// live authenticated source wedges TX into the black hole forever —
+    /// while kernel `WireGuard` simply roams to the latest authenticated
+    /// source, exactly as we do now.
     pub fn learn_endpoint(&self, session: &Arc<PeerSession>, source: SocketAddr) {
         // Always index the source for inbound demux + response targeting.
         self.by_endpoint.insert(source, session.clone());
-        // Adopt as the outbound default when (a) we have no endpoint yet,
-        // or (b) the path is unconfirmed and this is a NEW source — never
-        // clobber a confirmed-direct endpoint with an ephemeral source.
+        // Adopt any NEW authenticated source as the outbound default and
+        // record its provenance (a learned address outranks the roster
+        // candidate in `update_in_place`).
         let mut guard = session.endpoint.write();
-        if guard.is_none() || (!session.direct_confirmed() && *guard != Some(source)) {
+        if *guard != Some(source) {
             *guard = Some(source);
+            session.endpoint_learned.store(true, Ordering::Relaxed);
         }
     }
 
@@ -728,12 +728,18 @@ impl SessionTable {
             peer_pubkey: info.wg_public_key,
             allowed_ips: parking_lot::RwLock::new(allowed_ips_for(info)),
             endpoint: parking_lot::RwLock::new(info.listen_endpoint),
+            // Roster-sourced candidate, not a learned address (provenance
+            // starts at "advertised" until an authenticated inbound source
+            // is adopted by `learn_endpoint`).
+            endpoint_learned: AtomicBool::new(false),
             // A fresh session always starts UNCONFIRMED — even a re-upsert
             // (endpoint roam / re-handshake) must re-prove the direct path
             // before TX leaves the relay floor. The advertised endpoint is
             // only a candidate until a decrypted data packet confirms it.
             direct_confirmed: AtomicBool::new(false),
             last_direct_rx_micros: AtomicI64::new(0),
+            last_direct_data_tx_micros: AtomicI64::new(0),
+            last_direct_data_rx_micros: AtomicI64::new(0),
             last_probe_micros: AtomicI64::new(0),
             // A freshly-upserted peer starts un-penalised (A-c hysteresis).
             failed_handshake_count: AtomicU32::new(0),
@@ -789,15 +795,24 @@ impl SessionTable {
     /// Update an EXISTING session whose pubkey is unchanged (endpoint /
     /// metadata-only re-upsert) WITHOUT rebuilding it. Keeps the live
     /// `Tunn` — and so the boringtun handshake/rekey timer — intact, while
-    /// repointing the routing indexes to the freshly-advertised endpoint:
+    /// reconciling the routing indexes against the fresh roster record:
     ///
-    /// 1. Evict the stale `by_endpoint` alias and install the new one so an
-    ///    inbound datagram from the new endpoint still demuxes here.
-    /// 2. Repoint the session's outbound `endpoint` to the advertised
-    ///    address (or `None` if the peer went passive). The advertised
-    ///    endpoint is authoritative roster state; `learn_endpoint` /
-    ///    `downgrade_direct_if_stale` continue to handle live roaming.
-    /// 3. Reconcile the allowed-set against the durable `app_routes` index
+    /// 1. Endpoint handling. The roster's advertised endpoint is a
+    ///    CANDIDATE, never authority: it must NOT overwrite a LEARNED
+    ///    endpoint (an address the peer's authenticated datagrams actually
+    ///    arrive from — [`Self::learn_endpoint`]). For a symmetric-NAT peer
+    ///    the advertised reflexive address (observed by the coordinator's
+    ///    vantage) is a per-destination BLACK HOLE toward us, and this
+    ///    method runs on EVERY `peer_updated` + every ~20s heartbeat
+    ///    reconcile — the old unconditional repoint regressed a proven
+    ///    learned path onto the black hole within one tick of every direct
+    ///    convergence, permanently (the MSI wedge). So:
+    ///    * endpoint LEARNED → keep it and its demux alias; still index the
+    ///      advertised candidate so inbound from it demuxes here.
+    ///    * endpoint not learned (roster-sourced or unset) → repoint to the
+    ///      freshly-advertised address exactly as before (roster roaming for
+    ///      well-behaved peers), evicting the stale alias.
+    /// 2. Reconcile the allowed-set against the durable `app_routes` index
     ///    so a newly-hosted app-ULA is permitted as a source. Strictly
     ///    additive — the peer's own ULA is already present from the
     ///    original insert.
@@ -805,19 +820,28 @@ impl SessionTable {
     /// The per-peer `/128` route is left untouched (it was installed on the
     /// first insert and the ULA hasn't changed).
     fn update_in_place(&self, session: &Arc<PeerSession>, info: &PeerInfo) {
-        // (1) Repoint the by_endpoint index: drop the old alias, add the new.
-        let old_endpoint = session.endpoint();
-        if old_endpoint != info.listen_endpoint {
-            if let Some(addr) = old_endpoint {
-                self.by_endpoint.remove(&addr);
+        // (1) Endpoint: learned addresses outrank the roster candidate.
+        if session.endpoint_learned() {
+            // Keep the learned outbound endpoint + its alias; additionally
+            // index the advertised candidate for inbound demux.
+            if let Some(addr) = info.listen_endpoint {
+                self.by_endpoint.insert(addr, session.clone());
             }
+        } else {
+            // Roster-sourced endpoint → follow the roster (drop the old
+            // alias, add the new, repoint the outbound default).
+            let old_endpoint = session.endpoint();
+            if old_endpoint != info.listen_endpoint {
+                if let Some(addr) = old_endpoint {
+                    self.by_endpoint.remove(&addr);
+                }
+            }
+            if let Some(addr) = info.listen_endpoint {
+                self.by_endpoint.insert(addr, session.clone());
+            }
+            *session.endpoint.write() = info.listen_endpoint;
         }
-        if let Some(addr) = info.listen_endpoint {
-            self.by_endpoint.insert(addr, session.clone());
-        }
-        // (2) Repoint the outbound endpoint to the advertised address.
-        *session.endpoint.write() = info.listen_endpoint;
-        // (3) Reconcile hosted app-ULAs onto the (preserved) allowed-set.
+        // (2) Reconcile hosted app-ULAs onto the (preserved) allowed-set.
         for kv in self.app_routes.iter() {
             if *kv.value() == info.ula {
                 session.add_allowed_source(*kv.key());

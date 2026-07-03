@@ -130,13 +130,18 @@ async fn build_handshake_packet(session: &Arc<PeerSession>) -> Option<Vec<u8>> {
 /// targets `plan.endpoint` (the reflexive candidate) to open OUR local NAT
 /// mapping for a genuinely punchable peer.
 ///
-/// Crucially this does NOT pin the session's outbound endpoint while the
-/// session is UNCONFIRMED: for a no-inbound-port peer (a container netns, a
-/// symmetric-NAT peer we can't reach) the coordinator-advertised reflexive
-/// endpoint is a BLACK HOLE, and regressing the session onto it would
-/// defeat `send_wire`'s relay floor and loop boringtun's `REKEY_TIMEOUT`
-/// forever. The candidate is adopted as the outbound default only once a
-/// direct path is already confirmed.
+/// Crucially this NEVER pins the session's outbound endpoint — confirmed or
+/// not. For a no-inbound-port peer (a container netns, a symmetric-NAT peer
+/// we can't reach) the coordinator-advertised reflexive endpoint is a BLACK
+/// HOLE, and regressing the session onto it defeats `send_wire`'s relay
+/// floor (unconfirmed) or wedges a CONFIRMED session's TX into the black
+/// hole while the peer's own inbound keeps the path "fresh" (the MSI
+/// symmetric-NAT wedge — the confirmed-only pin this used to do was the
+/// same clobber as `update_in_place`'s roster repoint). Endpoint ownership
+/// lives solely with `SessionTable::learn_endpoint` (authenticated source
+/// adoption) and the roster candidate path; the punch's only job here is
+/// firing datagrams to open OUR local NAT mapping, which needs no session
+/// state at all.
 ///
 /// While unconfirmed AND a `relay` is configured, each burst init is ALSO
 /// queued on the relay floor (keyed by the peer's pubkey) — this is what
@@ -154,12 +159,9 @@ pub async fn execute_punch(
     interval: Duration,
 ) {
     let confirmed = plan.session.direct_confirmed();
-    // Adopt the reflexive endpoint as the outbound default ONLY when the
-    // direct path is already confirmed — never regress an unconfirmed
-    // session onto a possibly black-hole candidate.
-    if confirmed {
-        *plan.session.endpoint.write() = Some(plan.endpoint);
-    }
+    // Deliberately NO endpoint pin here — see the fn doc. The directive's
+    // reflexive candidate may be a black hole (symmetric NAT); only an
+    // authenticated inbound source (`learn_endpoint`) may repoint a session.
     for i in 0..burst {
         if let Some(bytes) = build_handshake_packet(&plan.session).await {
             // (a) Direct: open OUR local NAT mapping toward the candidate.
@@ -556,6 +558,48 @@ mod tests {
         assert!(
             relayed.is_err(),
             "a confirmed session must not double-relay the punch init"
+        );
+    }
+
+    /// The punch must NEVER repoint a session's outbound endpoint — confirmed
+    /// or not. The old confirmed-only pin was the same clobber class as the
+    /// roster repoint (the MSI symmetric-NAT wedge): the directive's reflexive
+    /// candidate may be a per-destination black hole, and overwriting a
+    /// proven learned endpoint with it wedges TX while the peer's inbound
+    /// keeps the path "fresh". Endpoint ownership belongs to
+    /// `learn_endpoint` (authenticated source adoption) alone.
+    #[tokio::test]
+    async fn execute_punch_never_repoints_a_confirmed_session() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
+        let candidate_addr = receiver.local_addr().expect("recv addr");
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind send"));
+
+        let me = Uuid::from_u128(1);
+        let target = Uuid::from_u128(2);
+        // The session's CURRENT endpoint is a proven learned address that
+        // differs from the punch directive's reflexive candidate.
+        let proven: std::net::SocketAddr = "127.0.0.1:40123".parse().expect("addr");
+        let sessions = session_table_with(target, "fd5a:1f00:1::2", Some("127.0.0.1:40123"));
+        let plan = plan_punch(&sessions, me, &ev(me, target, &candidate_addr.to_string()))
+            .expect("a plan");
+        plan.session.confirm_direct(1_000);
+        assert!(plan.session.direct_confirmed());
+
+        execute_punch(&sender, None, &plan, 1, Duration::from_millis(1)).await;
+
+        // The burst still fired at the candidate (opens OUR NAT mapping)…
+        let mut buf = [0u8; 256];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .expect("a direct datagram within timeout")
+            .expect("recv ok");
+        assert!(n >= 148, "WireGuard handshake-init is 148 bytes, got {n}");
+
+        // …but the session's outbound endpoint is untouched.
+        assert_eq!(
+            plan.session.endpoint(),
+            Some(proven),
+            "the punch must not clobber a confirmed session's endpoint with the directive candidate"
         );
     }
 

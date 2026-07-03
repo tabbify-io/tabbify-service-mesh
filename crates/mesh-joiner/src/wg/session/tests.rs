@@ -326,17 +326,23 @@ fn upsert_installs_per_peer_128_route() {
     assert_eq!(*added, vec![p.ula], "exactly the peer's /128 is routed");
 }
 
-/// Re-upserting the SAME ULA (e.g. an endpoint roam or re-handshake)
-/// must NOT re-install the route — route churn would needlessly
-/// flap the kernel table.
+/// Re-upserting the SAME ULA (an endpoint roam / re-handshake / heartbeat
+/// reconcile) RE-INSTALLS the peer's `/128` route each time — deliberate
+/// self-heal: a route stripped out of band by IP churn is restored on the very
+/// next reconcile (the unconditional install, f901617). It is idempotent at the
+/// kernel (`ip route add` on an existing route is a no-op → no table flap), and
+/// it is always the peer's own /128, never a stray.
 #[test]
-fn re_upsert_same_ula_does_not_duplicate_route() {
+fn re_upsert_same_ula_reinstalls_route_for_self_heal() {
     let sink = Arc::new(RecordingRouteSink::default());
     let t = SessionTable::with_route_sink(sink.clone());
     let me = StaticSecret::from([42u8; 32]);
+    let ula: Ipv6Addr = "fd5a:1f00:1::1".parse().unwrap();
     t.upsert(&me, &info(1, "fd5a:1f00:1::1", Some("127.0.0.1:51820")));
     t.upsert(&me, &info(1, "fd5a:1f00:1::1", Some("10.0.0.5:51820")));
-    assert_eq!(sink.added.lock().len(), 1, "route installed once per ULA");
+    let added = sink.added.lock();
+    assert_eq!(added.len(), 2, "route re-installed on every upsert (idempotent self-heal)");
+    assert!(added.iter().all(|u| *u == ula), "only ever the peer's own /128");
 }
 
 /// Removing a session tears down its `/128` route.
@@ -445,34 +451,115 @@ fn learn_endpoint_repoints_unconfirmed_active_peer() {
     assert!(t.by_endpoint(inbound_src).is_some());
 }
 
-// Fix B sibling — a CONFIRMED direct path must NEVER be clobbered by an
-// ephemeral inbound source. Once a decrypted data packet proved the path
-// works bidirectionally, the confirmed endpoint is authoritative; a
-// differing inbound source is indexed for demux but does NOT repoint the
-// outbound default (that would regress a working path onto an ephemeral
-// NAT mapping with a short lifetime).
+// Classic-WireGuard roaming (the MSI-wedge fix, deliberate contract
+// INVERSION of the old "a confirmed endpoint is authoritative" rule): a
+// source that just AUTHENTICATED under this peer's Tunn is the address the
+// peer verifiably transmits from RIGHT NOW, so it is adopted as the
+// outbound default even on a CONFIRMED session. The old refusal wedged TX
+// forever when the confirmed endpoint had been regressed onto a dead
+// candidate (symmetric-NAT advertised reflexive / roster churn): the
+// peer's live packets kept arriving from its real per-us mapping, but we
+// kept transmitting into the black hole. Kernel WireGuard roams to the
+// latest authenticated source; so do we now.
 #[test]
-fn learn_endpoint_does_not_repoint_confirmed_peer() {
+fn learn_endpoint_adopts_authenticated_source_even_when_confirmed() {
     let t = SessionTable::new();
     let me = StaticSecret::from([42u8; 32]);
     let advertised = "203.0.113.9:51820";
     let p = info(1, "fd5a:1f00:1::1", Some(advertised));
     t.upsert(&me, &p);
     let session = t.by_ula(p.ula).expect("session");
-    // Prove the direct path so the confirmed endpoint becomes authoritative.
     session.confirm_direct(1_000);
     assert!(session.direct_confirmed());
 
     let inbound_src: SocketAddr = "203.0.113.9:40000".parse().unwrap(); // different port
     t.learn_endpoint(&session, inbound_src);
-    // Confirmed → outbound default unchanged (still the advertised endpoint).
+    // Confirmed or not, the authenticated source becomes the outbound default…
     assert_eq!(
         session.endpoint(),
-        Some(advertised.parse().unwrap()),
-        "a confirmed endpoint must not be clobbered by an ephemeral source"
+        Some(inbound_src),
+        "an authenticated inbound source must repoint even a confirmed session"
     );
-    // The new source is still indexed for inbound demux + response targeting.
+    assert!(session.endpoint_learned(), "provenance flips to LEARNED");
+    // …and is indexed for inbound demux + response targeting.
     assert!(t.by_endpoint(inbound_src).is_some());
+}
+
+// THE MSI-wedge regression (symmetric NAT × roster reconcile): a learned,
+// confirmed endpoint must SURVIVE the same-pubkey roster re-upsert that
+// runs on every `peer_updated` + every ~20s heartbeat reconcile. The old
+// `update_in_place` unconditionally repointed the outbound endpoint to the
+// roster's advertised candidate — for a symmetric-NAT peer a per-destination
+// BLACK HOLE — while `direct_confirmed` survived, so `send_wire`'s
+// confirmed branch (direct-only, no relay copy) transmitted into the void
+// forever while the peer's own inbound kept the staleness clock fresh.
+#[test]
+fn same_pubkey_reupsert_does_not_clobber_learned_endpoint() {
+    let t = SessionTable::new();
+    let me = StaticSecret::from([42u8; 32]);
+    // Roster advertises the coordinator-observed reflexive endpoint (the
+    // symmetric-NAT black-hole candidate).
+    let advertised: SocketAddr = "87.116.166.212:51820".parse().unwrap();
+    let p = info(1, "fd5a:1f00:fc22:2::1", Some("87.116.166.212:51820"));
+    t.upsert(&me, &p);
+    let session = t.by_ula(p.ula).expect("session");
+
+    // The peer dials out through its NAT; its authenticated datagrams arrive
+    // from the per-us mapping — learned + then proven bidirectionally.
+    let learned: SocketAddr = "87.116.166.212:40123".parse().unwrap();
+    t.learn_endpoint(&session, learned);
+    session.confirm_direct(1_000);
+    assert_eq!(session.endpoint(), Some(learned));
+
+    // ~20s later: heartbeat reconcile / SSE `peer_updated` re-upserts the
+    // SAME record (same pubkey, advertised candidate unchanged).
+    t.upsert(&me, &p);
+
+    let after = t.by_ula(p.ula).expect("session survives (same pubkey)");
+    assert!(Arc::ptr_eq(&session, &after), "in-place update, same session");
+    assert_eq!(
+        after.endpoint(),
+        Some(learned),
+        "the roster candidate must NOT clobber the learned endpoint (MSI wedge)"
+    );
+    assert!(after.direct_confirmed(), "confirmation survives too");
+    // Both addresses demux inbound to this session.
+    assert!(t.by_endpoint(learned).is_some(), "learned alias kept");
+    assert!(t.by_endpoint(advertised).is_some(), "advertised alias indexed");
+}
+
+// After a staleness downgrade the learned endpoint's provenance is
+// surrendered (`endpoint_learned` cleared), so the NEXT roster re-upsert
+// may legitimately repoint the advertised candidate — the roster-roaming
+// behaviour for a peer whose learned mapping died.
+#[test]
+fn stale_downgrade_reopens_roster_repoint() {
+    let t = SessionTable::new();
+    let me = StaticSecret::from([42u8; 32]);
+    let advertised: SocketAddr = "203.0.113.9:51820".parse().unwrap();
+    let p = info(1, "fd5a:1f00:1::1", Some("203.0.113.9:51820"));
+    t.upsert(&me, &p);
+    let session = t.by_ula(p.ula).expect("session");
+    let learned: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+    t.learn_endpoint(&session, learned);
+    session.confirm_direct(1_000);
+
+    // The learned path goes silent past the TTL → downgrade + provenance
+    // surrender.
+    session.downgrade_direct_if_stale(
+        1_000 + super::peer_session::DIRECT_PATH_TTL_MICROS + 1,
+        super::peer_session::DIRECT_PATH_TTL_MICROS,
+    );
+    assert!(!session.direct_confirmed());
+    assert!(!session.endpoint_learned());
+
+    // The next reconcile may now repoint the roster candidate.
+    t.upsert(&me, &p);
+    assert_eq!(
+        session.endpoint(),
+        Some(advertised),
+        "after a stale downgrade the roster candidate is adoptable again"
+    );
 }
 
 // ---- per-app-ULA routing (consumer side) ----
