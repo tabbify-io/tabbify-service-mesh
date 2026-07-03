@@ -242,14 +242,34 @@ pub async fn apply_event(
                 .filter(|s| s.peer_id == payload.peer_id)
                 .collect();
             for s in candidates {
-                tracing::info!(
-                    peer_id = %s.peer_id,
-                    ula = %s.ula,
-                    endpoint = ?s.endpoint(),
-                    event = "peer_removed",
-                    "peer-stream: removing peer"
-                );
-                sessions.remove(s.ula);
+                // TOCTOU guard. The `snapshot()` above is lock-free, so between
+                // taking it and removing, this sticky ULA may have been
+                // RE-ASSIGNED to a FRESH peer (new pubkey, SAME ULA) — exactly
+                // what an MSI IP-flip re-register does. `remove(s.ula)` keys off
+                // the ULA, so a stale `peer_removed` for the OLD peer would tear
+                // down the NEW peer's session + /128 route, stranding it
+                // routeless. Only remove if the LIVE session at this ULA STILL
+                // belongs to the peer being removed.
+                match sessions.by_ula(s.ula) {
+                    Some(live) if live.peer_id == payload.peer_id => {
+                        tracing::info!(
+                            peer_id = %s.peer_id,
+                            ula = %s.ula,
+                            endpoint = ?s.endpoint(),
+                            event = "peer_removed",
+                            "peer-stream: removing peer"
+                        );
+                        sessions.remove(s.ula);
+                    }
+                    _ => {
+                        tracing::info!(
+                            peer_id = %payload.peer_id,
+                            ula = %s.ula,
+                            event = "peer_removed_skipped",
+                            "peer-stream: skipping stale removal — ULA reassigned to a different peer"
+                        );
+                    }
+                }
             }
         }
         PeerEventKind::HolePunch => {

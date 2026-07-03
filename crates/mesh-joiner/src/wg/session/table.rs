@@ -662,6 +662,17 @@ impl SessionTable {
     /// the `Tunn` across an endpoint-only change is correct.
     pub fn upsert(&self, our_private: &StaticSecret, info: &PeerInfo) {
         let prior = self.by_ula.get(&info.ula).map(|kv| kv.value().clone());
+        // ROUTE SELF-HEAL: (re)install the peer's /128 on EVERY upsert, not just
+        // first-insert. `reconcile_roster` upserts each roster peer every
+        // heartbeat, so making the install UNCONDITIONAL means a route stripped
+        // by a churn race — e.g. a stale `peer_removed` for a ULA that was
+        // re-assigned to a fresh peer during an MSI IP-flip re-register — is
+        // repaired within one heartbeat tick instead of staying routeless
+        // forever. `add_allowed` → `add_peer_route` is idempotent ("File exists"
+        // tolerated), so re-installing an already-present /128 is a cheap no-op.
+        if let Some(sink) = &self.route_sink {
+            sink.add_allowed(info.ula);
+        }
         // SAME-pubkey re-upsert (endpoint / metadata only): keep the live
         // session + Tunn, repointing the endpoint indexes in place.
         if let Some(old) = &prior {
@@ -769,13 +780,10 @@ impl SessionTable {
         if let Some(addr) = info.listen_endpoint {
             self.by_endpoint.insert(addr, session);
         }
-        // TX route scoping: install a per-peer `/128` host route only on
-        // first insert (spec §5.5). The blanket `/48` route is gone.
-        if is_new {
-            if let Some(sink) = &self.route_sink {
-                sink.add_allowed(info.ula);
-            }
-        }
+        // TX route scoping: the per-peer `/128` host route (spec §5.5, the
+        // blanket `/48` is gone) is installed UNCONDITIONALLY at the top of
+        // `upsert` now, so a stripped route self-heals on the next reconcile —
+        // no `is_new` gate here.
     }
 
     /// Update an EXISTING session whose pubkey is unchanged (endpoint /
