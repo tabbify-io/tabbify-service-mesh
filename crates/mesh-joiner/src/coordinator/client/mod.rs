@@ -313,6 +313,16 @@ impl CoordinatorClient {
         };
 
         let http = builder
+            // Self-heal: a dead cellular link must ERROR fast, not hang for the
+            // OS TCP-retransmit timeout (minutes) and stall the heartbeat loop.
+            // connect_timeout bounds the initial connect; tcp_keepalive detects a
+            // half-open pooled connection. NOTE: deliberately NOT a total
+            // `.timeout()` here — the SAME client serves the long-lived SSE
+            // peer-stream (an infinite body), which a total timeout would abort.
+            // Per-request total timeouts are applied on the heartbeat/register
+            // POSTs instead (see `post_json`).
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .tcp_keepalive(std::time::Duration::from_secs(15))
             .build()
             // Debug-format ({e:?}) dumps reqwest's full internal Error struct
             // incl. the hidden inner source (Display alone = a bare "builder
@@ -410,7 +420,13 @@ impl CoordinatorClient {
             relay_only,
         };
         let url = format!("{}/v1/mesh/register", self.base_url);
-        let mut builder = self.http.post(&url).json(&body);
+        // Per-request total timeout: register on a dead link must fail fast so
+        // the caller retries instead of hanging (see heartbeat for rationale).
+        let mut builder = self
+            .http
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&body);
         // Attach the join token as a Bearer credential when present. Use
         // reqwest's `bearer_auth` so the `Authorization: Bearer <token>`
         // header is formatted exactly as the coordinator's extractor
@@ -472,6 +488,10 @@ impl CoordinatorClient {
         let resp = self
             .http
             .post(&url)
+            // Per-request total timeout (safe here — this POST is short, unlike
+            // the SSE peer-stream): a heartbeat on a dead cellular link must fail
+            // in seconds so the loop re-registers promptly, not stall for minutes.
+            .timeout(std::time::Duration::from_secs(10))
             .json(&body)
             .send()
             .await

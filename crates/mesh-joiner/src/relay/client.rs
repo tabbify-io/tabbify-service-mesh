@@ -367,12 +367,40 @@ async fn connect_once(url: &str, task: &mut RelayTask) -> ConnOutcome {
     tracing::info!(url, "relay: connected");
     let (mut sink, mut stream) = ws.split();
 
+    // SELF-HEAL liveness. A cellular blip leaves the TCP half-open (no FIN); an
+    // IDLE relay lane then observes NO frame, NO error and NO close, so the old
+    // loop sat "connected" forever and run()'s reconnect/backoff NEVER fired —
+    // the DERP connectivity floor was silently dead until the process was killed
+    // (the confirmed root cause of "joiner needs a manual restart after a
+    // blip"). Fix: send an app-level Ping on a fixed cadence and require SOME
+    // inbound frame (data, Pong, or a server Ping) within an idle deadline;
+    // otherwise declare the socket dead so run() redials a FRESH WS (which
+    // re-registers this lane with the coordinator).
+    let mut liveness = tokio::time::interval(std::time::Duration::from_secs(15));
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let idle_deadline = std::time::Duration::from_secs(45);
+    let mut last_rx = tokio::time::Instant::now();
+
     loop {
         tokio::select! {
             biased;
             _ = task.shutdown.changed() => {
                 if *task.shutdown.borrow() {
                     return ConnOutcome::ShutdownRequested;
+                }
+            }
+            // Keepalive ping + half-open detection.
+            _ = liveness.tick() => {
+                if last_rx.elapsed() >= idle_deadline {
+                    tracing::warn!(
+                        url, idle_s = last_rx.elapsed().as_secs(),
+                        "relay: no inbound within idle deadline — half-open, reconnecting"
+                    );
+                    return ConnOutcome::Disconnected("idle-timeout");
+                }
+                if let Err(e) = sink.send(Message::Ping(Vec::new())).await {
+                    tracing::warn!(error = %e, "relay: keepalive ping send failed");
+                    return ConnOutcome::Disconnected("ping-send-failed");
                 }
             }
             // Drain THIS lane's outbound queue onto its own socket. There is
@@ -404,14 +432,20 @@ async fn connect_once(url: &str, task: &mut RelayTask) -> ConnOutcome {
                         return ConnOutcome::Disconnected("stream-error");
                     }
                     Some(Ok(Message::Binary(buf))) => {
+                        last_rx = tokio::time::Instant::now();
                         handle_inbound(task, &buf).await;
                     }
                     Some(Ok(Message::Close(_))) => {
                         return ConnOutcome::Disconnected("close");
                     }
-                    // Ping/Pong handled by the protocol layer; Text is not
-                    // part of the relay contract — ignore.
-                    Some(Ok(_)) => {}
+                    // Ping/Pong/Text carry no relay payload, but their arrival is
+                    // PROOF the socket is alive — refresh the liveness clock so a
+                    // busy-but-dataless lane is never torn down as half-open.
+                    // (tungstenite auto-replies Pong to server Pings and surfaces
+                    // our own Pong replies here.)
+                    Some(Ok(_)) => {
+                        last_rx = tokio::time::Instant::now();
+                    }
                 }
             }
         }
