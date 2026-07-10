@@ -255,3 +255,97 @@ async fn re_register_restamps_tags_from_claims() {
         "re-register tags must still come from claims"
     );
 }
+
+/// Authenticated network RE-HOME: a same-pubkey re-register whose validated
+/// claims name a DIFFERENT network moves the peer — its `network`, `ula` (into
+/// the new network's slot), and `tags` are all reconciled to the new claims.
+/// This is the dedik system→tenant retag: one wireguard identity, a fresh join
+/// token bound to a new network. A subsequent same-network re-register is then
+/// STABLE (no ULA thrash back to the old sticky address the joiner keeps
+/// re-requesting).
+#[tokio::test]
+async fn re_register_rehomes_peer_to_new_network_from_claims() {
+    use wiremock::matchers::body_string_contains;
+
+    let server = MockServer::start().await;
+    // Two token-keyed validate responses on the same auth endpoint so the two
+    // registers resolve to DIFFERENT networks deterministically.
+    Mock::given(method("POST"))
+        .and(path("/v1/validate"))
+        .and(body_string_contains("tok-alpha"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "valid": true,
+            "subject": "dedik",
+            "network": "alpha",
+            "tags": ["tag:net-alpha"],
+            "kind": "join",
+            "exp": 1_900_000_000_i64,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/validate"))
+        .and(body_string_contains("tok-beta"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "valid": true,
+            "subject": "dedik",
+            "network": "beta",
+            "tags": ["tag:net-beta", "tag:deploy-beta"],
+            "kind": "join",
+            "exp": 1_900_000_000_i64,
+        })))
+        .mount(&server)
+        .await;
+    let c = coordinator_with_validator(AuthValidator::new(server.uri()).unwrap());
+
+    // First join: network alpha. The request self-asserts junk that the claims
+    // override; `requested_ula` stays None so it lands on an idx-based ULA in
+    // alpha's slot.
+    let (first, o1) = c
+        .register_authenticated(req_with(11, "junk", &["tag:spoof"]), Some("tok-alpha"), None)
+        .await
+        .expect("first join");
+    assert_eq!(o1, RegisterOutcome::Created);
+    assert_eq!(first.network, "alpha");
+    assert_eq!(first.tags, vec!["tag:net-alpha".to_owned()]);
+
+    // Re-tag: SAME pubkey (seed 11), a beta-network token. The peer is re-homed.
+    // Its request STILL carries the alpha sticky ULA — proving the re-home
+    // ignores `requested_ula` and allocates fresh in beta's slot.
+    let mut retagged = req_with(11, "junk", &["tag:spoof"]);
+    retagged.requested_ula = Some(first.ula.to_string());
+    let (second, o2) = c
+        .register_authenticated(retagged, Some("tok-beta"), None)
+        .await
+        .expect("re-home");
+    assert_eq!(o2, RegisterOutcome::Existed, "same pubkey → still a re-register");
+    assert_eq!(first.peer_id, second.peer_id, "identity (peer_id) is preserved");
+    assert_eq!(second.network, "beta", "network reconciled to the new claims");
+    assert_eq!(
+        second.tags,
+        vec!["tag:net-beta".to_owned(), "tag:deploy-beta".to_owned()],
+        "tags replaced wholesale — the alpha tag is dropped",
+    );
+    assert_ne!(
+        first.ula, second.ula,
+        "a re-home allocates a fresh ULA in the new network's slot",
+    );
+    assert_ne!(
+        first.ula.segments()[2],
+        second.ula.segments()[2],
+        "the ULA moved into a different network slot",
+    );
+
+    // Stability: a third same-pubkey re-register on the SAME (beta) network must
+    // NOT move the ULA again — even though the joiner keeps re-requesting its old
+    // alpha sticky address. This is what stops a post-retag restart from thrashing.
+    let mut again = req_with(11, "junk", &["tag:spoof"]);
+    again.requested_ula = Some(first.ula.to_string());
+    let (third, o3) = c
+        .register_authenticated(again, Some("tok-beta"), None)
+        .await
+        .expect("steady re-register");
+    assert_eq!(o3, RegisterOutcome::Existed);
+    assert_eq!(third.network, "beta");
+    assert_eq!(third.ula, second.ula, "same-network re-register is ULA-stable");
+}

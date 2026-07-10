@@ -121,13 +121,14 @@ impl Coordinator {
 
         // Re-registration path. Holding the by_pubkey shard lock while
         // we look up the peer_id is fine — the roster is keyed by
-        // peer_id, so there's no inverse-lookup contention.
+        // peer_id, so there's no inverse-lookup contention. `refresh_existing`
+        // owns its own event emission (a steady `Updated`, or a re-home's
+        // `Removed`+`Added` when validated claims move the peer to a new
+        // network) so the ULA-move re-advertise stays in one place.
         if let Some(existing_id) = self.inner.by_pubkey.get(&pubkey).map(|v| *v) {
-            let entry =
-                self.refresh_existing(existing_id, &req, claims.as_ref(), &resolved, observed)?;
-            self.inner
-                .broadcaster
-                .broadcast(PeerEvent::Updated(entry.to_info()));
+            let entry = self
+                .refresh_existing(existing_id, &req, claims.as_ref(), &resolved, observed)
+                .await?;
             return Ok((entry, RegisterOutcome::Existed));
         }
 
@@ -257,7 +258,37 @@ impl Coordinator {
         }
     }
 
-    fn refresh_existing(
+    /// Refresh an existing peer's record on a same-`wg_public_key`
+    /// re-register. Owns its own event emission.
+    ///
+    /// Two modes:
+    ///
+    /// - **Steady (default):** re-stamp identity (endpoint / tags / metadata)
+    ///   IN PLACE at the peer's existing ULA and broadcast `Updated`. The tags
+    ///   flow through the same authoritative seam as first-time register so a
+    ///   re-register can't smuggle in spoofed identity tags (validated claims
+    ///   win when present).
+    ///
+    /// - **Network re-home (authenticated):** when the register presents
+    ///   VALIDATED claims whose `network` DIFFERS from the stored one — a host
+    ///   re-tagged from one network to another with a fresh join token bound to
+    ///   the SAME wireguard identity (the dedik system→tenant case) — move the
+    ///   peer: allocate a FRESH ULA in the new network's slot, reconcile
+    ///   `network` + `ula` + `tags`, and re-advertise the `/128` as
+    ///   `Removed(old)` then `Added(new)` so every joiner tears down the old
+    ///   slot's session/route (the joiner keys sessions by ULA and only drops
+    ///   them on `Removed` — a bare `Updated` would strand the old-ULA session)
+    ///   and installs the new one. Persisted so the move survives a coordinator
+    ///   restart.
+    ///
+    /// The re-home is GATED on validated claims: an unauthenticated / escape-
+    /// hatch re-register never moves networks, so a re-register can no more
+    /// smuggle a peer into another network than it can spoof identity tags —
+    /// the move requires a token the auth service signed for the new network.
+    /// `req.requested_ula` (which still carries the peer's OLD sticky ULA, in
+    /// the OLD network's slot) is intentionally ignored on a re-home: it is
+    /// meaningless in the new network, so a fresh idx-based ULA is allocated.
+    async fn refresh_existing(
         &self,
         peer_id: Uuid,
         req: &RegisterRequest,
@@ -265,25 +296,43 @@ impl Coordinator {
         resolved: &ResolvedEndpoint,
         observed: Option<SocketAddr>,
     ) -> Result<PeerEntry, CoordinatorError> {
-        // Re-stamp identity through the same authoritative seam as
-        // first-time register so a re-register can't be used to smuggle in
-        // spoofed tags either: the validated claims win when present. The
-        // network is NOT changed on re-register: a peer keeps the ULA block
-        // it was first allocated in (changing it would orphan its address).
         let identity = stamp_identity(req, claims);
-        let entry = {
+
+        // Detect an AUTHENTICATED network change. Only a validated-claims
+        // re-register may move a peer between networks; the escape hatch keeps
+        // the legacy "network never changes on re-register" behavior.
+        let old_network = self
+            .inner
+            .roster
+            .get(&peer_id)
+            .map(|e| e.network.clone())
+            .ok_or(CoordinatorError::UnknownPeer(peer_id))?;
+        let rehome = claims.is_some() && identity.network != old_network;
+
+        // A re-home allocates the fresh ULA BEFORE taking the roster write
+        // guard: the allocator is a distinct lock and can fail (exhaustion), so
+        // a failed allocation must leave the entry untouched (fail closed).
+        let realloc = if rehome {
+            Some(self.inner.allocator.allocate(&identity.network)?)
+        } else {
+            None
+        };
+
+        let (entry, old_ula, old_tags) = {
             let mut e = self
                 .inner
                 .roster
                 .get_mut(&peer_id)
                 .ok_or(CoordinatorError::UnknownPeer(peer_id))?;
+            let old_ula = e.ula;
+            let old_tags = e.tags.clone();
             // Store the reflexive-resolved endpoint, not the raw
             // self-report — a re-register from behind NAT must refresh the
             // peer's reachable endpoint, not regress it to a loopback guess.
             e.listen_endpoint.clone_from(&resolved.endpoint);
             e.endpoint_is_reflexive = resolved.reflexive;
             e.display_name.clone_from(&req.display_name);
-            e.tags = identity.tags;
+            e.tags.clone_from(&identity.tags);
             // Refresh the hosted app-ULA set from the (re-)register request
             // so a re-register reflects the supervisor's current hosting
             // state, mirroring the heartbeat replace semantics.
@@ -309,9 +358,50 @@ impl Coordinator {
             if let Some(obs) = observed {
                 e.observed_external = obs.to_string();
             }
-            e.clone()
+            // Re-home: move the peer into the new network at its fresh ULA.
+            if let Some((new_index, new_ula)) = realloc {
+                e.network.clone_from(&identity.network);
+                e.ula = new_ula;
+                e.peer_index = new_index;
+            }
+            (e.clone(), old_ula, old_tags)
         };
-        info!(peer_id = %peer_id, "peer re-registered (idempotent)");
+
+        if rehome {
+            info!(
+                peer_id = %peer_id,
+                display_name = %entry.display_name,
+                old_network = %old_network,
+                new_network = %entry.network,
+                old_ula = %old_ula,
+                new_ula = %entry.ula,
+                old_tags = ?old_tags,
+                new_tags = ?entry.tags,
+                "peer re-homed to a new network on authenticated re-register \
+                 (fresh ULA allocated, /128 re-advertised)",
+            );
+            // Re-advertise the /128: tear down the OLD slot's session/route on
+            // every joiner FIRST (the `Removed` frame carries the OLD tags so
+            // the same ACL-filtered set of viewers that had the old peer drop
+            // it), then install the NEW ULA via `Added`. Ordering matters —
+            // `Removed` before `Added` — so a viewer never briefly holds two
+            // sessions for one peer.
+            self.inner.broadcaster.broadcast(PeerEvent::Removed {
+                peer_id: peer_id.to_string(),
+                tags: old_tags,
+            });
+            self.inner
+                .broadcaster
+                .broadcast(PeerEvent::Added(entry.to_info()));
+            // Membership changed (network + ULA) — persist so a coordinator
+            // restart restores the peer in its NEW network/slot, not the old.
+            self.persist_roster().await;
+        } else {
+            info!(peer_id = %peer_id, "peer re-registered (idempotent)");
+            self.inner
+                .broadcaster
+                .broadcast(PeerEvent::Updated(entry.to_info()));
+        }
         Ok(entry)
     }
 
