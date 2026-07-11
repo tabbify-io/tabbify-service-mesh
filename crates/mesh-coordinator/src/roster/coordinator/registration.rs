@@ -22,6 +22,21 @@ use std::time::Instant;
 use tracing::info;
 use uuid::Uuid;
 
+/// Second 16-bit segment (`segments()[1]`) of the coordinator's host/infra
+/// ULA block (`fd5a:1f00:…`). Distinct from the supervisor-minted
+/// per-app-runner slot (`fd5a:1f02:…`, `is_ephemeral_peer` in `mesh-joiner`).
+const HOST_ULA_SLOT: u16 = 0x1f00;
+
+/// The ULA index (`segments()[3]`) that the dynamic allocator NEVER hands out
+/// (it starts at 1). A `requested_ula` with `idx == 0` is therefore a FIXED
+/// platform-infra address (e.g. the forge's `fd5a:1f00:ffff::1`) rather than a
+/// normal host peer, so it is the one gated behind an `infra`/`forge` tag —
+/// normal host ULAs (`idx >= 1`) keep their existing conflict semantics.
+const INFRA_ULA_IDX: u16 = 0;
+
+/// Identity tags that authorize claiming a fixed infra `requested_ula`.
+const INFRA_ULA_TAGS: [&str; 2] = ["infra", "forge"];
+
 impl Coordinator {
     /// Register (or re-register) a peer — escape-hatch convenience that
     /// performs **no** join-token validation and supplies **no** observed
@@ -149,7 +164,7 @@ impl Coordinator {
         // peer — prevented from reaching here by the re-registration guard
         // above). Fall back to idx-based allocation otherwise.
         let (peer_index, ula) =
-            self.resolve_ula(&identity.network, req.requested_ula.as_deref())?;
+            self.resolve_ula(&identity.network, &identity.tags, req.requested_ula.as_deref())?;
         let peer_id = Uuid::now_v7();
         let now_micros = now_unix_micros();
         let event = PeerJoined {
@@ -506,13 +521,41 @@ impl Coordinator {
     /// normal sequential idx-based allocation (malformed ULA silently falls
     /// through to idx-based; the caller learns the assigned address from the
     /// returned `PeerEntry`, not the request).
+    ///
+    /// Infra-address hardening: a `requested_ula` in the host slot
+    /// (`segments()[1] == 0x1f00`) with `idx == 0` (`segments()[3]`) is a
+    /// FIXED platform-infra address — the allocator never hands out `idx 0`,
+    /// so the forge's `fd5a:1f00:ffff::1` and its kin live only there. Such an
+    /// address may be claimed only by a peer whose AUTHORITATIVE identity
+    /// `tags` carry `infra` or `forge`; any other peer is rejected with
+    /// [`CoordinatorError::Unauthorized`] BEFORE the uniqueness scan, so an
+    /// unauthorized caller can neither pin nor probe the address. Normal host
+    /// ULAs (`idx >= 1`) and app-runner requests (`0x1f02` slot) are
+    /// unaffected — they keep their existing conflict semantics. The tags are
+    /// the coordinator-stamped set (validated claims in production, the
+    /// request in the dev escape hatch) — never the raw self-report.
     fn resolve_ula(
         &self,
         network: &str,
+        tags: &[String],
         requested_ula: Option<&str>,
     ) -> Result<(u16, Ipv6Addr), CoordinatorError> {
         if let Some(raw) = requested_ula {
             if let Ok(addr) = raw.parse::<Ipv6Addr>() {
+                // Infra-address gate (fail closed, checked FIRST): claiming a
+                // fixed `fd5a:1f00:…::` address (host slot, idx 0) requires an
+                // `infra`/`forge` tag. Without it ANY peer could pin the
+                // forge's fixed address and black-hole it. Rejecting before
+                // the uniqueness scan also avoids leaking claim state.
+                let segs = addr.segments();
+                if segs[1] == HOST_ULA_SLOT
+                    && segs[3] == INFRA_ULA_IDX
+                    && !tags.iter().any(|t| INFRA_ULA_TAGS.contains(&t.as_str()))
+                {
+                    return Err(CoordinatorError::Unauthorized(format!(
+                        "requested infra ULA {raw} requires an infra/forge tag"
+                    )));
+                }
                 // Uniqueness check: scan the roster for any peer already
                 // holding this exact ULA. The re-registration path (same
                 // wg_public_key) was already handled above — so if we find

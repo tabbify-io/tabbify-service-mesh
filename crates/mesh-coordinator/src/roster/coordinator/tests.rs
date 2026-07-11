@@ -1625,6 +1625,108 @@ async fn register_rejects_requested_ula_claimed_by_different_peer() {
     assert_eq!(c.snapshot().len(), 1);
 }
 
+// Task 9 — infra-ULA hardening: the coordinator-allocated `fd5a:1f00:…`
+// slot is the host/infra block (as opposed to the supervisor-minted
+// `fd5a:1f02:…` per-app-runner slot). A `requested_ula` in the infra slot
+// pins a platform-privileged address (e.g. the forge's fixed infra ULA), so
+// it MUST carry an `infra`/`forge` tag in its authoritative identity;
+// otherwise ANY peer could claim the forge's address and black-hole it.
+// App-runner (`1f02`) requests stay unchanged.
+// -----------------------------------------------------------------
+
+/// Build a register with an explicit `requested_ula` AND explicit identity
+/// tags (the default `req` helper hardcodes `["dev-machine"]`).
+fn req_with_ula_and_tags(
+    seed: u8,
+    name: &str,
+    requested_ula: &str,
+    tags: &[&str],
+) -> RegisterRequest {
+    RegisterRequest {
+        requested_ula: Some(requested_ula.into()),
+        tags: tags.iter().map(|s| (*s).to_owned()).collect(),
+        ..req(seed, name)
+    }
+}
+
+/// An untagged peer requesting an infra-slot (`fd5a:1f00:…`) ULA is rejected
+/// with `Unauthorized` and leaves no roster entry.
+#[tokio::test]
+async fn register_rejects_infra_ula_without_infra_or_forge_tag() {
+    let c = coordinator();
+    // The fixed forge infra ULA: `1f00` slot, idx (segments[3]) == 0.
+    let infra = "fd5a:1f00:ffff::1";
+    let err = c
+        .register(req_with_ula_and_tags(80, "impostor", infra, &["dev-machine"]))
+        .await
+        .expect_err("an untagged peer must not claim an infra ULA");
+    assert!(
+        matches!(err, CoordinatorError::Unauthorized(_)),
+        "expected Unauthorized, got {err:?}"
+    );
+    assert_eq!(
+        c.snapshot().len(),
+        0,
+        "the rejected register must leave no roster entry"
+    );
+}
+
+/// A `forge`-tagged peer is allowed to claim the infra ULA verbatim.
+#[tokio::test]
+async fn register_honours_infra_ula_with_forge_tag() {
+    let c = coordinator();
+    let infra = "fd5a:1f00:ffff::1";
+    let (entry, outcome) = c
+        .register(req_with_ula_and_tags(81, "forge", infra, &["forge"]))
+        .await
+        .expect("a forge-tagged peer may claim the infra ULA");
+    assert_eq!(outcome, RegisterOutcome::Created);
+    assert_eq!(entry.ula.to_string(), infra);
+}
+
+/// An `infra`-tagged peer is likewise allowed to claim an infra-slot ULA.
+#[tokio::test]
+async fn register_honours_infra_ula_with_infra_tag() {
+    let c = coordinator();
+    let infra = "fd5a:1f00:ffff::2";
+    let (entry, _) = c
+        .register(req_with_ula_and_tags(82, "infra", infra, &["infra"]))
+        .await
+        .expect("an infra-tagged peer may claim the infra ULA");
+    assert_eq!(entry.ula.to_string(), infra);
+}
+
+/// App-runner (`1f02`) requests are NOT gated: a plain, non-infra peer still
+/// claims its `derive_app_ula` address exactly as before.
+#[tokio::test]
+async fn register_still_honours_app_ula_without_infra_tag() {
+    let c = coordinator();
+    let app = "fd5a:1f02:1234::1";
+    let (entry, outcome) = c
+        .register(req_with_ula_and_tags(83, "runner", app, &["dev-machine"]))
+        .await
+        .expect("an app-slot ULA needs no infra tag");
+    assert_eq!(outcome, RegisterOutcome::Created);
+    assert_eq!(entry.ula.to_string(), app);
+}
+
+/// The gate is narrowed to FIXED infra addresses (`idx == 0`): a normal host
+/// ULA in the `1f00` slot with a non-zero index is NOT gated, so a plain peer
+/// still claims it without an infra tag — the general host-ULA conflict
+/// semantics are untouched.
+#[tokio::test]
+async fn register_still_honours_non_infra_host_ula_without_tag() {
+    let c = coordinator();
+    // `1f00` slot but idx (segments[3]) == 7 → a normal host ULA, not infra.
+    let host = "fd5a:1f00:0:7::1";
+    let (entry, outcome) = c
+        .register(req_with_ula_and_tags(84, "host", host, &["dev-machine"]))
+        .await
+        .expect("a non-idx-0 host ULA needs no infra tag");
+    assert_eq!(outcome, RegisterOutcome::Created);
+    assert_eq!(entry.ula.to_string(), host);
+}
+
 /// Raw 32-byte pubkey for a register seed — the bytes `pubkey(seed)`
 /// base64-encodes. Lets a test register a relay connection under the SAME
 /// key a peer registered with, so it can assert the connection is torn
