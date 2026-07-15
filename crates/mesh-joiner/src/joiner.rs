@@ -169,7 +169,10 @@ impl Joiner {
             relay_only = config.relay_enabled && config.relay_only,
             "joiner: starting join_with_commands"
         );
-        tracing::info!(phase = "resolve_identity", "joiner: resolving local identity");
+        tracing::info!(
+            phase = "resolve_identity",
+            "joiner: resolving local identity"
+        );
         let (keypair, sticky_ula, effective_requested_ula) = resolve_identity(&config)?;
 
         // 1) Open the UDP socket. We bind to v4 wildcard because the
@@ -188,7 +191,11 @@ impl Joiner {
         //    test) we fall back to an OS-picked port so the bind still
         //    succeeds.
         let preferred_port = config.listen_port.unwrap_or(DEFAULT_WG_LISTEN_PORT);
-        tracing::info!(phase = "bind_wg_socket", preferred_port, "joiner: binding WG UDP socket");
+        tracing::info!(
+            phase = "bind_wg_socket",
+            preferred_port,
+            "joiner: binding WG UDP socket"
+        );
         let (socket, wg_listen_port) = bind_wg_socket(preferred_port)?;
 
         // 1b) Track A-a: if a STUN server is configured, discover the WG
@@ -274,12 +281,8 @@ impl Joiner {
             *keypair.public.as_bytes(),
             effective_requested_ula.as_ref(),
         );
-        // Cold-start register, with the SAME sticky-then-free 409 self-heal the
-        // heartbeat re-register uses: if the requested (sticky) ULA is held by
-        // a stale peer the coordinator hasn't evicted yet, retry once with a
-        // coordinator-allocated address rather than failing the entire join.
-        // Guarantees a node ALWAYS joins (defense in depth alongside the
-        // coordinator's adopt-on-stale eviction).
+        // Cold-start register. Persisted sticky identity conflicts may recover
+        // through allocation; an explicit requested ULA remains strict.
         tracing::info!(
             phase = "register",
             coordinator = %config.coordinator_url,
@@ -384,8 +387,7 @@ impl Joiner {
         // rejected); a `None` sink → a no-op sink — so a host that does not opt
         // into remote commands never acts. The supervisor passes the real
         // super-admin pubkey + a process-restart sink (Track C C9).
-        let nonce_path =
-            command_nonce_path.unwrap_or_else(|| default_command_nonce_path(&config));
+        let nonce_path = command_nonce_path.unwrap_or_else(|| default_command_nonce_path(&config));
         let command_gate =
             crate::coordinator::command_gate::CommandGate::new(super_admin_pubkey, &nonce_path);
         let command_sink: Arc<dyn crate::coordinator::command_exec::CommandSink> = command_sink
@@ -1054,11 +1056,16 @@ fn resolve_identity(
         (kp, None)
     };
 
-    // Sticky ULA from a prior identity file takes precedence over any
-    // explicit `config.requested_ula` (re-request path on restart).
-    let effective_requested_ula = sticky_ula
-        .map(|u| u.to_string())
-        .or_else(|| config.requested_ula.clone());
+    let effective_requested_ula = match (&config.requested_ula, sticky_ula) {
+        (Some(requested), Some(sticky)) if requested != &sticky.to_string() => {
+            anyhow::bail!(
+                "explicit requested ULA {requested} differs from persisted identity ULA {sticky}"
+            );
+        }
+        (Some(requested), _) => Some(requested.clone()),
+        (None, Some(sticky)) => Some(sticky.to_string()),
+        (None, None) => None,
+    };
 
     Ok((keypair, sticky_ula, effective_requested_ula))
 }
@@ -1109,6 +1116,7 @@ fn build_reregister_inputs(
         tags: config.tags.clone(),
         join_token: config.join_token.clone(),
         requested_ula: effective_requested_ula.cloned(),
+        strict_requested_ula: config.requested_ula.is_some(),
         kind: config.kind.clone(),
         parent: config.parent.clone(),
         app_uuid: config.app_uuid.clone(),
@@ -1140,9 +1148,10 @@ fn default_command_nonce_path(config: &JoinConfig) -> std::path::PathBuf {
         .as_ref()
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| {
-            default_keypair_path()
-                .parent()
-                .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf)
+            default_keypair_path().parent().map_or_else(
+                || std::path::PathBuf::from("."),
+                std::path::Path::to_path_buf,
+            )
         });
     dir.join("mesh-command-nonces.json")
 }
@@ -1535,7 +1544,10 @@ mod tests {
         let port = first.local_addr().expect("local_addr").port();
         let again = make_reusable_udp(SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), port));
         #[cfg(target_os = "linux")]
-        assert!(again.is_ok(), "SO_REUSEPORT allows a second bind of the same port");
+        assert!(
+            again.is_ok(),
+            "SO_REUSEPORT allows a second bind of the same port"
+        );
         // Keep `first` alive across the second bind attempt.
         drop(first);
         let _ = again;

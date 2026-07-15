@@ -25,7 +25,8 @@ pub fn coord_err_to_response(err: &CoordinatorError) -> Response {
         CoordinatorError::Allocation(_) => StatusCode::SERVICE_UNAVAILABLE,
         CoordinatorError::InvalidPeerId(_)
         | CoordinatorError::InvalidPubkey(_)
-        | CoordinatorError::PubkeyDecode(_) => StatusCode::BAD_REQUEST,
+        | CoordinatorError::PubkeyDecode(_)
+        | CoordinatorError::InvalidRequestedUla(_) => StatusCode::BAD_REQUEST,
         // A failed join-token validation (missing / invalid / revoked /
         // wrong-kind / validator unreachable) rejects the register.
         CoordinatorError::Unauthorized(_) => StatusCode::UNAUTHORIZED,

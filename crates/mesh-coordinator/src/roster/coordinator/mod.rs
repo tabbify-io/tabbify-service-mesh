@@ -255,6 +255,9 @@ pub enum CoordinatorError {
     /// The base64 `wg_public_key` was malformed.
     #[error("invalid base64 in wg_public_key: {0}")]
     PubkeyDecode(String),
+    /// `requested_ula` must be a syntactically valid IPv6 ULA.
+    #[error("invalid requested ULA: {0}")]
+    InvalidRequestedUla(String),
     /// The peer index space is exhausted.
     #[error(transparent)]
     Allocation(#[from] crate::roster::allocator::AllocError),
@@ -299,6 +302,9 @@ pub(crate) struct Inner {
     pub(crate) roster: DashMap<Uuid, PeerEntry>,
     pub(crate) by_pubkey: DashMap<Vec<u8>, Uuid>,
     pub(crate) allocator: UlaAllocator,
+    /// Serializes stale eviction, allocation, publish and apply as one register
+    /// transaction so two exact-ULA requests cannot both pass uniqueness.
+    pub(crate) registration_lock: tokio::sync::Mutex<()>,
     pub(crate) publisher: SharedPublisher,
     pub(crate) broadcaster: PeerBroadcaster,
     /// Live ACL policy. The coordinator filters every node's view of the
@@ -422,6 +428,7 @@ impl Coordinator {
                 roster: DashMap::new(),
                 by_pubkey: DashMap::new(),
                 allocator: UlaAllocator::new(),
+                registration_lock: tokio::sync::Mutex::new(()),
                 publisher,
                 broadcaster: PeerBroadcaster::new(),
                 policy,
@@ -712,9 +719,9 @@ impl Coordinator {
                     // CAP. Reuses the existing per-pair `direct` signal — no new
                     // wire field. Canonical key so either reporter hits the same.
                     if p.direct {
-                        self.inner
-                            .punch_tracker
-                            .note_confirmed(crate::nat::holepunch::canonical_pair(reporter, target));
+                        self.inner.punch_tracker.note_confirmed(
+                            crate::nat::holepunch::canonical_pair(reporter, target),
+                        );
                     }
                 }
             }

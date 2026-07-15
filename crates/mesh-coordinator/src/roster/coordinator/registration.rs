@@ -30,12 +30,9 @@ const HOST_ULA_SLOT: u16 = 0x1f00;
 /// The ULA index (`segments()[3]`) that the dynamic allocator NEVER hands out
 /// (it starts at 1). A `requested_ula` with `idx == 0` is therefore a FIXED
 /// platform-infra address (e.g. the forge's `fd5a:1f00:ffff::1`) rather than a
-/// normal host peer, so it is the one gated behind an `infra`/`forge` tag —
+/// normal host peer, so it requires an exact signed join-token capability —
 /// normal host ULAs (`idx >= 1`) keep their existing conflict semantics.
 const INFRA_ULA_IDX: u16 = 0;
-
-/// Identity tags that authorize claiming a fixed infra `requested_ula`.
-const INFRA_ULA_TAGS: [&str; 2] = ["infra", "forge"];
 
 impl Coordinator {
     /// Register (or re-register) a peer — escape-hatch convenience that
@@ -115,6 +112,7 @@ impl Coordinator {
         // absent, preserving the prior validate behavior.
         let pubkey_b64 = Some(req.wg_public_key.trim()).filter(|k| !k.is_empty());
         let claims = self.authenticate(bearer, pubkey_b64).await?;
+        authorize_fixed_requested_ula(req.requested_ula.as_deref(), claims.as_ref())?;
 
         let pubkey = decode_pubkey(&req.wg_public_key)?;
         if pubkey.len() != 32 {
@@ -133,6 +131,11 @@ impl Coordinator {
             req.wg_listen_port,
             req.relay_only,
         );
+
+        // Hold one transaction boundary through stale eviction, allocation,
+        // event publication and apply. The prior scan/publish/apply sequence
+        // allowed two concurrent exact-ULA requests to both succeed.
+        let _registration = self.inner.registration_lock.lock().await;
 
         // Re-registration path. Holding the by_pubkey shard lock while
         // we look up the peer_id is fine — the roster is keyed by
@@ -164,7 +167,7 @@ impl Coordinator {
         // peer — prevented from reaching here by the re-registration guard
         // above). Fall back to idx-based allocation otherwise.
         let (peer_index, ula) =
-            self.resolve_ula(&identity.network, &identity.tags, req.requested_ula.as_deref())?;
+            self.resolve_ula(&identity.network, req.requested_ula.as_deref())?;
         let peer_id = Uuid::now_v7();
         let now_micros = now_unix_micros();
         let event = PeerJoined {
@@ -517,65 +520,81 @@ impl Coordinator {
     ///   network block don't collide. The returned `peer_index` is derived
     ///   from the address layout (`segments()[3]`), matching `apply_peer_joined`.
     ///
-    /// When `requested_ula` is `None` or malformed → fall back to the
-    /// normal sequential idx-based allocation (malformed ULA silently falls
-    /// through to idx-based; the caller learns the assigned address from the
-    /// returned `PeerEntry`, not the request).
+    /// When `requested_ula` is `None`, use normal sequential allocation.
+    /// Malformed, non-IPv6, and non-ULA requests fail closed.
     ///
     /// Infra-address hardening: a `requested_ula` in the host slot
     /// (`segments()[1] == 0x1f00`) with `idx == 0` (`segments()[3]`) is a
     /// FIXED platform-infra address — the allocator never hands out `idx 0`,
     /// so the forge's `fd5a:1f00:ffff::1` and its kin live only there. Such an
-    /// address may be claimed only by a peer whose AUTHORITATIVE identity
-    /// `tags` carry `infra` or `forge`; any other peer is rejected with
+    /// address may be claimed only when the validated join token carries that
+    /// exact address in `requested_ulas`; any other peer is rejected with
     /// [`CoordinatorError::Unauthorized`] BEFORE the uniqueness scan, so an
     /// unauthorized caller can neither pin nor probe the address. Normal host
     /// ULAs (`idx >= 1`) and app-runner requests (`0x1f02` slot) are
-    /// unaffected — they keep their existing conflict semantics. The tags are
-    /// the coordinator-stamped set (validated claims in production, the
-    /// request in the dev escape hatch) — never the raw self-report.
+    /// unaffected — they keep their existing conflict semantics. The check runs
+    /// before stale-holder eviction and never reads self-advertised tags.
     fn resolve_ula(
         &self,
         network: &str,
-        tags: &[String],
         requested_ula: Option<&str>,
     ) -> Result<(u16, Ipv6Addr), CoordinatorError> {
         if let Some(raw) = requested_ula {
-            if let Ok(addr) = raw.parse::<Ipv6Addr>() {
-                // Infra-address gate (fail closed, checked FIRST): claiming a
-                // fixed `fd5a:1f00:…::` address (host slot, idx 0) requires an
-                // `infra`/`forge` tag. Without it ANY peer could pin the
-                // forge's fixed address and black-hole it. Rejecting before
-                // the uniqueness scan also avoids leaking claim state.
-                let segs = addr.segments();
-                if segs[1] == HOST_ULA_SLOT
-                    && segs[3] == INFRA_ULA_IDX
-                    && !tags.iter().any(|t| INFRA_ULA_TAGS.contains(&t.as_str()))
-                {
-                    return Err(CoordinatorError::Unauthorized(format!(
-                        "requested infra ULA {raw} requires an infra/forge tag"
-                    )));
-                }
-                // Uniqueness check: scan the roster for any peer already
-                // holding this exact ULA. The re-registration path (same
-                // wg_public_key) was already handled above — so if we find
-                // a match here it MUST be a different peer.
-                let already_claimed = self.inner.roster.iter().any(|kv| kv.value().ula == addr);
-                if already_claimed {
-                    return Err(CoordinatorError::UlaConflict(raw.to_owned()));
-                }
-                // Honour the requested address. Derive the index from the
-                // address layout (`fd5a:1f00:<slot>:<idx>::1`) so the
-                // PeerEntry and the allocator stay consistent.
-                let peer_index = addr.segments()[3];
-                let slot = addr.segments()[2];
-                // Advance the allocator so subsequent idx-based allocations
-                // in this network block skip past the manually-assigned index.
-                self.inner.allocator.bump_slot_at_least(slot, peer_index);
-                return Ok((peer_index, addr));
+            let addr = raw
+                .parse::<Ipv6Addr>()
+                .map_err(|_| CoordinatorError::InvalidRequestedUla(raw.to_owned()))?;
+            if addr.segments()[0] & 0xfe00 != 0xfc00 {
+                return Err(CoordinatorError::InvalidRequestedUla(raw.to_owned()));
             }
+            // Uniqueness check: scan the roster for any peer already
+            // holding this exact ULA. The re-registration path (same
+            // wg_public_key) was already handled above — so if we find
+            // a match here it MUST be a different peer.
+            let already_claimed = self.inner.roster.iter().any(|kv| kv.value().ula == addr);
+            if already_claimed {
+                return Err(CoordinatorError::UlaConflict(raw.to_owned()));
+            }
+            // Honour the requested address. Derive the index from the
+            // address layout (`fd5a:1f00:<slot>:<idx>::1`) so the
+            // PeerEntry and the allocator stay consistent.
+            let peer_index = addr.segments()[3];
+            let slot = addr.segments()[2];
+            // Advance the allocator so subsequent idx-based allocations
+            // in this network block skip past the manually-assigned index.
+            self.inner.allocator.bump_slot_at_least(slot, peer_index);
+            return Ok((peer_index, addr));
         }
         // Fall back to the standard sequential idx-based allocation.
         Ok(self.inner.allocator.allocate(network)?)
+    }
+}
+
+fn authorize_fixed_requested_ula(
+    requested_ula: Option<&str>,
+    claims: Option<&ValidatedClaims>,
+) -> Result<(), CoordinatorError> {
+    let Some(raw) = requested_ula else {
+        return Ok(());
+    };
+    let addr = raw
+        .parse::<Ipv6Addr>()
+        .map_err(|_| CoordinatorError::InvalidRequestedUla(raw.to_owned()))?;
+    let segments = addr.segments();
+    if segments[1] != HOST_ULA_SLOT || segments[3] != INFRA_ULA_IDX {
+        return Ok(());
+    }
+    let authorized = claims.is_some_and(|claims| {
+        claims.requested_ulas.iter().any(|allowed| {
+            allowed
+                .parse::<Ipv6Addr>()
+                .is_ok_and(|allowed_addr| allowed_addr == addr)
+        })
+    });
+    if authorized {
+        Ok(())
+    } else {
+        Err(CoordinatorError::Unauthorized(format!(
+            "requested fixed infra ULA {raw} is not authorized by this join token"
+        )))
     }
 }

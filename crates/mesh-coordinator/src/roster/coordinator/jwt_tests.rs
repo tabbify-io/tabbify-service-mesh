@@ -15,6 +15,7 @@ use crate::http::api::RegisterRequest;
 use crate::policy::{AclRule, Policy, PolicyStore};
 use crate::publisher::NoopPublisher;
 use base64::Engine as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -68,6 +69,28 @@ async fn mock_validate(server: &MockServer, body: serde_json::Value) {
         .await;
 }
 
+struct FirstPublishGate {
+    calls: AtomicUsize,
+    entered: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait::async_trait]
+impl crate::publisher::EventPublisher for FirstPublishGate {
+    async fn publish(
+        &self,
+        _event_type: &str,
+        _segment: &str,
+        _payload: Vec<u8>,
+    ) -> Result<(), String> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.entered.wait().await;
+            self.release.wait().await;
+        }
+        Ok(())
+    }
+}
+
 /// Valid token → admit, and the node's network + tags come from the
 /// CLAIMS, not the request.
 #[tokio::test]
@@ -100,6 +123,125 @@ async fn valid_token_admits_with_claims_network_and_tags() {
         vec!["tag:user-alice".to_owned()],
         "tags must come from claims"
     );
+}
+
+async fn fixed_ula_claims(server: &MockServer, allowed: &[&str], network: &str) {
+    mock_validate(
+        server,
+        serde_json::json!({
+            "valid": true,
+            "subject": "store-service",
+            "network": network,
+            "tags": [],
+            "requested_ulas": allowed,
+            "kind": "join",
+            "exp": 1_900_000_000_i64,
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn exact_signed_capability_allows_only_its_fixed_ula_and_binds_network() {
+    let server = MockServer::start().await;
+    fixed_ula_claims(&server, &["fd5a:1f00:fffe::1"], "store-system").await;
+    let c = coordinator_with_validator(AuthValidator::new(server.uri()).unwrap());
+    let mut req = req_with(21, "spoofed-other-network", &["infra", "forge"]);
+    req.requested_ula = Some("fd5a:1f00:fffe:0:0:0:0:1".into());
+
+    let (entry, _) = c
+        .register_authenticated(req, Some("token-for-store-system"), None)
+        .await
+        .expect("exact capability admits");
+    assert_eq!(entry.ula.to_string(), "fd5a:1f00:fffe::1");
+    assert_eq!(
+        entry.network, "store-system",
+        "token network is authoritative"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_exact_capability_registers_cannot_both_reserve_fixed_ula() {
+    let server = MockServer::start().await;
+    fixed_ula_claims(&server, &["fd5a:1f00:fffe::1"], "store-system").await;
+    let publish_entered = Arc::new(tokio::sync::Barrier::new(2));
+    let publish_release = Arc::new(tokio::sync::Barrier::new(2));
+    let publisher = Arc::new(FirstPublishGate {
+        calls: AtomicUsize::new(0),
+        entered: publish_entered.clone(),
+        release: publish_release.clone(),
+    });
+    let coordinator = Coordinator::with_policy_and_validator(
+        publisher,
+        Duration::from_secs(60),
+        permissive(),
+        Some(AuthValidator::new(server.uri()).unwrap()),
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let register = |seed, token: &'static str| {
+        let coordinator = coordinator.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            let mut request = req_with(seed, "spoofed-network", &[]);
+            request.requested_ula = Some("fd5a:1f00:fffe::1".into());
+            barrier.wait().await;
+            coordinator
+                .register_authenticated(request, Some(token), None)
+                .await
+        })
+    };
+    let first = register(31, "first-token");
+    let second = register(32, "second-token");
+    barrier.wait().await;
+    publish_entered.wait().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !first.is_finished() && !second.is_finished(),
+        "the second register crossed publish/apply while the first reservation was pending"
+    );
+    publish_release.wait().await;
+    let outcomes = [first.await.unwrap(), second.await.unwrap()];
+
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(result, Err(CoordinatorError::UlaConflict(_))))
+            .count(),
+        1
+    );
+    assert_eq!(coordinator.snapshot().len(), 1);
+}
+
+#[tokio::test]
+async fn capability_for_fixed_ula_one_rejects_fixed_ula_two() {
+    let server = MockServer::start().await;
+    fixed_ula_claims(&server, &["fd5a:1f00:fffe::1"], "store-system").await;
+    let c = coordinator_with_validator(AuthValidator::new(server.uri()).unwrap());
+    let mut req = req_with(22, "store-system", &[]);
+    req.requested_ula = Some("fd5a:1f00:fffe::2".into());
+
+    let error = c
+        .register_authenticated(req, Some("token-for-one"), None)
+        .await
+        .expect_err("capability must be exact");
+    assert!(matches!(error, CoordinatorError::Unauthorized(_)));
+}
+
+#[tokio::test]
+async fn self_advertised_infra_or_forge_tags_never_authorize_fixed_ula() {
+    let server = MockServer::start().await;
+    fixed_ula_claims(&server, &[], "store-system").await;
+    let c = coordinator_with_validator(AuthValidator::new(server.uri()).unwrap());
+    let mut req = req_with(23, "store-system", &["infra", "forge"]);
+    req.requested_ula = Some("fd5a:1f00:fffe::1".into());
+
+    let error = c
+        .register_authenticated(req, Some("no-capability"), None)
+        .await
+        .expect_err("self tags must not grant fixed ULA");
+    assert!(matches!(error, CoordinatorError::Unauthorized(_)));
 }
 
 /// The headline spoofing test: a node sends `tag:admin` + a foreign
@@ -302,7 +444,11 @@ async fn re_register_rehomes_peer_to_new_network_from_claims() {
     // override; `requested_ula` stays None so it lands on an idx-based ULA in
     // alpha's slot.
     let (first, o1) = c
-        .register_authenticated(req_with(11, "junk", &["tag:spoof"]), Some("tok-alpha"), None)
+        .register_authenticated(
+            req_with(11, "junk", &["tag:spoof"]),
+            Some("tok-alpha"),
+            None,
+        )
         .await
         .expect("first join");
     assert_eq!(o1, RegisterOutcome::Created);
@@ -318,9 +464,19 @@ async fn re_register_rehomes_peer_to_new_network_from_claims() {
         .register_authenticated(retagged, Some("tok-beta"), None)
         .await
         .expect("re-home");
-    assert_eq!(o2, RegisterOutcome::Existed, "same pubkey → still a re-register");
-    assert_eq!(first.peer_id, second.peer_id, "identity (peer_id) is preserved");
-    assert_eq!(second.network, "beta", "network reconciled to the new claims");
+    assert_eq!(
+        o2,
+        RegisterOutcome::Existed,
+        "same pubkey → still a re-register"
+    );
+    assert_eq!(
+        first.peer_id, second.peer_id,
+        "identity (peer_id) is preserved"
+    );
+    assert_eq!(
+        second.network, "beta",
+        "network reconciled to the new claims"
+    );
     assert_eq!(
         second.tags,
         vec!["tag:net-beta".to_owned(), "tag:deploy-beta".to_owned()],
@@ -347,5 +503,8 @@ async fn re_register_rehomes_peer_to_new_network_from_claims() {
         .expect("steady re-register");
     assert_eq!(o3, RegisterOutcome::Existed);
     assert_eq!(third.network, "beta");
-    assert_eq!(third.ula, second.ula, "same-network re-register is ULA-stable");
+    assert_eq!(
+        third.ula, second.ula,
+        "same-network re-register is ULA-stable"
+    );
 }
