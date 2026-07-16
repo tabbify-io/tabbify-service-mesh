@@ -508,3 +508,119 @@ async fn re_register_rehomes_peer_to_new_network_from_claims() {
         "same-network re-register is ULA-stable"
     );
 }
+
+/// Network-slot binding under a validator: a token authenticated for network
+/// `alice` cannot bind a host-slot ULA inside another network's block — here
+/// an unclaimed address in the Store infra /64 with a non-zero index (so the
+/// fixed-infra capability gate does not fire). The requested address must sit
+/// in the CLAIMS network's own slot.
+#[tokio::test]
+async fn authenticated_peer_cannot_bind_host_ula_in_foreign_network_slot() {
+    let server = MockServer::start().await;
+    mock_validate(
+        &server,
+        serde_json::json!({
+            "valid": true,
+            "subject": "node-alice",
+            "network": "alice",
+            "tags": ["tag:user-alice"],
+            "kind": "join",
+            "exp": 1_900_000_000_i64,
+        }),
+    )
+    .await;
+    let c = coordinator_with_validator(AuthValidator::new(server.uri()).unwrap());
+    let mut req = req_with(24, "alice", &[]);
+    req.requested_ula = Some("fd5a:1f00:fffe:1::1".into());
+
+    let error = c
+        .register_authenticated(req, Some("good-token"), None)
+        .await
+        .expect_err("a foreign-slot host ULA must be rejected");
+    assert!(
+        matches!(error, CoordinatorError::UlaNetworkMismatch { .. }),
+        "expected UlaNetworkMismatch, got {error:?}"
+    );
+    assert_eq!(c.snapshot().len(), 0);
+}
+
+/// Defense-in-depth on the re-home realloc: when the freshly-allocated ULA is
+/// somehow already held by ANOTHER peer (the re-home write bypasses
+/// `apply_peer_joined`'s duplicate reject), the re-home must fail closed with
+/// `UlaConflict` and leave the peer untouched in its old network — never
+/// silently install a duplicate address.
+#[tokio::test]
+async fn rehome_fails_closed_when_fresh_ula_is_already_held() {
+    use wiremock::matchers::body_string_contains;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/validate"))
+        .and(body_string_contains("tok-alpha"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "valid": true,
+            "subject": "dedik",
+            "network": "alpha",
+            "tags": ["tag:net-alpha"],
+            "kind": "join",
+            "exp": 1_900_000_000_i64,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/validate"))
+        .and(body_string_contains("tok-beta"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "valid": true,
+            "subject": "dedik",
+            "network": "beta",
+            "tags": ["tag:net-beta"],
+            "kind": "join",
+            "exp": 1_900_000_000_i64,
+        })))
+        .mount(&server)
+        .await;
+    let c = coordinator_with_validator(AuthValidator::new(server.uri()).unwrap());
+
+    // Peer A and peer B both join alpha (idx 1 and 2 in alpha's slot).
+    let (first, _) = c
+        .register_authenticated(req_with(41, "node-a", &[]), Some("tok-alpha"), None)
+        .await
+        .expect("peer A joins alpha");
+    let (other, _) = c
+        .register_authenticated(req_with(42, "node-b", &[]), Some("tok-alpha"), None)
+        .await
+        .expect("peer B joins alpha");
+    // Rewrite peer B's roster ULA to the address beta's allocator will hand
+    // out FIRST (beta slot, idx 1) — simulating a stale/foreign record the
+    // allocator does not know about (the invariant the guard defends).
+    let beta_first = crate::roster::allocator::UlaAllocator::address_for(
+        crate::roster::allocator::network_slot("beta"),
+        1,
+    );
+    c.inner
+        .roster
+        .get_mut(&other.peer_id)
+        .expect("peer B entry")
+        .ula = beta_first;
+
+    // Re-home peer A alpha→beta: the fresh beta allocation collides with
+    // peer B's address and must fail closed.
+    let err = c
+        .register_authenticated(req_with(41, "node-a", &[]), Some("tok-beta"), None)
+        .await
+        .expect_err("re-home must fail closed on a duplicate fresh ULA");
+    assert!(
+        matches!(err, CoordinatorError::UlaConflict(_)),
+        "expected UlaConflict, got {err:?}"
+    );
+    // Peer A is untouched: still in alpha at its original ULA.
+    let entry = c
+        .inner
+        .roster
+        .get(&first.peer_id)
+        .expect("peer A entry")
+        .clone();
+    assert_eq!(entry.network, "alpha", "failed re-home must not move the peer");
+    assert_eq!(entry.ula, first.ula, "failed re-home must not change the ULA");
+}

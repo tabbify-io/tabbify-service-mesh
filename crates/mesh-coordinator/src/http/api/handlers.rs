@@ -30,8 +30,13 @@ pub fn coord_err_to_response(err: &CoordinatorError) -> Response {
         // A failed join-token validation (missing / invalid / revoked /
         // wrong-kind / validator unreachable) rejects the register.
         CoordinatorError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-        // A different peer already holds the requested ULA.
-        CoordinatorError::UlaConflict(_) => StatusCode::CONFLICT,
+        // A different peer already holds the requested ULA, or the request
+        // sits outside the peer's own network block. Both are 409 so the
+        // joiner's sticky-then-free fallback re-registers with a fresh
+        // coordinator-allocated address.
+        CoordinatorError::UlaConflict(_) | CoordinatorError::UlaNetworkMismatch { .. } => {
+            StatusCode::CONFLICT
+        }
     };
     (
         status,

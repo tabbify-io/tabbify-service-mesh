@@ -276,6 +276,20 @@ pub enum CoordinatorError {
     /// ULA so the coordinator log can surface it.
     #[error("requested ULA already claimed by another peer: {0}")]
     UlaConflict(String),
+    /// A host-slot `requested_ula` lies outside the requesting peer's
+    /// authenticated network block (`segments()[2]` differs from the
+    /// network's slot). The HTTP layer maps this to `409 Conflict` — same
+    /// as [`Self::UlaConflict`] — so a sticky joiner whose network was
+    /// re-tagged falls back to a fresh coordinator-allocated address
+    /// (`register_with_409_fallback` in `mesh-joiner`) instead of wedging
+    /// on a non-retriable 4xx.
+    #[error("requested ULA {ula} is outside network `{network}`'s address block")]
+    UlaNetworkMismatch {
+        /// The requested address, verbatim from the register request.
+        ula: String,
+        /// The peer's effective (authenticated when validated) network.
+        network: String,
+    },
 }
 
 /// Outcome of `register`: whether the peer was new or already in the

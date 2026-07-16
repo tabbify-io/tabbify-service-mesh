@@ -15,6 +15,7 @@ use crate::http::api::RegisterRequest;
 use crate::http::sse::PeerEvent;
 use crate::nat::reflexive::{ResolvedEndpoint, resolve_listen_endpoint};
 use crate::publisher::publish_event;
+use crate::roster::allocator::network_slot;
 use crate::roster::events::PeerJoined;
 use crate::roster::identity::stamp_identity;
 use std::net::{Ipv6Addr, SocketAddr};
@@ -331,7 +332,23 @@ impl Coordinator {
         // guard: the allocator is a distinct lock and can fail (exhaustion), so
         // a failed allocation must leave the entry untouched (fail closed).
         let realloc = if rehome {
-            Some(self.inner.allocator.allocate(&identity.network)?)
+            let (new_index, new_ula) = self.inner.allocator.allocate(&identity.network)?;
+            // The re-home write below sets `e.ula` directly, bypassing
+            // `apply_peer_joined`'s duplicate-ULA reject — so re-assert
+            // roster-wide uniqueness here instead of leaning on the
+            // allocator's implicit never-reissues invariant. Fail closed: a
+            // conflict leaves the entry untouched in its old network.
+            // Serialized against concurrent registers by `registration_lock`,
+            // which our caller holds.
+            let held_by_other = self
+                .inner
+                .roster
+                .iter()
+                .any(|kv| kv.value().ula == new_ula && kv.value().peer_id != peer_id);
+            if held_by_other {
+                return Err(CoordinatorError::UlaConflict(new_ula.to_string()));
+            }
+            Some((new_index, new_ula))
         } else {
             None
         };
@@ -534,6 +551,14 @@ impl Coordinator {
     /// ULAs (`idx >= 1`) and app-runner requests (`0x1f02` slot) are
     /// unaffected — they keep their existing conflict semantics. The check runs
     /// before stale-holder eviction and never reads self-advertised tags.
+    ///
+    /// Network-slot binding: a host-slot request with a normal index
+    /// (`idx >= 1`) must additionally sit inside the requesting peer's own
+    /// network block — `segments()[2]` must equal `network_slot(network)` —
+    /// so a peer can't bind an address inside ANOTHER network's `/64` (e.g.
+    /// squat in the Store infra range). Rejected with
+    /// [`CoordinatorError::UlaNetworkMismatch`] (409, so a sticky joiner
+    /// whose network moved falls back to a fresh allocation).
     fn resolve_ula(
         &self,
         network: &str,
@@ -546,6 +571,25 @@ impl Coordinator {
             if addr.segments()[0] & 0xfe00 != 0xfc00 {
                 return Err(CoordinatorError::InvalidRequestedUla(raw.to_owned()));
             }
+            // Network-slot binding: a host-slot request must land inside the
+            // peer's own network block (the authenticated one when a
+            // validator is configured — `stamp_identity`). Rejecting BEFORE
+            // the uniqueness scan keeps the response independent of whether
+            // the address is claimed, so a peer can neither bind nor probe
+            // inside another network's /64. Fixed infra addresses (idx 0)
+            // are exempt — already exact-capability-gated in
+            // `authorize_fixed_requested_ula` — and app-runner requests
+            // (`0x1f02` slot) keep their existing semantics.
+            let segments = addr.segments();
+            if segments[1] == HOST_ULA_SLOT
+                && !is_fixed_infra_ula(&addr)
+                && segments[2] != network_slot(network)
+            {
+                return Err(CoordinatorError::UlaNetworkMismatch {
+                    ula: raw.to_owned(),
+                    network: network.to_owned(),
+                });
+            }
             // Uniqueness check: scan the roster for any peer already
             // holding this exact ULA. The re-registration path (same
             // wg_public_key) was already handled above — so if we find
@@ -557,8 +601,8 @@ impl Coordinator {
             // Honour the requested address. Derive the index from the
             // address layout (`fd5a:1f00:<slot>:<idx>::1`) so the
             // PeerEntry and the allocator stay consistent.
-            let peer_index = addr.segments()[3];
-            let slot = addr.segments()[2];
+            let peer_index = segments[3];
+            let slot = segments[2];
             // Advance the allocator so subsequent idx-based allocations
             // in this network block skip past the manually-assigned index.
             self.inner.allocator.bump_slot_at_least(slot, peer_index);
@@ -569,6 +613,35 @@ impl Coordinator {
     }
 }
 
+/// True when `addr` is a FIXED platform-infra ULA: a unique-local address
+/// (`fc00::/7`) in the coordinator's host slot (`segments()[1] ==`
+/// [`HOST_ULA_SLOT`]) at the reserved index the allocator never issues
+/// (`segments()[3] ==` [`INFRA_ULA_IDX`]) — e.g. the forge's
+/// `fd5a:1f00:ffff::1`.
+///
+/// MUST stay in lockstep with the mint-side copy in `tabbify-service-auth`
+/// (`validate_requested_ulas`, `src/handlers/tokens.rs`): auth refuses to
+/// mint a `requested_ulas` capability for any other address shape, and this
+/// coordinator refuses to grant such an address without one.
+const fn is_fixed_infra_ula(addr: &Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    segments[0] & 0xfe00 == 0xfc00
+        && segments[1] == HOST_ULA_SLOT
+        && segments[3] == INFRA_ULA_IDX
+}
+
+/// Gate FIXED platform-infra `requested_ula`s (see [`is_fixed_infra_ula`])
+/// behind an exact signed capability in the validated join-token claims.
+///
+/// Deliberately FAIL-CLOSED on the no-validator escape hatch: without a
+/// configured validator (`AUTH_URL` unset) `claims` is `None`, so EVERY
+/// fixed-infra ULA request is rejected — there is no request-trusted
+/// allowance. Running Store/forge services at their fixed addresses
+/// therefore requires a configured validator even in dev; a validator-less
+/// mesh serves only dynamically-allocated peers. Do NOT weaken this: the
+/// escape hatch trusts request-supplied identity, so honoring
+/// request-supplied infra addresses there would let any local process squat
+/// the forge/Store address.
 fn authorize_fixed_requested_ula(
     requested_ula: Option<&str>,
     claims: Option<&ValidatedClaims>,
@@ -579,8 +652,7 @@ fn authorize_fixed_requested_ula(
     let addr = raw
         .parse::<Ipv6Addr>()
         .map_err(|_| CoordinatorError::InvalidRequestedUla(raw.to_owned()))?;
-    let segments = addr.segments();
-    if segments[1] != HOST_ULA_SLOT || segments[3] != INFRA_ULA_IDX {
+    if !is_fixed_infra_ula(&addr) {
         return Ok(());
     }
     let authorized = claims.is_some_and(|claims| {

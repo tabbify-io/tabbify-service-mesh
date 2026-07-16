@@ -1777,6 +1777,52 @@ async fn register_still_honours_non_infra_host_ula_without_tag() {
     assert_eq!(entry.ula.to_string(), host);
 }
 
+/// Network-slot binding: a host-slot (`1f00`) `requested_ula` whose
+/// `<network16>` hextet belongs to a DIFFERENT network's block is rejected —
+/// a peer cannot bind an address inside another network's /64 (e.g. squat in
+/// the Store infra range) even when the address is unclaimed and its index
+/// is non-zero (so the fixed-infra capability gate does not apply).
+#[tokio::test]
+async fn register_rejects_host_ula_outside_own_network_slot() {
+    let c = coordinator();
+    // `req` self-declares the default network (slot 0); `fffe` is another
+    // block (the Store infra /64), idx 1 so the infra gate does not fire.
+    let foreign = "fd5a:1f00:fffe:1::1";
+    let err = c
+        .register(req_with_requested_ula(85, "squatter", foreign))
+        .await
+        .expect_err("a cross-network host ULA must be rejected");
+    assert!(
+        matches!(err, CoordinatorError::UlaNetworkMismatch { .. }),
+        "expected UlaNetworkMismatch, got {err:?}"
+    );
+    assert_eq!(
+        c.snapshot().len(),
+        0,
+        "the rejected register must leave no roster entry"
+    );
+}
+
+/// The binding still honours a host-slot request inside the peer's OWN
+/// (named) network block — the slot-0 default-network case is covered by
+/// `register_still_honours_non_infra_host_ula_without_tag` above.
+#[tokio::test]
+async fn register_honours_host_ula_in_own_network_slot() {
+    let c = coordinator();
+    let slot = crate::roster::allocator::network_slot("alice");
+    let want = crate::roster::allocator::UlaAllocator::address_for(slot, 7);
+    let request = RegisterRequest {
+        network: "alice".into(),
+        ..req_with_requested_ula(86, "alice-host", &want.to_string())
+    };
+    let (entry, outcome) = c
+        .register(request)
+        .await
+        .expect("an own-slot host ULA is honoured");
+    assert_eq!(outcome, RegisterOutcome::Created);
+    assert_eq!(entry.ula, want);
+}
+
 /// Raw 32-byte pubkey for a register seed — the bytes `pubkey(seed)`
 /// base64-encodes. Lets a test register a relay connection under the SAME
 /// key a peer registered with, so it can assert the connection is torn
