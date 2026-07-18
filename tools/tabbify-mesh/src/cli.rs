@@ -1,6 +1,6 @@
 //! `clap` definitions for the `tabbify-mesh` binary.
 
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -11,6 +11,16 @@ use clap::{Args, Parser, Subcommand};
 /// The production EIP is baked in so `tabbify-mesh join --name X` is enough.
 /// Override with `--coordinator http://127.0.0.1:8888` for a local smoke run.
 pub const DEFAULT_COORDINATOR_URL: &str = "http://3.124.69.92:8888";
+
+fn parse_ula(value: &str) -> Result<Ipv6Addr, String> {
+    let address = value
+        .parse::<Ipv6Addr>()
+        .map_err(|error| format!("invalid IPv6 ULA: {error}"))?;
+    if address.segments()[0] & 0xfe00 != 0xfc00 {
+        return Err("requested address must be an IPv6 ULA (fc00::/7)".to_owned());
+    }
+    Ok(address)
+}
 
 /// `tabbify-mesh` — overlay-mesh peer CLI.
 #[derive(Debug, Parser)]
@@ -103,6 +113,12 @@ pub struct JoinArgs {
     #[arg(long)]
     pub identity_path: Option<PathBuf>,
 
+    /// Claim this exact ULA. Conflicts fail closed and never fall back to an
+    /// allocator-assigned address. Fixed infrastructure addresses require the
+    /// exact address in the validated join token's signed capability.
+    #[arg(long, env = "MESH_REQUESTED_ULA", value_parser = parse_ula)]
+    pub requested_ula: Option<Ipv6Addr>,
+
     /// Super-admin Ed25519 pubkey as 64-char hex (Track C). When set, this
     /// standalone joiner becomes a signed-remote-command TARGET: it verifies
     /// every command against this key end-to-end and, on an accepted verb,
@@ -178,7 +194,11 @@ pub struct JoinArgs {
     /// lever. Normally unset: the joiner derives
     /// `ws(s)://<coordinator-host>/v1/mesh/relay`. A single value is
     /// byte-identical to today (one-element list ⇒ failover dormant).
-    #[arg(long = "relay-url", env = "TABBIFY_MESH_RELAY_URL", value_delimiter = ',')]
+    #[arg(
+        long = "relay-url",
+        env = "TABBIFY_MESH_RELAY_URL",
+        value_delimiter = ','
+    )]
     pub relay_url: Vec<String>,
 
     /// Declare this peer RELAY-ONLY: it has no reachable direct endpoint
@@ -313,6 +333,36 @@ mod tests {
     fn join_identity_path_defaults_none() {
         let args = parse_join(&["join", "--coordinator", "http://u", "--name", "x"]);
         assert_eq!(args.identity_path, None);
+    }
+
+    #[test]
+    fn join_parses_requested_ula() {
+        let args = parse_join(&[
+            "join",
+            "--coordinator",
+            "http://u",
+            "--name",
+            "store-control",
+            "--requested-ula",
+            "fd5a:1f00:fffe::1",
+        ]);
+        assert_eq!(
+            args.requested_ula.map(|ula| ula.to_string()).as_deref(),
+            Some("fd5a:1f00:fffe::1")
+        );
+    }
+
+    #[test]
+    fn join_rejects_non_ula_requested_address() {
+        let parsed = Cli::try_parse_from([
+            "tabbify-mesh",
+            "join",
+            "--name",
+            "store-control",
+            "--requested-ula",
+            "2001:db8::1",
+        ]);
+        assert!(parsed.is_err());
     }
 
     /// `--super-admin-pubkey <hex>` parses into `JoinArgs::super_admin_pubkey`.

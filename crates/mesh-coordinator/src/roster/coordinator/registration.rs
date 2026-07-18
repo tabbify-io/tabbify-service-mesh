@@ -15,12 +15,25 @@ use crate::http::api::RegisterRequest;
 use crate::http::sse::PeerEvent;
 use crate::nat::reflexive::{ResolvedEndpoint, resolve_listen_endpoint};
 use crate::publisher::publish_event;
+use crate::roster::allocator::network_slot;
 use crate::roster::events::PeerJoined;
 use crate::roster::identity::stamp_identity;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::Instant;
 use tracing::info;
 use uuid::Uuid;
+
+/// Second 16-bit segment (`segments()[1]`) of the coordinator's host/infra
+/// ULA block (`fd5a:1f00:…`). Distinct from the supervisor-minted
+/// per-app-runner slot (`fd5a:1f02:…`, `is_ephemeral_peer` in `mesh-joiner`).
+const HOST_ULA_SLOT: u16 = 0x1f00;
+
+/// The ULA index (`segments()[3]`) that the dynamic allocator NEVER hands out
+/// (it starts at 1). A `requested_ula` with `idx == 0` is therefore a FIXED
+/// platform-infra address (e.g. the forge's `fd5a:1f00:ffff::1`) rather than a
+/// normal host peer, so it requires an exact signed join-token capability —
+/// normal host ULAs (`idx >= 1`) keep their existing conflict semantics.
+const INFRA_ULA_IDX: u16 = 0;
 
 impl Coordinator {
     /// Register (or re-register) a peer — escape-hatch convenience that
@@ -100,6 +113,7 @@ impl Coordinator {
         // absent, preserving the prior validate behavior.
         let pubkey_b64 = Some(req.wg_public_key.trim()).filter(|k| !k.is_empty());
         let claims = self.authenticate(bearer, pubkey_b64).await?;
+        authorize_fixed_requested_ula(req.requested_ula.as_deref(), claims.as_ref())?;
 
         let pubkey = decode_pubkey(&req.wg_public_key)?;
         if pubkey.len() != 32 {
@@ -119,15 +133,21 @@ impl Coordinator {
             req.relay_only,
         );
 
+        // Hold one transaction boundary through stale eviction, allocation,
+        // event publication and apply. The prior scan/publish/apply sequence
+        // allowed two concurrent exact-ULA requests to both succeed.
+        let _registration = self.inner.registration_lock.lock().await;
+
         // Re-registration path. Holding the by_pubkey shard lock while
         // we look up the peer_id is fine — the roster is keyed by
-        // peer_id, so there's no inverse-lookup contention.
+        // peer_id, so there's no inverse-lookup contention. `refresh_existing`
+        // owns its own event emission (a steady `Updated`, or a re-home's
+        // `Removed`+`Added` when validated claims move the peer to a new
+        // network) so the ULA-move re-advertise stays in one place.
         if let Some(existing_id) = self.inner.by_pubkey.get(&pubkey).map(|v| *v) {
-            let entry =
-                self.refresh_existing(existing_id, &req, claims.as_ref(), &resolved, observed)?;
-            self.inner
-                .broadcaster
-                .broadcast(PeerEvent::Updated(entry.to_info()));
+            let entry = self
+                .refresh_existing(existing_id, &req, claims.as_ref(), &resolved, observed)
+                .await?;
             return Ok((entry, RegisterOutcome::Existed));
         }
 
@@ -257,7 +277,37 @@ impl Coordinator {
         }
     }
 
-    fn refresh_existing(
+    /// Refresh an existing peer's record on a same-`wg_public_key`
+    /// re-register. Owns its own event emission.
+    ///
+    /// Two modes:
+    ///
+    /// - **Steady (default):** re-stamp identity (endpoint / tags / metadata)
+    ///   IN PLACE at the peer's existing ULA and broadcast `Updated`. The tags
+    ///   flow through the same authoritative seam as first-time register so a
+    ///   re-register can't smuggle in spoofed identity tags (validated claims
+    ///   win when present).
+    ///
+    /// - **Network re-home (authenticated):** when the register presents
+    ///   VALIDATED claims whose `network` DIFFERS from the stored one — a host
+    ///   re-tagged from one network to another with a fresh join token bound to
+    ///   the SAME wireguard identity (the dedik system→tenant case) — move the
+    ///   peer: allocate a FRESH ULA in the new network's slot, reconcile
+    ///   `network` + `ula` + `tags`, and re-advertise the `/128` as
+    ///   `Removed(old)` then `Added(new)` so every joiner tears down the old
+    ///   slot's session/route (the joiner keys sessions by ULA and only drops
+    ///   them on `Removed` — a bare `Updated` would strand the old-ULA session)
+    ///   and installs the new one. Persisted so the move survives a coordinator
+    ///   restart.
+    ///
+    /// The re-home is GATED on validated claims: an unauthenticated / escape-
+    /// hatch re-register never moves networks, so a re-register can no more
+    /// smuggle a peer into another network than it can spoof identity tags —
+    /// the move requires a token the auth service signed for the new network.
+    /// `req.requested_ula` (which still carries the peer's OLD sticky ULA, in
+    /// the OLD network's slot) is intentionally ignored on a re-home: it is
+    /// meaningless in the new network, so a fresh idx-based ULA is allocated.
+    async fn refresh_existing(
         &self,
         peer_id: Uuid,
         req: &RegisterRequest,
@@ -265,25 +315,59 @@ impl Coordinator {
         resolved: &ResolvedEndpoint,
         observed: Option<SocketAddr>,
     ) -> Result<PeerEntry, CoordinatorError> {
-        // Re-stamp identity through the same authoritative seam as
-        // first-time register so a re-register can't be used to smuggle in
-        // spoofed tags either: the validated claims win when present. The
-        // network is NOT changed on re-register: a peer keeps the ULA block
-        // it was first allocated in (changing it would orphan its address).
         let identity = stamp_identity(req, claims);
-        let entry = {
+
+        // Detect an AUTHENTICATED network change. Only a validated-claims
+        // re-register may move a peer between networks; the escape hatch keeps
+        // the legacy "network never changes on re-register" behavior.
+        let old_network = self
+            .inner
+            .roster
+            .get(&peer_id)
+            .map(|e| e.network.clone())
+            .ok_or(CoordinatorError::UnknownPeer(peer_id))?;
+        let rehome = claims.is_some() && identity.network != old_network;
+
+        // A re-home allocates the fresh ULA BEFORE taking the roster write
+        // guard: the allocator is a distinct lock and can fail (exhaustion), so
+        // a failed allocation must leave the entry untouched (fail closed).
+        let realloc = if rehome {
+            let (new_index, new_ula) = self.inner.allocator.allocate(&identity.network)?;
+            // The re-home write below sets `e.ula` directly, bypassing
+            // `apply_peer_joined`'s duplicate-ULA reject — so re-assert
+            // roster-wide uniqueness here instead of leaning on the
+            // allocator's implicit never-reissues invariant. Fail closed: a
+            // conflict leaves the entry untouched in its old network.
+            // Serialized against concurrent registers by `registration_lock`,
+            // which our caller holds.
+            let held_by_other = self
+                .inner
+                .roster
+                .iter()
+                .any(|kv| kv.value().ula == new_ula && kv.value().peer_id != peer_id);
+            if held_by_other {
+                return Err(CoordinatorError::UlaConflict(new_ula.to_string()));
+            }
+            Some((new_index, new_ula))
+        } else {
+            None
+        };
+
+        let (entry, old_ula, old_tags) = {
             let mut e = self
                 .inner
                 .roster
                 .get_mut(&peer_id)
                 .ok_or(CoordinatorError::UnknownPeer(peer_id))?;
+            let old_ula = e.ula;
+            let old_tags = e.tags.clone();
             // Store the reflexive-resolved endpoint, not the raw
             // self-report — a re-register from behind NAT must refresh the
             // peer's reachable endpoint, not regress it to a loopback guess.
             e.listen_endpoint.clone_from(&resolved.endpoint);
             e.endpoint_is_reflexive = resolved.reflexive;
             e.display_name.clone_from(&req.display_name);
-            e.tags = identity.tags;
+            e.tags.clone_from(&identity.tags);
             // Refresh the hosted app-ULA set from the (re-)register request
             // so a re-register reflects the supervisor's current hosting
             // state, mirroring the heartbeat replace semantics.
@@ -309,9 +393,50 @@ impl Coordinator {
             if let Some(obs) = observed {
                 e.observed_external = obs.to_string();
             }
-            e.clone()
+            // Re-home: move the peer into the new network at its fresh ULA.
+            if let Some((new_index, new_ula)) = realloc {
+                e.network.clone_from(&identity.network);
+                e.ula = new_ula;
+                e.peer_index = new_index;
+            }
+            (e.clone(), old_ula, old_tags)
         };
-        info!(peer_id = %peer_id, "peer re-registered (idempotent)");
+
+        if rehome {
+            info!(
+                peer_id = %peer_id,
+                display_name = %entry.display_name,
+                old_network = %old_network,
+                new_network = %entry.network,
+                old_ula = %old_ula,
+                new_ula = %entry.ula,
+                old_tags = ?old_tags,
+                new_tags = ?entry.tags,
+                "peer re-homed to a new network on authenticated re-register \
+                 (fresh ULA allocated, /128 re-advertised)",
+            );
+            // Re-advertise the /128: tear down the OLD slot's session/route on
+            // every joiner FIRST (the `Removed` frame carries the OLD tags so
+            // the same ACL-filtered set of viewers that had the old peer drop
+            // it), then install the NEW ULA via `Added`. Ordering matters —
+            // `Removed` before `Added` — so a viewer never briefly holds two
+            // sessions for one peer.
+            self.inner.broadcaster.broadcast(PeerEvent::Removed {
+                peer_id: peer_id.to_string(),
+                tags: old_tags,
+            });
+            self.inner
+                .broadcaster
+                .broadcast(PeerEvent::Added(entry.to_info()));
+            // Membership changed (network + ULA) — persist so a coordinator
+            // restart restores the peer in its NEW network/slot, not the old.
+            self.persist_roster().await;
+        } else {
+            info!(peer_id = %peer_id, "peer re-registered (idempotent)");
+            self.inner
+                .broadcaster
+                .broadcast(PeerEvent::Updated(entry.to_info()));
+        }
         Ok(entry)
     }
 
@@ -412,37 +537,136 @@ impl Coordinator {
     ///   network block don't collide. The returned `peer_index` is derived
     ///   from the address layout (`segments()[3]`), matching `apply_peer_joined`.
     ///
-    /// When `requested_ula` is `None` or malformed → fall back to the
-    /// normal sequential idx-based allocation (malformed ULA silently falls
-    /// through to idx-based; the caller learns the assigned address from the
-    /// returned `PeerEntry`, not the request).
+    /// When `requested_ula` is `None`, use normal sequential allocation.
+    /// Malformed, non-IPv6, and non-ULA requests fail closed.
+    ///
+    /// Infra-address hardening: a `requested_ula` in the host slot
+    /// (`segments()[1] == 0x1f00`) with `idx == 0` (`segments()[3]`) is a
+    /// FIXED platform-infra address — the allocator never hands out `idx 0`,
+    /// so the forge's `fd5a:1f00:ffff::1` and its kin live only there. Such an
+    /// address may be claimed only when the validated join token carries that
+    /// exact address in `requested_ulas`; any other peer is rejected with
+    /// [`CoordinatorError::Unauthorized`] BEFORE the uniqueness scan, so an
+    /// unauthorized caller can neither pin nor probe the address. Normal host
+    /// ULAs (`idx >= 1`) and app-runner requests (`0x1f02` slot) are
+    /// unaffected — they keep their existing conflict semantics. The check runs
+    /// before stale-holder eviction and never reads self-advertised tags.
+    ///
+    /// Network-slot binding: a host-slot request with a normal index
+    /// (`idx >= 1`) must additionally sit inside the requesting peer's own
+    /// network block — `segments()[2]` must equal `network_slot(network)` —
+    /// so a peer can't bind an address inside ANOTHER network's `/64` (e.g.
+    /// squat in the Store infra range). Rejected with
+    /// [`CoordinatorError::UlaNetworkMismatch`] (409, so a sticky joiner
+    /// whose network moved falls back to a fresh allocation).
     fn resolve_ula(
         &self,
         network: &str,
         requested_ula: Option<&str>,
     ) -> Result<(u16, Ipv6Addr), CoordinatorError> {
         if let Some(raw) = requested_ula {
-            if let Ok(addr) = raw.parse::<Ipv6Addr>() {
-                // Uniqueness check: scan the roster for any peer already
-                // holding this exact ULA. The re-registration path (same
-                // wg_public_key) was already handled above — so if we find
-                // a match here it MUST be a different peer.
-                let already_claimed = self.inner.roster.iter().any(|kv| kv.value().ula == addr);
-                if already_claimed {
-                    return Err(CoordinatorError::UlaConflict(raw.to_owned()));
-                }
-                // Honour the requested address. Derive the index from the
-                // address layout (`fd5a:1f00:<slot>:<idx>::1`) so the
-                // PeerEntry and the allocator stay consistent.
-                let peer_index = addr.segments()[3];
-                let slot = addr.segments()[2];
-                // Advance the allocator so subsequent idx-based allocations
-                // in this network block skip past the manually-assigned index.
-                self.inner.allocator.bump_slot_at_least(slot, peer_index);
-                return Ok((peer_index, addr));
+            let addr = raw
+                .parse::<Ipv6Addr>()
+                .map_err(|_| CoordinatorError::InvalidRequestedUla(raw.to_owned()))?;
+            if addr.segments()[0] & 0xfe00 != 0xfc00 {
+                return Err(CoordinatorError::InvalidRequestedUla(raw.to_owned()));
             }
+            // Network-slot binding: a host-slot request must land inside the
+            // peer's own network block (the authenticated one when a
+            // validator is configured — `stamp_identity`). Rejecting BEFORE
+            // the uniqueness scan keeps the response independent of whether
+            // the address is claimed, so a peer can neither bind nor probe
+            // inside another network's /64. Fixed infra addresses (idx 0)
+            // are exempt — already exact-capability-gated in
+            // `authorize_fixed_requested_ula` — and app-runner requests
+            // (`0x1f02` slot) keep their existing semantics.
+            let segments = addr.segments();
+            if segments[1] == HOST_ULA_SLOT
+                && !is_fixed_infra_ula(&addr)
+                && segments[2] != network_slot(network)
+            {
+                return Err(CoordinatorError::UlaNetworkMismatch {
+                    ula: raw.to_owned(),
+                    network: network.to_owned(),
+                });
+            }
+            // Uniqueness check: scan the roster for any peer already
+            // holding this exact ULA. The re-registration path (same
+            // wg_public_key) was already handled above — so if we find
+            // a match here it MUST be a different peer.
+            let already_claimed = self.inner.roster.iter().any(|kv| kv.value().ula == addr);
+            if already_claimed {
+                return Err(CoordinatorError::UlaConflict(raw.to_owned()));
+            }
+            // Honour the requested address. Derive the index from the
+            // address layout (`fd5a:1f00:<slot>:<idx>::1`) so the
+            // PeerEntry and the allocator stay consistent.
+            let peer_index = segments[3];
+            let slot = segments[2];
+            // Advance the allocator so subsequent idx-based allocations
+            // in this network block skip past the manually-assigned index.
+            self.inner.allocator.bump_slot_at_least(slot, peer_index);
+            return Ok((peer_index, addr));
         }
         // Fall back to the standard sequential idx-based allocation.
         Ok(self.inner.allocator.allocate(network)?)
+    }
+}
+
+/// True when `addr` is a FIXED platform-infra ULA: a unique-local address
+/// (`fc00::/7`) in the coordinator's host slot (`segments()[1] ==`
+/// [`HOST_ULA_SLOT`]) at the reserved index the allocator never issues
+/// (`segments()[3] ==` [`INFRA_ULA_IDX`]) — e.g. the forge's
+/// `fd5a:1f00:ffff::1`.
+///
+/// MUST stay in lockstep with the mint-side copy in `tabbify-service-auth`
+/// (`validate_requested_ulas`, `src/handlers/tokens.rs`): auth refuses to
+/// mint a `requested_ulas` capability for any other address shape, and this
+/// coordinator refuses to grant such an address without one.
+const fn is_fixed_infra_ula(addr: &Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    segments[0] & 0xfe00 == 0xfc00
+        && segments[1] == HOST_ULA_SLOT
+        && segments[3] == INFRA_ULA_IDX
+}
+
+/// Gate FIXED platform-infra `requested_ula`s (see [`is_fixed_infra_ula`])
+/// behind an exact signed capability in the validated join-token claims.
+///
+/// Deliberately FAIL-CLOSED on the no-validator escape hatch: without a
+/// configured validator (`AUTH_URL` unset) `claims` is `None`, so EVERY
+/// fixed-infra ULA request is rejected — there is no request-trusted
+/// allowance. Running Store/forge services at their fixed addresses
+/// therefore requires a configured validator even in dev; a validator-less
+/// mesh serves only dynamically-allocated peers. Do NOT weaken this: the
+/// escape hatch trusts request-supplied identity, so honoring
+/// request-supplied infra addresses there would let any local process squat
+/// the forge/Store address.
+fn authorize_fixed_requested_ula(
+    requested_ula: Option<&str>,
+    claims: Option<&ValidatedClaims>,
+) -> Result<(), CoordinatorError> {
+    let Some(raw) = requested_ula else {
+        return Ok(());
+    };
+    let addr = raw
+        .parse::<Ipv6Addr>()
+        .map_err(|_| CoordinatorError::InvalidRequestedUla(raw.to_owned()))?;
+    if !is_fixed_infra_ula(&addr) {
+        return Ok(());
+    }
+    let authorized = claims.is_some_and(|claims| {
+        claims.requested_ulas.iter().any(|allowed| {
+            allowed
+                .parse::<Ipv6Addr>()
+                .is_ok_and(|allowed_addr| allowed_addr == addr)
+        })
+    });
+    if authorized {
+        Ok(())
+    } else {
+        Err(CoordinatorError::Unauthorized(format!(
+            "requested fixed infra ULA {raw} is not authorized by this join token"
+        )))
     }
 }

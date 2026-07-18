@@ -31,6 +31,9 @@ pub struct ValidatedClaims {
     /// Authoritative tags claim — drive ACL roster filtering (§5).
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Exact fixed infrastructure ULAs authorized by the signed join token.
+    #[serde(default)]
+    pub requested_ulas: Vec<String>,
     /// Token kind — `"join"` for node-join tokens, `"auth"` for user
     /// tokens. The coordinator only admits `"join"` tokens.
     #[serde(default)]

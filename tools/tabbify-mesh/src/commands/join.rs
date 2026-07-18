@@ -106,6 +106,7 @@ fn build_join_config(args: JoinArgs) -> JoinConfig {
         // `resolve_identity` uses the identity file and re-requests the same
         // mesh ULA across restarts (the lifeline-joiner sticky-address path).
         identity_path: args.identity_path,
+        requested_ula: args.requested_ula.map(|ula| ula.to_string()),
         tls_cert: args.tls_cert,
         tls_key: args.tls_key,
         tls_ca: args.tls_ca,
@@ -219,9 +220,13 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     // When a super-admin pubkey is configured AND parses, run the joiner with
     // the Track-C gate (verifies every command against the key) wired to the
     // host command sink. Otherwise plain join — remote commands fail-closed.
-    let joiner =
-        join_with_optional_sink(config, &coordinator, super_admin_pubkey.as_deref(), &sink_data_dir)
-            .await?;
+    let joiner = join_with_optional_sink(
+        config,
+        &coordinator,
+        super_admin_pubkey.as_deref(),
+        &sink_data_dir,
+    )
+    .await?;
 
     let my_peer_id = joiner.my_peer_id();
     let my_ula = joiner.my_ula();
@@ -408,6 +413,28 @@ mod tests {
         assert_eq!(sanitize_join_token(clean), clean, "clean token untouched");
     }
 
+    #[test]
+    fn explicit_requested_ula_maps_to_join_config() {
+        use clap::Parser;
+        let args = match crate::cli::Cli::parse_from([
+            "tabbify-mesh",
+            "join",
+            "--coordinator",
+            "http://u",
+            "--name",
+            "store-control",
+            "--requested-ula",
+            "fd5a:1f00:fffe::1",
+        ])
+        .cmd
+        {
+            crate::cli::Cmd::Join(args) => *args,
+            _ => panic!("expected join"),
+        };
+        let config = build_join_config(args);
+        assert_eq!(config.requested_ula.as_deref(), Some("fd5a:1f00:fffe::1"));
+    }
+
     /// The persisted JSON carries exactly the operator-facing fields with their
     /// expected values — `peer_id`, `ula`, `name`.
     #[test]
@@ -426,7 +453,10 @@ mod tests {
             raw.contains("01234567-89ab-cdef-0123-456789abcdef"),
             "peer_id uuid must be serialized: {raw}"
         );
-        assert!(raw.contains("fd5a:1f00:2:3::1"), "ula must be serialized: {raw}");
+        assert!(
+            raw.contains("fd5a:1f00:2:3::1"),
+            "ula must be serialized: {raw}"
+        );
         assert!(raw.contains("lifeline"), "name must be serialized: {raw}");
     }
 

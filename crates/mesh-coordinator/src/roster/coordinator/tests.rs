@@ -370,7 +370,11 @@ async fn snapshot_carries_connectivity_age_alongside_connectivity() {
         .find(|p| p.peer_id == reporter.peer_id.to_string())
         .unwrap();
     assert_eq!(r.connectivity.as_deref(), Some("direct"));
-    assert_eq!(r.connectivity_age_ms, Some(12), "self-view age = freshest edge");
+    assert_eq!(
+        r.connectivity_age_ms,
+        Some(12),
+        "self-view age = freshest edge"
+    );
 
     // `?vantage=reporter`: to peer `a` it reported relay@500.
     let snap = c.snapshot_with_vantage(Some(reporter.peer_id));
@@ -960,7 +964,8 @@ async fn flagged_direct_pair_still_suppressed_when_relay_only() {
         e.relay_only = true;
     }
     // Flag the pair direct UP FRONT — under R6 this must NOT relax the self-pin.
-    c.direct_pair_flags().set_direct(alice.peer_id, bob.peer_id, true);
+    c.direct_pair_flags()
+        .set_direct(alice.peer_id, bob.peer_id, true);
 
     c.heartbeat(
         alice.peer_id,
@@ -1011,12 +1016,28 @@ async fn proactive_gate_off_suppresses_all_punch_like_today() {
         let mut e = c.inner.roster.get_mut(&bob.peer_id).expect("bob entry");
         e.listen_endpoint = Some("198.51.100.91:51820".into());
     }
-    c.heartbeat(alice.peer_id, "203.0.113.90:11111".into(), Some(51820), vec![], None, None, false)
-        .await
-        .expect("a hb");
-    c.heartbeat(bob.peer_id, "198.51.100.91:22222".into(), Some(51820), vec![], None, None, false)
-        .await
-        .expect("b hb");
+    c.heartbeat(
+        alice.peer_id,
+        "203.0.113.90:11111".into(),
+        Some(51820),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("a hb");
+    c.heartbeat(
+        bob.peer_id,
+        "198.51.100.91:22222".into(),
+        Some(51820),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("b hb");
     assert_eq!(
         pub_.count_by_type("holepunch_initiate"),
         0,
@@ -1040,13 +1061,30 @@ async fn direct_true_forces_attempt_even_gate_off() {
         let mut e = c.inner.roster.get_mut(&bob.peer_id).expect("bob entry");
         e.listen_endpoint = Some("198.51.100.93:51820".into());
     }
-    c.direct_pair_flags().set_direct(alice.peer_id, bob.peer_id, true);
-    c.heartbeat(alice.peer_id, "203.0.113.92:11111".into(), Some(51820), vec![], None, None, false)
-        .await
-        .expect("a hb");
-    c.heartbeat(bob.peer_id, "198.51.100.93:22222".into(), Some(51820), vec![], None, None, false)
-        .await
-        .expect("b hb");
+    c.direct_pair_flags()
+        .set_direct(alice.peer_id, bob.peer_id, true);
+    c.heartbeat(
+        alice.peer_id,
+        "203.0.113.92:11111".into(),
+        Some(51820),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("a hb");
+    c.heartbeat(
+        bob.peer_id,
+        "198.51.100.93:22222".into(),
+        Some(51820),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("b hb");
     assert_eq!(
         pub_.count_by_type("holepunch_initiate"),
         2,
@@ -1069,15 +1107,32 @@ async fn pin_to_relay_true_suppresses_even_gate_on() {
     }
     // ... but the pair is hard-pinned to relay (and even flagged direct, which
     // the pin must override).
-    c.direct_pair_flags().set_direct(alice.peer_id, bob.peer_id, true);
+    c.direct_pair_flags()
+        .set_direct(alice.peer_id, bob.peer_id, true);
     c.direct_pair_flags()
         .set_pinned_to_relay(alice.peer_id, bob.peer_id, true);
-    c.heartbeat(alice.peer_id, "203.0.113.94:11111".into(), Some(51820), vec![], None, None, false)
-        .await
-        .expect("a hb");
-    c.heartbeat(bob.peer_id, "198.51.100.95:22222".into(), Some(51820), vec![], None, None, false)
-        .await
-        .expect("b hb");
+    c.heartbeat(
+        alice.peer_id,
+        "203.0.113.94:11111".into(),
+        Some(51820),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("a hb");
+    c.heartbeat(
+        bob.peer_id,
+        "198.51.100.95:22222".into(),
+        Some(51820),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("b hb");
     assert_eq!(
         pub_.count_by_type("holepunch_initiate"),
         0,
@@ -1625,6 +1680,149 @@ async fn register_rejects_requested_ula_claimed_by_different_peer() {
     assert_eq!(c.snapshot().len(), 1);
 }
 
+// Task 9 — infra-ULA hardening: the coordinator-allocated `fd5a:1f00:…`
+// slot is the host/infra block (as opposed to the supervisor-minted
+// `fd5a:1f02:…` per-app-runner slot). A `requested_ula` in the infra slot
+// pins a platform-privileged address (e.g. the forge's fixed infra ULA), so
+// it MUST carry an `infra`/`forge` tag in its authoritative identity;
+// otherwise ANY peer could claim the forge's address and black-hole it.
+// App-runner (`1f02`) requests stay unchanged.
+// -----------------------------------------------------------------
+
+/// Build a register with an explicit `requested_ula` AND explicit identity
+/// tags (the default `req` helper hardcodes `["dev-machine"]`).
+fn req_with_ula_and_tags(
+    seed: u8,
+    name: &str,
+    requested_ula: &str,
+    tags: &[&str],
+) -> RegisterRequest {
+    RegisterRequest {
+        requested_ula: Some(requested_ula.into()),
+        tags: tags.iter().map(|s| (*s).to_owned()).collect(),
+        ..req(seed, name)
+    }
+}
+
+/// An untagged peer requesting an infra-slot (`fd5a:1f00:…`) ULA is rejected
+/// with `Unauthorized` and leaves no roster entry.
+#[tokio::test]
+async fn register_rejects_infra_ula_without_infra_or_forge_tag() {
+    let c = coordinator();
+    // The fixed forge infra ULA: `1f00` slot, idx (segments[3]) == 0.
+    let infra = "fd5a:1f00:ffff::1";
+    let err = c
+        .register(req_with_ula_and_tags(
+            80,
+            "impostor",
+            infra,
+            &["dev-machine"],
+        ))
+        .await
+        .expect_err("an untagged peer must not claim an infra ULA");
+    assert!(
+        matches!(err, CoordinatorError::Unauthorized(_)),
+        "expected Unauthorized, got {err:?}"
+    );
+    assert_eq!(
+        c.snapshot().len(),
+        0,
+        "the rejected register must leave no roster entry"
+    );
+}
+
+/// Self-advertised legacy tags never grant a fixed ULA in the dev escape hatch.
+#[tokio::test]
+async fn register_rejects_self_advertised_forge_and_infra_tags() {
+    for (seed, tag, ula) in [
+        (81, "forge", "fd5a:1f00:ffff::1"),
+        (82, "infra", "fd5a:1f00:ffff::2"),
+    ] {
+        let error = coordinator()
+            .register(req_with_ula_and_tags(seed, tag, ula, &[tag]))
+            .await
+            .expect_err("self-advertised tag must not grant fixed ULA");
+        assert!(matches!(error, CoordinatorError::Unauthorized(_)));
+    }
+}
+
+/// App-runner (`1f02`) requests are NOT gated: a plain, non-infra peer still
+/// claims its `derive_app_ula` address exactly as before.
+#[tokio::test]
+async fn register_still_honours_app_ula_without_infra_tag() {
+    let c = coordinator();
+    let app = "fd5a:1f02:1234::1";
+    let (entry, outcome) = c
+        .register(req_with_ula_and_tags(83, "runner", app, &["dev-machine"]))
+        .await
+        .expect("an app-slot ULA needs no infra tag");
+    assert_eq!(outcome, RegisterOutcome::Created);
+    assert_eq!(entry.ula.to_string(), app);
+}
+
+/// The gate is narrowed to FIXED infra addresses (`idx == 0`): a normal host
+/// ULA in the `1f00` slot with a non-zero index is NOT gated, so a plain peer
+/// still claims it without an infra tag — the general host-ULA conflict
+/// semantics are untouched.
+#[tokio::test]
+async fn register_still_honours_non_infra_host_ula_without_tag() {
+    let c = coordinator();
+    // `1f00` slot but idx (segments[3]) == 7 → a normal host ULA, not infra.
+    let host = "fd5a:1f00:0:7::1";
+    let (entry, outcome) = c
+        .register(req_with_ula_and_tags(84, "host", host, &["dev-machine"]))
+        .await
+        .expect("a non-idx-0 host ULA needs no infra tag");
+    assert_eq!(outcome, RegisterOutcome::Created);
+    assert_eq!(entry.ula.to_string(), host);
+}
+
+/// Network-slot binding: a host-slot (`1f00`) `requested_ula` whose
+/// `<network16>` hextet belongs to a DIFFERENT network's block is rejected —
+/// a peer cannot bind an address inside another network's /64 (e.g. squat in
+/// the Store infra range) even when the address is unclaimed and its index
+/// is non-zero (so the fixed-infra capability gate does not apply).
+#[tokio::test]
+async fn register_rejects_host_ula_outside_own_network_slot() {
+    let c = coordinator();
+    // `req` self-declares the default network (slot 0); `fffe` is another
+    // block (the Store infra /64), idx 1 so the infra gate does not fire.
+    let foreign = "fd5a:1f00:fffe:1::1";
+    let err = c
+        .register(req_with_requested_ula(85, "squatter", foreign))
+        .await
+        .expect_err("a cross-network host ULA must be rejected");
+    assert!(
+        matches!(err, CoordinatorError::UlaNetworkMismatch { .. }),
+        "expected UlaNetworkMismatch, got {err:?}"
+    );
+    assert_eq!(
+        c.snapshot().len(),
+        0,
+        "the rejected register must leave no roster entry"
+    );
+}
+
+/// The binding still honours a host-slot request inside the peer's OWN
+/// (named) network block — the slot-0 default-network case is covered by
+/// `register_still_honours_non_infra_host_ula_without_tag` above.
+#[tokio::test]
+async fn register_honours_host_ula_in_own_network_slot() {
+    let c = coordinator();
+    let slot = crate::roster::allocator::network_slot("alice");
+    let want = crate::roster::allocator::UlaAllocator::address_for(slot, 7);
+    let request = RegisterRequest {
+        network: "alice".into(),
+        ..req_with_requested_ula(86, "alice-host", &want.to_string())
+    };
+    let (entry, outcome) = c
+        .register(request)
+        .await
+        .expect("an own-slot host ULA is honoured");
+    assert_eq!(outcome, RegisterOutcome::Created);
+    assert_eq!(entry.ula, want);
+}
+
 /// Raw 32-byte pubkey for a register seed — the bytes `pubkey(seed)`
 /// base64-encodes. Lets a test register a relay connection under the SAME
 /// key a peer registered with, so it can assert the connection is torn
@@ -1665,8 +1863,7 @@ async fn register_evicts_stale_holder_and_adopts_requested_ula() {
     // Register a live relay connection under A's pubkey — eviction must
     // tear it down (proves `apply_peer_left` -> `relay.drop_pubkey(A)`).
     let (lo, _lo_rx) = tokio::sync::mpsc::channel(16);
-    c.relay()
-        .register(&pubkey_a, crate::relay::Lane::Lo, lo);
+    c.relay().register(&pubkey_a, crate::relay::Lane::Lo, lo);
     assert!(
         c.relay().forward(&pubkey_a, vec![1, 2, 3], false),
         "relay conn for A is live before eviction"

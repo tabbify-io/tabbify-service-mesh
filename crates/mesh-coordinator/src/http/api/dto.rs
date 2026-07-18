@@ -169,7 +169,11 @@ pub struct RegisterRequest {
     /// coordinator assigns it verbatim. When absent the coordinator falls
     /// back to the standard idx-based derivation. A different peer holding
     /// the same ULA causes the register to be rejected with
-    /// [`crate::roster::coordinator::CoordinatorError::UlaConflict`].
+    /// [`crate::roster::coordinator::CoordinatorError::UlaConflict`]; a
+    /// host-slot address outside the peer's own (authenticated) network
+    /// block is rejected with
+    /// [`crate::roster::coordinator::CoordinatorError::UlaNetworkMismatch`]
+    /// (both 409, so the joiner's sticky-then-free fallback recovers).
     /// `#[serde(default)]` keeps older joiners (which omit this field) working.
     #[serde(default)]
     pub requested_ula: Option<String>,

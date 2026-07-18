@@ -77,6 +77,9 @@ pub struct ReregisterInputs {
     /// Sticky ULA to re-request so the coordinator hands us the same
     /// overlay address (identity preservation). `None` = coordinator-derived.
     pub requested_ula: Option<String>,
+    /// Whether `requested_ula` came from an explicit operator request. A 409
+    /// must remain fatal for this path; sticky identity recovery may fall back.
+    pub strict_requested_ula: bool,
     /// Runner role metadata (all `None` for a plain peer).
     pub kind: Option<String>,
     /// ULA of the supervisor that owns this runner.
@@ -387,8 +390,8 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
     }
 }
 
-/// Register against the coordinator, transparently self-healing a sticky-ULA
-/// `409`.
+/// Register against the coordinator. Persisted sticky identities may recover
+/// from a `409`; explicit requested ULAs fail closed.
 ///
 /// Tries `requested_ula` first. A `409` means a DIFFERENT peer holds that ULA
 /// — e.g. a node redeploy churned its pubkey so the coordinator minted a new
@@ -398,10 +401,7 @@ pub async fn tick_once(ctx: TickCtx<'_>) {
 /// FREE allocation (`requested_ula = None`) so the node rejoins at a fresh
 /// coordinator-assigned address.
 ///
-/// Shared by BOTH the cold-start (initial [`crate::joiner::Joiner::join`]) and
-/// the heartbeat roster-loss re-register paths so a node ALWAYS joins instead
-/// of failing the entire join on a 409 (defense in depth alongside the
-/// coordinator's adopt-on-stale eviction). The control plane re-derives
+/// Shared by the cold-start and heartbeat roster-loss paths. The control plane re-derives
 /// `software_version` from heartbeats, so the FALLBACK register carries
 /// `None`; the first attempt carries the caller-supplied value.
 ///
@@ -427,6 +427,9 @@ pub(crate) async fn register_with_409_fallback(
     .await
     {
         Ok(resp) => Ok(resp),
+        Err(error @ JoinerError::HttpStatus { status: 409, .. }) if inputs.strict_requested_ula => {
+            Err(error)
+        }
         Err(JoinerError::HttpStatus { status: 409, body }) => {
             tracing::warn!(
                 requested_ula = ?inputs.requested_ula,
@@ -680,6 +683,7 @@ mod tests {
             tags: vec![],
             join_token: None,
             requested_ula: None,
+            strict_requested_ula: false,
             kind: None,
             parent: None,
             app_uuid: None,
@@ -1162,6 +1166,42 @@ mod tests {
         );
         assert_eq!(resp.ula, assigned_ula);
         // Both `.expect(1)` verified on drop: one sticky 409 + one free 200.
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn explicit_requested_ula_409_fails_without_allocator_retry() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/mesh/register"))
+            .and(body_partial_json(serde_json::json!({
+                "requested_ula": "fd5a:1f00:fffe::1"
+            })))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_string("requested ULA already claimed"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = CoordinatorClient::new(server.uri(), None, None, None, true).unwrap();
+        let inputs = ReregisterInputs {
+            requested_ula: Some("fd5a:1f00:fffe::1".into()),
+            strict_requested_ula: true,
+            ..reregister_inputs()
+        };
+        let error = register_with_409_fallback(
+            &client,
+            &inputs,
+            51820,
+            None,
+            None,
+            inputs.requested_ula.clone(),
+        )
+        .await
+        .expect_err("an explicit requested ULA conflict must fail closed");
+        assert!(matches!(error, JoinerError::HttpStatus { status: 409, .. }));
         drop(server);
     }
 

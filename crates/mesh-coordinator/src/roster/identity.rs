@@ -131,6 +131,7 @@ mod tests {
             subject: "node".into(),
             network: network.into(),
             tags: tags.iter().map(|s| (*s).to_owned()).collect(),
+            requested_ulas: Vec::new(),
             kind: "join".into(),
             exp: 1_900_000_000,
         }
@@ -192,7 +193,14 @@ mod tests {
     fn capability_tags_merge_over_claims_identity_tags_do_not() {
         let advertised = req(
             "bob",
-            &["supervisor", "firecracker", "builder", "docker", "tag:user-bob", "tag:system"],
+            &[
+                "supervisor",
+                "firecracker",
+                "builder",
+                "docker",
+                "tag:user-bob",
+                "tag:system",
+            ],
         );
         let validated = claims("alice", &["tag:net-alice"]);
         let id = stamp_identity(&advertised, Some(&validated));

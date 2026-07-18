@@ -30,6 +30,14 @@ impl Coordinator {
         let ula: Ipv6Addr = event.ula.parse().map_err(|e: std::net::AddrParseError| {
             CoordinatorError::InvalidPeerId(e.to_string())
         })?;
+        if self
+            .inner
+            .roster
+            .iter()
+            .any(|existing| existing.ula == ula && existing.peer_id != peer_id)
+        {
+            return Err(CoordinatorError::UlaConflict(ula.to_string()));
+        }
         // ULA layout is fd5a:1f00:<network16>:<idx>::1 — the network slot
         // lives in the 3rd hextet, the per-network index in the 4th.
         let network_slot = ula.segments()[2];
@@ -247,9 +255,7 @@ mod tests {
         coord.apply_peer_joined(&joined).expect("apply joined");
         // Register a live relay connection (lo lane) for this peer's pubkey.
         let (lo, _lo_rx) = tokio::sync::mpsc::channel(16);
-        coord
-            .relay()
-            .register(&pubkey, crate::relay::Lane::Lo, lo);
+        coord.relay().register(&pubkey, crate::relay::Lane::Lo, lo);
         assert!(
             coord.relay().forward(&pubkey, vec![1, 2, 3], false),
             "relay forward should reach the live conn before peer-left"
@@ -317,6 +323,39 @@ mod tests {
         };
         let (entry, _) = coord.register(req).await.expect("register");
         assert_eq!(entry.peer_index, 8);
+    }
+
+    #[tokio::test]
+    async fn apply_peer_joined_rejects_duplicate_ula_for_another_peer() {
+        let coord = Coordinator::new(Arc::new(NoopPublisher), Duration::from_secs(60));
+        let first = PeerJoined {
+            peer_id: Uuid::now_v7().to_string(),
+            wg_public_key: vec![1; 32],
+            ula: "fd5a:1f00:1234::1".into(),
+            listen_endpoint: String::new(),
+            display_name: "first".into(),
+            network: "system".into(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            joined_at_micros: 1,
+            kind: "peer".into(),
+            parent: None,
+            app_uuid: None,
+            software_version: None,
+            mesh_version: None,
+            relay_only: false,
+        };
+        coord.apply_peer_joined(&first).expect("first apply");
+        let second = PeerJoined {
+            peer_id: Uuid::now_v7().to_string(),
+            wg_public_key: vec![2; 32],
+            display_name: "second".into(),
+            ..first
+        };
+
+        let error = coord.apply_peer_joined(&second).expect_err("duplicate ULA");
+        assert!(matches!(error, CoordinatorError::UlaConflict(_)));
+        assert_eq!(coord.snapshot().len(), 1);
     }
 
     #[tokio::test]

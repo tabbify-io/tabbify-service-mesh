@@ -255,6 +255,9 @@ pub enum CoordinatorError {
     /// The base64 `wg_public_key` was malformed.
     #[error("invalid base64 in wg_public_key: {0}")]
     PubkeyDecode(String),
+    /// `requested_ula` must be a syntactically valid IPv6 ULA.
+    #[error("invalid requested ULA: {0}")]
+    InvalidRequestedUla(String),
     /// The peer index space is exhausted.
     #[error(transparent)]
     Allocation(#[from] crate::roster::allocator::AllocError),
@@ -273,6 +276,20 @@ pub enum CoordinatorError {
     /// ULA so the coordinator log can surface it.
     #[error("requested ULA already claimed by another peer: {0}")]
     UlaConflict(String),
+    /// A host-slot `requested_ula` lies outside the requesting peer's
+    /// authenticated network block (`segments()[2]` differs from the
+    /// network's slot). The HTTP layer maps this to `409 Conflict` — same
+    /// as [`Self::UlaConflict`] — so a sticky joiner whose network was
+    /// re-tagged falls back to a fresh coordinator-allocated address
+    /// (`register_with_409_fallback` in `mesh-joiner`) instead of wedging
+    /// on a non-retriable 4xx.
+    #[error("requested ULA {ula} is outside network `{network}`'s address block")]
+    UlaNetworkMismatch {
+        /// The requested address, verbatim from the register request.
+        ula: String,
+        /// The peer's effective (authenticated when validated) network.
+        network: String,
+    },
 }
 
 /// Outcome of `register`: whether the peer was new or already in the
@@ -299,6 +316,9 @@ pub(crate) struct Inner {
     pub(crate) roster: DashMap<Uuid, PeerEntry>,
     pub(crate) by_pubkey: DashMap<Vec<u8>, Uuid>,
     pub(crate) allocator: UlaAllocator,
+    /// Serializes stale eviction, allocation, publish and apply as one register
+    /// transaction so two exact-ULA requests cannot both pass uniqueness.
+    pub(crate) registration_lock: tokio::sync::Mutex<()>,
     pub(crate) publisher: SharedPublisher,
     pub(crate) broadcaster: PeerBroadcaster,
     /// Live ACL policy. The coordinator filters every node's view of the
@@ -422,6 +442,7 @@ impl Coordinator {
                 roster: DashMap::new(),
                 by_pubkey: DashMap::new(),
                 allocator: UlaAllocator::new(),
+                registration_lock: tokio::sync::Mutex::new(()),
                 publisher,
                 broadcaster: PeerBroadcaster::new(),
                 policy,
@@ -712,9 +733,9 @@ impl Coordinator {
                     // CAP. Reuses the existing per-pair `direct` signal — no new
                     // wire field. Canonical key so either reporter hits the same.
                     if p.direct {
-                        self.inner
-                            .punch_tracker
-                            .note_confirmed(crate::nat::holepunch::canonical_pair(reporter, target));
+                        self.inner.punch_tracker.note_confirmed(
+                            crate::nat::holepunch::canonical_pair(reporter, target),
+                        );
                     }
                 }
             }
