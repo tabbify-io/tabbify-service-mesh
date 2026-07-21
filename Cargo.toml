@@ -8,6 +8,9 @@ members  = [
     "tools/tabbify-mesh",
     "tools/tabbify-mesh-ca",
 ]
+# Vendored contract crates are standalone path deps (same pattern as the node's
+# vendor/), not workspace members — keep them out of workspace resolution.
+exclude  = ["vendor"]
 
 [workspace.package]
 edition      = "2024"

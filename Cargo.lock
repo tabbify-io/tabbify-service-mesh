@@ -2275,6 +2275,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tabbify-join-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "tabbify-mesh"
 version = "0.1.0"
 dependencies = [
@@ -2321,6 +2328,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "tabbify-join-contract",
  "tabbify-mesh-log",
  "tempfile",
  "thiserror 2.0.18",

@@ -1,0 +1,17 @@
+[package]
+name = "tabbify-join-contract"
+version = "0.1.0"
+edition = "2021"
+description = "Single source of truth for the Tabbify join/mint contract: JoinRequest wire body, container name/kind rules, fixed-infra ULA predicates."
+
+[features]
+# ToSchema derive + field examples for the auth service's OpenAPI document.
+openapi = ["dep:utoipa", "dep:serde_json"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+utoipa = { version = "5", optional = true }
+
+[dev-dependencies]
+serde_json = "1"

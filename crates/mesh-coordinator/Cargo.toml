@@ -43,6 +43,11 @@ tracing            = { workspace = true }
 # field, shared by every mesh entry point. Replaces the inline
 # `tracing_subscriber::fmt().json().init()` this binary used to call.
 tabbify-mesh-log   = { path = "../mesh-log" }
+# Shared join/mint contract (fixed-infra ULA predicates + address-layout
+# constants — the SAME definitions auth mints against). Vendored copy of the
+# canonical private repo tabbify-io/tabbify-join-contract; re-sync `vendor/`
+# on contract changes.
+tabbify-join-contract = { path = "../../vendor/tabbify-join-contract" }
 
 clap     = { workspace = true }
 anyhow   = { workspace = true }

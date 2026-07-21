@@ -20,20 +20,13 @@ use crate::roster::events::PeerJoined;
 use crate::roster::identity::stamp_identity;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::Instant;
+// Fixed-infra ULA predicate + address-layout constants come from the SHARED
+// join/mint contract crate — the same definitions auth mints against, so the
+// set of addresses auth mints and the set this coordinator protects can no
+// longer diverge (the 2026-07-21 registry incident).
+use tabbify_join_contract::{HOST_ULA_SLOT, is_fixed_infra_ula};
 use tracing::info;
 use uuid::Uuid;
-
-/// Second 16-bit segment (`segments()[1]`) of the coordinator's host/infra
-/// ULA block (`fd5a:1f00:…`). Distinct from the supervisor-minted
-/// per-app-runner slot (`fd5a:1f02:…`, `is_ephemeral_peer` in `mesh-joiner`).
-const HOST_ULA_SLOT: u16 = 0x1f00;
-
-/// The ULA index (`segments()[3]`) that the dynamic allocator NEVER hands out
-/// (it starts at 1). A `requested_ula` with `idx == 0` is therefore a FIXED
-/// platform-infra address (e.g. the forge's `fd5a:1f00:ffff::1`) rather than a
-/// normal host peer, so it requires an exact signed join-token capability —
-/// normal host ULAs (`idx >= 1`) keep their existing conflict semantics.
-const INFRA_ULA_IDX: u16 = 0;
 
 impl Coordinator {
     /// Register (or re-register) a peer — escape-hatch convenience that
@@ -613,40 +606,6 @@ impl Coordinator {
     }
 }
 
-/// True when `addr` is a FIXED platform-infra ULA: a unique-local address
-/// (`fc00::/7`) in the coordinator's host slot (`segments()[1] ==`
-/// [`HOST_ULA_SLOT`]) at the reserved index the allocator never issues
-/// (`segments()[3] ==` [`INFRA_ULA_IDX`]) — e.g. the forge's
-/// `fd5a:1f00:ffff::1`.
-///
-/// MUST stay in lockstep with the mint-side copy in `tabbify-service-auth`
-/// (`validate_requested_ulas`, `src/handlers/tokens.rs`): auth refuses to
-/// mint a `requested_ulas` capability for any other address shape, and this
-/// coordinator refuses to grant such an address without one.
-const fn is_fixed_infra_ula(addr: &Ipv6Addr) -> bool {
-    let segments = addr.segments();
-    (segments[0] & 0xfe00 == 0xfc00 && segments[1] == HOST_ULA_SLOT && segments[3] == INFRA_ULA_IDX)
-        || is_legacy_infra_ula(&segments)
-}
-
-/// Legacy fixed platform-infra ULA: the mesh registry has served at
-/// `fd5a:1f00:0:3::1` since before per-network address blocks existed, so its
-/// index is 3 rather than the reserved [`INFRA_ULA_IDX`]. Every stored OCI ref
-/// embeds that address; on 2026-07-21 a registry restart lost it to slot
-/// binding and broke image pulls platform-wide. Granted exactly like an idx-0
-/// infra address — capability-gated, exempt from network-slot binding.
-/// MUST stay in lockstep with the mint-side copy in `tabbify-service-auth`.
-const fn is_legacy_infra_ula(s: &[u16; 8]) -> bool {
-    s[0] == 0xfd5a
-        && s[1] == 0x1f00
-        && s[2] == 0
-        && s[3] == 3
-        && s[4] == 0
-        && s[5] == 0
-        && s[6] == 0
-        && s[7] == 1
-}
-
 /// Gate FIXED platform-infra `requested_ula`s (see [`is_fixed_infra_ula`])
 /// behind an exact signed capability in the validated join-token claims.
 ///
@@ -685,42 +644,5 @@ fn authorize_fixed_requested_ula(
         Err(CoordinatorError::Unauthorized(format!(
             "requested fixed infra ULA {raw} is not authorized by this join token"
         )))
-    }
-}
-
-#[cfg(test)]
-mod fixed_infra_ula_tests {
-    use super::*;
-
-    /// The reserved idx-0 shape stays fixed-infra.
-    #[test]
-    fn reserved_index_zero_addresses_are_fixed_infra() {
-        assert!(is_fixed_infra_ula(&"fd5a:1f00:ffff::1".parse().unwrap()));
-        assert!(is_fixed_infra_ula(&"fd5a:1f00:fffe::1".parse().unwrap()));
-    }
-
-    /// The registry's legacy address predates the idx-0 scheme. Losing this
-    /// grandfather clause re-homes the registry on restart and breaks every
-    /// stored OCI ref (2026-07-21 incident).
-    #[test]
-    fn legacy_registry_address_is_fixed_infra() {
-        assert!(is_fixed_infra_ula(&"fd5a:1f00:0:3::1".parse().unwrap()));
-    }
-
-    /// The clause is exact: neighbours of the legacy address are NOT exempt,
-    /// so it cannot be used to smuggle an arbitrary out-of-block request.
-    #[test]
-    fn addresses_near_the_legacy_one_are_not_fixed_infra() {
-        for near in [
-            "fd5a:1f00:0:3::2",
-            "fd5a:1f00:0:4::1",
-            "fd5a:1f00:1:3::1",
-            "fd5a:1f00:4ed8:16::1",
-        ] {
-            assert!(
-                !is_fixed_infra_ula(&near.parse().unwrap()),
-                "{near} must not be fixed-infra"
-            );
-        }
     }
 }
