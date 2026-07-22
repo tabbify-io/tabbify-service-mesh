@@ -649,6 +649,143 @@ mod tests {
         );
     }
 
+    /// A burst puts exactly ONE handshake-initiation on the wire, however large
+    /// the burst is.
+    ///
+    /// The fast, always-run counterpart to the `#[ignore]`d expired-Tunn guard
+    /// below: it costs no wall-clock, so it runs on every build. Flipping
+    /// `build_handshake_packet`'s `force_resend` back to `true` makes this fail
+    /// immediately with `burst` datagrams instead of one — that flag is what
+    /// caused the 2026-06-07 relay outage (each fresh init reset the handshake
+    /// the peer was still responding to, so no relayed session ever reached
+    /// DATA), and nothing else in the suite catches a flip end-to-end.
+    ///
+    /// Note this also means the burst does NOT put `burst` datagrams on the wire
+    /// for NAT-mapping purposes — suppression collapses it to one. That is the
+    /// deliberate trade the `force_resend = false` fix made: a stable handshake
+    /// beats a wider punch.
+    #[tokio::test]
+    async fn a_burst_puts_exactly_one_initiation_on_the_wire() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind recv");
+        let candidate_addr = receiver.local_addr().expect("recv addr");
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind send"));
+
+        let target = Uuid::from_u128(11);
+        let sessions = session_table_with(target, "fd5a:1f00:1::b", None);
+        let session = sessions
+            .snapshot()
+            .into_iter()
+            .find(|s| s.peer_id == target)
+            .expect("the target session");
+        let plan = PunchPlan {
+            session,
+            endpoint: candidate_addr,
+        };
+
+        execute_punch(&sender, None, &plan, 5, Duration::from_millis(1)).await;
+
+        // Drain everything the burst actually sent.
+        let mut buf = vec![0u8; 2048];
+        let mut sent_count = 0usize;
+        while let Ok(Ok((len, _))) =
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv_from(&mut buf)).await
+        {
+            assert_eq!(
+                buf[0], 1,
+                "every datagram a punch sends is a WG handshake-init"
+            );
+            assert!(len >= 148, "WG handshake-init is 148 bytes, got {len}");
+            sent_count += 1;
+        }
+
+        assert_eq!(
+            sent_count, 1,
+            "a burst of 5 must put exactly ONE initiation on the wire; {sent_count} means \
+             repeats are no longer suppressed (force_resend=true?), which is the \
+             2026-06-07 relay failure"
+        );
+    }
+
+    /// Drive `session`'s `Tunn` to boringtun's permanent EXPIRED state (it gives
+    /// up after `REKEY_ATTEMPT_TIME`). Costs real wall-clock — there is no global
+    /// mock clock — so every test using it is `#[ignore]`d, matching
+    /// `expired_session_is_rearmed_over_relay` in `wg::loops`.
+    async fn drive_tunn_to_expired(session: &Arc<PeerSession>) {
+        let mut scratch = vec![0u8; 65535];
+        {
+            let mut guard = session.tunn.lock().await;
+            let _ = guard.encapsulate(&[], &mut scratch);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            {
+                let mut guard = session.tunn.lock().await;
+                if guard.is_expired() {
+                    return;
+                }
+                let _ = guard.update_timers(&mut scratch);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Tunn failed to reach Expired within the attempt window"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// THE EXPIRED-TUNN SIBLING of
+    /// `build_handshake_packet_suppresses_repeats_within_window`.
+    ///
+    /// The suspicion this pins: `force_resend = false` makes boringtun suppress
+    /// repeats only while a handshake is IN PROGRESS, so a long-idle pair whose
+    /// `Tunn` has EXPIRED might have no in-progress handshake to suppress
+    /// against and mint a fresh initiation per burst iteration — which would
+    /// reproduce the 2026-06-07 relay failure by a different door (over a
+    /// ~100-300 ms relay RTT the response to init #1 lands after we already
+    /// reset to #2-5, so it never matches and the session never reaches DATA).
+    ///
+    /// MEASURED: it does not. An expired `Tunn` mints exactly ONE initiation and
+    /// leaves the expired state on that first call, after which boringtun's
+    /// normal in-progress suppression applies to the rest of the burst. So this
+    /// test PASSES against today's code and exists as a REGRESSION GUARD on that
+    /// invariant, not as a reproduction. If anyone reintroduces `force_resend =
+    /// true` — or boringtun changes what an expired `Tunn` does — this is what
+    /// catches it on the expired path.
+    #[tokio::test]
+    #[ignore = "drives a real boringtun Tunn to 90s expiry (no global mock clock); run with --ignored"]
+    async fn expired_tunn_burst_mints_at_most_one_initiation() {
+        let target = Uuid::from_u128(9);
+        let sessions = session_table_with(target, "fd5a:1f00:1::9", None);
+        let session = sessions
+            .snapshot()
+            .into_iter()
+            .find(|s| s.peer_id == target)
+            .expect("the target session");
+
+        drive_tunn_to_expired(&session).await;
+        assert!(
+            session.tunn.lock().await.is_expired(),
+            "precondition: the Tunn must be EXPIRED"
+        );
+
+        // A burst's worth of calls, exactly as `execute_punch` makes them.
+        let mut minted = 0usize;
+        for _ in 0..BURST_FOR_TEST {
+            if build_handshake_packet(&session).await.is_some() {
+                minted += 1;
+            }
+        }
+
+        assert!(
+            minted <= 1,
+            "an expired-Tunn burst must mint AT MOST ONE initiation (a fresh init \
+             per iteration resets the handshake the peer is responding to); minted {minted}"
+        );
+    }
+
+    /// The burst size the canary ran with, and what the test above simulates.
+    const BURST_FOR_TEST: usize = 5;
+
     fn ev(initiator: Uuid, target: Uuid, endpoint: &str) -> HolePunchInitiate {
         HolePunchInitiate {
             initiator_peer_id: initiator.to_string(),
