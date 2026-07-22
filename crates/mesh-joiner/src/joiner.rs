@@ -947,17 +947,42 @@ fn push_relay_tasks(
 /// runs working at the cost of a less predictable advertised port — fine
 /// because same-host peers reach each other via loopback / WG roaming, not
 /// via the coordinator-advertised reflexive endpoint.
-/// Bind a non-blocking tokio [`UdpSocket`] on `addr` with `SO_REUSEADDR`
-/// (and `SO_REUSEPORT` on Linux) set BEFORE the bind.
+/// How many times [`bind_udp_with_fallback`] re-tries the PREFERRED port before
+/// giving up and taking an ephemeral one.
+const BIND_RETRY_ATTEMPTS: u32 = 5;
+
+/// Pause between preferred-port retries. `5 × 100ms` bounds a restart's bind at
+/// ~0.5s — long enough for a just-killed predecessor's socket to be reclaimed,
+/// short enough not to stall startup when the port is genuinely held.
+const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Bind a non-blocking tokio [`UdpSocket`] on `addr` with NO address-reuse
+/// flags. Pure-`socket2` (musl-clean), converted to a tokio socket via
+/// `from_std`.
 ///
-/// The reuse flags are what let a FAST restart re-grab the SAME stable
-/// `:51820` port: without `SO_REUSEADDR` a freshly-restarted joiner can hit a
-/// transient `EADDRINUSE` on the lingering socket of the just-exited process
-/// and get demoted to an ephemeral port — which silently breaks reflexive
-/// endpoint discovery (the coordinator advertises a now-wrong port). With the
-/// flags set the rebind succeeds immediately on the stable port. Pure-`socket2`
-/// (musl-clean), converted to a tokio socket via `from_std`.
-fn make_reusable_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+/// ## Why no reuse flags at all
+///
+/// This socket previously set `SO_REUSEADDR` + `SO_REUSEPORT`, to let a FAST
+/// restart re-grab the stable `:51820` rather than hit a transient
+/// `EADDRINUSE`. The cost was that CO-RESIDENT joiners collided SILENTLY: the
+/// supervisor and all 16 runners bound `0.0.0.0:51820` successfully, and Linux
+/// then split inbound `WireGuard` across those sockets, so a handshake response
+/// reached its rightful owner roughly 1 time in 17. Direct connectivity could
+/// not converge on such a host.
+///
+/// Verified on the dedik (Linux 6.12): for a wildcard UDP bind, a duplicate is
+/// admitted ONLY when BOTH sockets set `SO_REUSEADDR` — every other
+/// combination, including `SO_REUSEADDR` on just one side, is `EADDRINUSE`.
+/// Dropping `SO_REUSEPORT` alone would therefore NOT have made the collision
+/// loud; both flags have to go. (macOS refuses the duplicate either way, which
+/// is why a local-only test would have missed this.)
+///
+/// The restart case that motivated the flags is handled instead by the bounded
+/// retry in [`bind_udp_with_fallback`]: a dead predecessor's UDP socket is
+/// reclaimed within milliseconds (UDP has no `TIME_WAIT`), so a retry re-grabs
+/// the same port, while a genuinely co-resident joiner still holds it after the
+/// whole retry budget and we fall back — loudly — to an ephemeral port.
+fn bind_wg_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     let domain = if addr.is_ipv4() {
@@ -966,45 +991,77 @@ fn make_reusable_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
         Domain::IPV6
     };
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
-    // CO-RESIDENCE CAVEAT (FIX 8): `SO_REUSEPORT` lets a same-port rebind
-    // SUCCEED instead of `EADDRINUSE`-ing, but on Linux two joiners bound to the
-    // SAME port on one host then LOAD-BALANCE inbound UDP across both sockets
-    // (kernel hashes by 4-tuple) rather than the second falling back to an
-    // ephemeral port — so a fraction of each peer's frames would be delivered to
-    // the WRONG joiner's `Tunn` and silently dropped. Co-resident joiners (e.g.
-    // the supervisor in-process joiner + the standalone lifeline on one box)
-    // MUST therefore be given DISTINCT `--listen-port` values (e.g. 51820 +
-    // 51821); the ephemeral fallback in `bind_udp_with_fallback` is NOT a
-    // safety net here because the same-port bind no longer errors.
-    #[cfg(target_os = "linux")]
-    sock.set_reuse_port(true)?;
     sock.bind(&addr.into())?;
     sock.set_nonblocking(true)?;
     UdpSocket::from_std(std::net::UdpSocket::from(sock))
 }
 
+/// Bind the preferred port, retrying briefly, and fall back to an OS-picked
+/// ephemeral port if it stays occupied.
+///
+/// The retry separates the two reasons a preferred port can be busy now that no
+/// reuse flags paper over either (see [`bind_wg_udp`]):
+///
+/// * a JUST-EXITED predecessor whose socket the kernel has not finished
+///   reclaiming — clears in milliseconds, so a retry wins the stable port back
+///   and the advertised endpoint does not move;
+/// * a genuinely CO-RESIDENT joiner that holds the port for its whole life — no
+///   number of retries will win it, so after the budget we take an ephemeral
+///   port and say so at `warn`.
+///
+/// Falling back is safe for reachability because the joiner advertises the port
+/// it ACTUALLY bound ([`bind_wg_socket`] reads it back from `local_addr()`); the
+/// peer is reachable on a less predictable port rather than silently splitting
+/// another joiner's traffic.
 fn bind_udp_with_fallback(preferred_port: u16) -> Result<UdpSocket, JoinerError> {
     let preferred = SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), preferred_port);
-    match make_reusable_udp(preferred) {
-        Ok(sock) => Ok(sock),
-        Err(e) if preferred_port != 0 => {
-            tracing::warn!(
-                port = preferred_port,
-                error = %e,
-                "joiner: preferred WG port unavailable, falling back to OS-picked port"
-            );
-            let ephemeral = SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0);
-            make_reusable_udp(ephemeral).map_err(|source| JoinerError::UdpBind {
-                addr: ephemeral,
-                source,
-            })
+    let mut last_err = None;
+    for attempt in 1..=BIND_RETRY_ATTEMPTS {
+        match bind_wg_udp(preferred) {
+            Ok(sock) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        port = preferred_port,
+                        attempt,
+                        "joiner: preferred WG port acquired after a retry \
+                         (a predecessor's socket was still being reclaimed)"
+                    );
+                }
+                return Ok(sock);
+            }
+            Err(e) => {
+                // Port 0 means "any": a failure there is a real bind error, not
+                // contention, so there is nothing to wait for.
+                if preferred_port == 0 {
+                    return Err(JoinerError::UdpBind {
+                        addr: preferred,
+                        source: e,
+                    });
+                }
+                tracing::debug!(
+                    port = preferred_port, attempt, error = %e,
+                    "joiner: preferred WG port busy, retrying"
+                );
+                last_err = Some(e);
+                if attempt < BIND_RETRY_ATTEMPTS {
+                    std::thread::sleep(BIND_RETRY_DELAY);
+                }
+            }
         }
-        Err(source) => Err(JoinerError::UdpBind {
-            addr: preferred,
-            source,
-        }),
     }
+    tracing::warn!(
+        port = preferred_port,
+        attempts = BIND_RETRY_ATTEMPTS,
+        error = ?last_err,
+        "joiner: preferred WG port held by another socket after every retry; \
+         falling back to an OS-picked port. A CO-RESIDENT joiner on this port is \
+         the usual cause — give each one its own --listen-port."
+    );
+    let ephemeral = SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0);
+    bind_wg_udp(ephemeral).map_err(|source| JoinerError::UdpBind {
+        addr: ephemeral,
+        source,
+    })
 }
 
 /// Resolve the local peer identity from `config`.
@@ -1565,47 +1622,93 @@ mod tests {
         assert_eq!(u.handshake_rx_total, 0);
     }
 
-    /// `make_reusable_udp` binds with `SO_REUSEADDR` (and `SO_REUSEPORT` on
-    /// Linux) so a fast restart can re-grab the SAME stable port instead of
-    /// being demoted to an ephemeral one. We assert the reuse flag is set on
-    /// the bound socket via a `socket2` view of the raw fd.
+    /// The WG socket must carry NO address-reuse flags.
+    ///
+    /// Verified on Linux 6.12: a duplicate wildcard UDP bind is admitted ONLY
+    /// when BOTH sockets set `SO_REUSEADDR`. Leaving `SO_REUSEADDR` on (even
+    /// with `SO_REUSEPORT` off) would therefore still let two joiners that both
+    /// set it share a port — which is the fleet-wide collision. Both flags must
+    /// be off, so this asserts both.
     #[tokio::test]
-    async fn make_reusable_udp_sets_reuse_flags() {
+    async fn wg_socket_carries_no_address_reuse_flags() {
         let addr = SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0);
-        let sock = make_reusable_udp(addr).expect("bind reusable udp");
+        let sock = bind_wg_udp(addr).expect("bind wg udp");
 
-        // Re-wrap the raw fd in a socket2 Socket (without taking ownership) to
-        // read back the options. `SockRef` borrows the fd — it must NOT close it.
+        // `SockRef` borrows the fd — it must NOT close it.
         let sref = socket2::SockRef::from(&sock);
         assert!(
-            sref.reuse_address().expect("read reuse_address"),
-            "SO_REUSEADDR must be set"
+            !sref.reuse_address().expect("read reuse_address"),
+            "SO_REUSEADDR must NOT be set: two sockets that both set it are \
+             allowed to share one UDP port on Linux"
         );
         #[cfg(target_os = "linux")]
         assert!(
-            sref.reuse_port().expect("read reuse_port"),
-            "SO_REUSEPORT must be set on Linux"
+            !sref.reuse_port().expect("read reuse_port"),
+            "SO_REUSEPORT must NOT be set: it makes co-resident joiners share a \
+             port and splits inbound WireGuard between them"
         );
     }
 
-    /// With `SO_REUSEPORT` two binds to the SAME concrete port succeed on
-    /// Linux. On platforms without `SO_REUSEPORT` we only assert the first
-    /// bind succeeds (the reuse-address path still re-binds a freed port).
+    /// A second bind of the SAME concrete port must FAIL rather than silently
+    /// succeed. The regression guard for the fleet-wide collision: the
+    /// supervisor and all 16 runners bound `0.0.0.0:51820` successfully and
+    /// then split each other's inbound frames.
     #[tokio::test]
-    async fn make_reusable_udp_double_bind_ok() {
-        // Bind an ephemeral port first to discover a concrete number, then try
-        // to bind it a SECOND time. On Linux + SO_REUSEPORT this succeeds.
-        let first = make_reusable_udp(SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0))
-            .expect("first bind");
+    async fn second_bind_of_an_occupied_port_is_refused() {
+        let first =
+            bind_wg_udp(SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0)).expect("first bind");
         let port = first.local_addr().expect("local_addr").port();
-        let again = make_reusable_udp(SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), port));
-        #[cfg(target_os = "linux")]
+
+        let again = bind_wg_udp(SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), port));
         assert!(
-            again.is_ok(),
-            "SO_REUSEPORT allows a second bind of the same port"
+            again.is_err(),
+            "a co-resident bind of an occupied port must be a LOUD error, not a \
+             silent share (port {port})"
         );
-        // Keep `first` alive across the second bind attempt.
         drop(first);
-        let _ = again;
+    }
+
+    /// A held port is survivable: after the retry budget,
+    /// `bind_udp_with_fallback` takes an OS-picked port instead of failing or
+    /// sharing. The peer stays reachable because the joiner advertises the port
+    /// it ACTUALLY bound, so the outcome is a distinct working port.
+    #[tokio::test]
+    async fn occupied_preferred_port_falls_back_to_a_distinct_port() {
+        let occupant =
+            bind_wg_udp(SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0)).expect("occupy a port");
+        let taken = occupant.local_addr().expect("local_addr").port();
+
+        let fallback = bind_udp_with_fallback(taken).expect("fallback must still bind");
+        let got = fallback.local_addr().expect("local_addr").port();
+        assert_ne!(
+            got, taken,
+            "the fallback must land on a DIFFERENT port than the occupied one"
+        );
+        assert_ne!(got, 0, "the fallback must be a real, advertisable port");
+        drop(occupant);
+    }
+
+    /// A FREE preferred port is taken on the first attempt — the retry loop must
+    /// not cost startup latency in the normal case, and must return the exact
+    /// port asked for (the advertised endpoint depends on it).
+    #[tokio::test]
+    async fn free_preferred_port_is_bound_verbatim() {
+        // Discover a free port by binding and releasing it.
+        let probe =
+            bind_wg_udp(SocketAddr::new(IpAddr::from([0u8, 0, 0, 0]), 0)).expect("probe bind");
+        let port = probe.local_addr().expect("local_addr").port();
+        drop(probe);
+
+        let started = std::time::Instant::now();
+        let sock = bind_udp_with_fallback(port).expect("free port must bind");
+        assert_eq!(
+            sock.local_addr().expect("local_addr").port(),
+            port,
+            "a free preferred port must be bound verbatim, not fallen back from"
+        );
+        assert!(
+            started.elapsed() < BIND_RETRY_DELAY,
+            "binding a free port must not pay any retry delay"
+        );
     }
 }
