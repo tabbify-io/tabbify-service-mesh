@@ -104,6 +104,17 @@ fn is_wg_data_frame(bytes: &[u8]) -> bool {
     bytes.len() > 32 && bytes.first() == Some(&4)
 }
 
+/// Is `bytes` a `WireGuard` HANDSHAKE-CLASS frame — init (1), response (2) or
+/// cookie (3)?
+///
+/// Drives ONLY the per-session handshake observability stamp
+/// ([`PeerSession::note_handshake_rx`]) so the heartbeat can report whether
+/// the latest handshake exchange for a pair rode a direct endpoint or the
+/// relay — the direct-rollout canary signal. Never used for path selection.
+const fn is_wg_handshake_frame(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && matches!(bytes.first(), Some(1..=3))
+}
+
 /// Send already-encapsulated `WireGuard` bytes to `session` over the best
 /// path:
 ///   * a CONFIRMED-direct UDP endpoint; else
@@ -352,6 +363,12 @@ pub(crate) async fn udp_recv_loop(
                             // drain both route through it, so a real data frame
                             // arriving on the roam path still refreshes liveness).
                             session.note_direct_rx(now_micros());
+                            // Handshake observability: the roam-path datagram
+                            // decapsulated cleanly; if it was handshake-class,
+                            // stamp it as a DIRECT handshake RX (this is UDP).
+                            if is_wg_handshake_frame(datagram) {
+                                session.note_handshake_rx(true, now_micros());
+                            }
                             // `via_direct = true`: slow path is still UDP.
                             apply_wg_action(&socket, relay, true, &tun, &sessions, &session, attempt).await;
                             // Drain any queued frames (mirrors process_inbound_datagram).
@@ -432,6 +449,13 @@ pub(crate) async fn process_inbound_datagram(
     // is stamped ONLY on a real DeliverToTun delivery, inside `apply_wg_action`.
     if via_direct && !matches!(first, WgAction::Error(_)) {
         session.note_direct_rx(now_micros());
+    }
+    // Handshake observability (canary telemetry): a VALID handshake-class frame
+    // (init/response/cookie) just arrived — record which transport carried it
+    // so the heartbeat can report "latest handshake was direct/relay" per pair.
+    // Gated on !Error so an unauthenticated/garbage frame never stamps.
+    if is_wg_handshake_frame(datagram) && !matches!(first, WgAction::Error(_)) {
+        session.note_handshake_rx(via_direct, now_micros());
     }
     apply_wg_action(socket, relay, via_direct, tun, sessions, session, first).await;
 
@@ -1277,6 +1301,9 @@ mod tests {
             last_rearm_micros: std::sync::atomic::AtomicI64::new(0),
             rearm_streak: std::sync::atomic::AtomicU32::new(0),
             eager_convergence: std::sync::atomic::AtomicBool::new(false),
+            last_handshake_rx_micros: std::sync::atomic::AtomicI64::new(0),
+            last_handshake_rx_direct: std::sync::atomic::AtomicBool::new(false),
+            handshake_rx_count: std::sync::atomic::AtomicU64::new(0),
             tunn: tokio::sync::Mutex::new(boringtun::noise::Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
@@ -2358,6 +2385,67 @@ mod tests {
                 > 0,
             "a data-bearing frame must stamp the direct-DATA-TX clock (black-hole detection intact)"
         );
+    }
+
+    /// Handshake observability (canary telemetry): a GENUINE `WireGuard`
+    /// handshake-init fed through `process_inbound_datagram` stamps the
+    /// session's handshake snapshot with the transport that carried it —
+    /// `via_direct=false` (relay-injected) records "relay", a later
+    /// `via_direct=true` (UDP socket) records "direct" and wins the latest
+    /// view. Garbage never stamps (decap errors are gated out).
+    #[tokio::test]
+    async fn process_inbound_stamps_handshake_transport() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tun: Arc<dyn TunDevice> = Arc::new(NoopTun);
+        let table = SessionTable::new();
+        // `upsert_peer` builds OUR session for peer A: our private = [9;32],
+        // A's pubkey derived from [3;32]. A real init from A's side must
+        // decapsulate cleanly on it.
+        let session = upsert_peer(&table, "fd5a:1f00:1::1", None);
+        let mut a_tunn = boringtun::noise::Tunn::new(
+            StaticSecret::from([3u8; 32]),
+            PublicKey::from(&StaticSecret::from([9u8; 32])),
+            None,
+            None,
+            7,
+            None,
+        );
+        let mut mint_init = |force: bool| -> Vec<u8> {
+            let mut buf = vec![0u8; 256];
+            match a_tunn.format_handshake_initiation(&mut buf, force) {
+                boringtun::noise::TunnResult::WriteToNetwork(b) => b.to_vec(),
+                other => panic!("expected a handshake-init, got {other:?}"),
+            }
+        };
+
+        // Garbage first: a type-1-looking frame that fails decap must NOT stamp.
+        let mut garbage = vec![0u8; 148];
+        garbage[0] = 1;
+        process_inbound_datagram(&socket, None, false, &tun, &table, &session, &garbage).await;
+        assert_eq!(
+            session.handshake_status(1_000).0,
+            0,
+            "an unauthenticated frame must never stamp the handshake snapshot"
+        );
+
+        // A REAL init injected by the relay path (via_direct = false).
+        let init = mint_init(false);
+        assert_eq!(init[0], 1, "a WG handshake-init");
+        process_inbound_datagram(&socket, None, false, &tun, &table, &session, &init).await;
+        let (count, obs) = session.handshake_status(now_micros());
+        assert_eq!(count, 1, "one valid handshake-class frame");
+        let (direct, _age) = obs.expect("an observation");
+        assert!(!direct, "relay-injected handshake records transport=relay");
+
+        // A fresh init over the UDP socket path (via_direct = true) wins the
+        // latest view. `force=true` mints a brand-new init (test-side only).
+        let init2 = mint_init(true);
+        process_inbound_datagram(&socket, None, true, &tun, &table, &session, &init2).await;
+        let (count, obs) = session.handshake_status(now_micros());
+        assert_eq!(count, 2);
+        let (direct, _age) = obs.expect("an observation");
+        assert!(direct, "UDP-socket handshake records transport=direct");
     }
 
     /// A TUN device that swallows every write — lets the `DeliverToTun` path

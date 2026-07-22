@@ -135,6 +135,11 @@ pub fn route_uplink(
     if coordinator.relay().forward(&dst, downlink.clone(), hi_prio) {
         // Phase-5 metrics: relay offload — this total drops as direct engages.
         coordinator.note_relay_forwarded(downlink.len());
+        // Per-pair canary metrics: the same forward, attributed src → dst so
+        // an operator can watch ONE pair's relay bytes fall to ~0 as its
+        // direct path engages (and spot a relayed re-handshake storm via the
+        // hi_prio counter).
+        coordinator.note_relay_pair_forwarded(my_pubkey, &dst, downlink.len(), hi_prio);
         tracing::debug!(
             src = %B64URL.encode(my_pubkey),
             dst = %B64URL.encode(dst),
@@ -381,6 +386,54 @@ mod tests {
         assert_eq!(&forwarded[32..], b"ping");
         let received = b_rx.try_recv().expect("b received the downlink");
         assert_eq!(received, forwarded);
+    }
+
+    /// Canary observability: every successful forward is ALSO attributed to
+    /// its directed (src, dst) pair — bytes always, plus a handshake-frame
+    /// count for a hi-prio (WG type 1-3) payload — and rendered at /metrics.
+    #[tokio::test]
+    async fn route_uplink_attributes_per_pair_relay_metrics() {
+        let c = coordinator();
+        let (a, _) = c
+            .register(req(1, "a", "a", &["tag:user-a"]))
+            .await
+            .expect("a");
+        let (b, _) = c
+            .register(req(2, "b", "svc", &["tag:svc"]))
+            .await
+            .expect("b");
+        let a_pubkey = [1u8; 32];
+        let b_pubkey = [2u8; 32];
+        let (b_lo, _b_lo_rx) = mpsc::channel(16);
+        let (b_hi, _b_hi_rx) = mpsc::channel(16);
+        c.relay().register(&b_pubkey, Lane::Lo, b_lo);
+        c.relay().register(&b_pubkey, Lane::Hi, b_hi);
+
+        // One DATA frame (first byte 'p' = not 1-3) + one handshake-class
+        // frame (first byte 1).
+        let data = encode_relay_frame(&b_pubkey, b"ping");
+        let forwarded_data = route_uplink(&c, &a_pubkey, &data).expect("data forwarded");
+        let mut hs_payload = vec![1u8; 148];
+        hs_payload[0] = 1;
+        let hs = encode_relay_frame(&b_pubkey, &hs_payload);
+        let forwarded_hs = route_uplink(&c, &a_pubkey, &hs).expect("handshake forwarded");
+
+        let m = c.render_metrics();
+        let expected_bytes = forwarded_data.len() + forwarded_hs.len();
+        assert!(
+            m.contains(&format!(
+                "relay_pair_bytes_total{{src_id=\"{}\",dst_id=\"{}\",src=\"a\",dst=\"b\"}} {expected_bytes}",
+                a.peer_id, b.peer_id
+            )),
+            "pair bytes attribute src→dst:\n{m}"
+        );
+        assert!(
+            m.contains(&format!(
+                "relay_pair_handshake_frames_total{{src_id=\"{}\",dst_id=\"{}\",src=\"a\",dst=\"b\"}} 1",
+                a.peer_id, b.peer_id
+            )),
+            "exactly the handshake-class frame bumps the pair handshake counter:\n{m}"
+        );
     }
 
     /// Relay-rendezvous (R2): a handshake-INIT to a COLD destination (no live

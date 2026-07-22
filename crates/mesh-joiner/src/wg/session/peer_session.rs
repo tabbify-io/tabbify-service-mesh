@@ -9,7 +9,7 @@ use crate::peer::PeerInfo;
 use boringtun::noise::Tunn;
 use std::collections::HashSet;
 use std::net::{Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 /// How long a confirmed-direct path may go without a VALID inbound UDP
@@ -243,6 +243,22 @@ pub struct PeerSession {
     /// default. Relaxed like the other flags; a stale read shifts ONE re-arm
     /// window at worst.
     pub eager_convergence: AtomicBool,
+    /// Unix-micros of the last VALID inbound `WireGuard` handshake-class frame
+    /// (types 1-3: init / response / cookie) from this peer, over EITHER
+    /// transport. `0` = never. Pure observability (direct-rollout canary
+    /// telemetry): reported per pair on the heartbeat so an operator can see
+    /// whether the latest handshake exchange rode a direct endpoint and how
+    /// fresh it is. Never feeds path selection.
+    pub last_handshake_rx_micros: AtomicI64,
+    /// Transport of the LAST inbound handshake-class frame: `true` = it arrived
+    /// on the direct UDP socket, `false` = injected by the relay client. Only
+    /// meaningful while `last_handshake_rx_micros != 0`. Observability only.
+    pub last_handshake_rx_direct: AtomicBool,
+    /// Count of valid inbound handshake-class frames over this session's
+    /// lifetime (both transports). Reported on the heartbeat so an operator can
+    /// spot a re-handshake storm (the 2026-06-07 thrash signature) as a
+    /// per-pair RATE between heartbeats. Observability only.
+    pub handshake_rx_count: AtomicU64,
     /// Boringtun session state. Wrapped in a tokio Mutex so async
     /// send + receive halves can serialise access without holding a
     /// guard across socket I/O.
@@ -322,6 +338,35 @@ impl PeerSession {
     #[must_use]
     pub fn endpoint_learned(&self) -> bool {
         self.endpoint_learned.load(Ordering::Relaxed)
+    }
+
+    /// Record one VALID inbound handshake-class frame (WG types 1-3) and the
+    /// transport it arrived on (`direct` = the UDP socket, else relay). Pure
+    /// observability for the direct-rollout canary: feeds the per-pair
+    /// heartbeat report ([`Self::handshake_status`]); never touches path
+    /// selection, confirmation, or back-off state.
+    pub fn note_handshake_rx(&self, direct: bool, now_micros: i64) {
+        self.last_handshake_rx_micros
+            .store(now_micros, Ordering::Relaxed);
+        self.last_handshake_rx_direct.store(direct, Ordering::Relaxed);
+        self.handshake_rx_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Handshake observability snapshot for the heartbeat report:
+    /// `(handshake_rx_count, Some((last_was_direct, age_micros)))`, or `None`
+    /// for the second element when no handshake-class frame was ever received.
+    /// The age is signed (clock-skew tolerant); callers clamp to a
+    /// non-negative wire value. Relaxed loads — a one-tick-stale read only
+    /// shifts the reported age by one heartbeat.
+    #[must_use]
+    pub fn handshake_status(&self, now_micros: i64) -> (u64, Option<(bool, i64)>) {
+        let count = self.handshake_rx_count.load(Ordering::Relaxed);
+        let at = self.last_handshake_rx_micros.load(Ordering::Relaxed);
+        if at == 0 {
+            return (count, None);
+        }
+        let direct = self.last_handshake_rx_direct.load(Ordering::Relaxed);
+        (count, Some((direct, now_micros - at)))
     }
 
     /// Stamp a DATA-BEARING send over the CONFIRMED direct path. The caller
@@ -613,6 +658,18 @@ impl std::fmt::Debug for PeerSession {
                 "last_rearm_micros",
                 &self.last_rearm_micros.load(Ordering::Relaxed),
             )
+            .field(
+                "last_handshake_rx_micros",
+                &self.last_handshake_rx_micros.load(Ordering::Relaxed),
+            )
+            .field(
+                "last_handshake_rx_direct",
+                &self.last_handshake_rx_direct.load(Ordering::Relaxed),
+            )
+            .field(
+                "handshake_rx_count",
+                &self.handshake_rx_count.load(Ordering::Relaxed),
+            )
             .field("rearm_streak", &self.rearm_streak.load(Ordering::Relaxed))
             .field("tunn", &"<Tunn>")
             .finish()
@@ -624,7 +681,7 @@ impl std::fmt::Debug for PeerSession {
 mod tests {
     use super::*;
     use boringtun::noise::Tunn;
-    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
     use x25519_dalek::{PublicKey, StaticSecret};
 
     /// Build a bare `PeerSession` (no endpoint, empty allowed-set) for
@@ -647,6 +704,9 @@ mod tests {
             last_rearm_micros: AtomicI64::new(0),
             rearm_streak: AtomicU32::new(0),
             eager_convergence: AtomicBool::new(false),
+            last_handshake_rx_micros: AtomicI64::new(0),
+            last_handshake_rx_direct: AtomicBool::new(false),
+            handshake_rx_count: AtomicU64::new(0),
             tunn: Mutex::new(Tunn::new(
                 StaticSecret::from([1u8; 32]),
                 PublicKey::from(&StaticSecret::from([2u8; 32])),
@@ -681,6 +741,40 @@ mod tests {
         let s = bare_session();
         s.note_direct_rx(1_000);
         assert!(!s.direct_confirmed());
+    }
+
+    /// Handshake observability (canary telemetry): a fresh session reports
+    /// "no handshake seen"; each `note_handshake_rx` bumps the count and the
+    /// LATEST call's transport + age win the snapshot. Never touches the
+    /// direct-path confirm state.
+    #[test]
+    fn handshake_status_tracks_latest_transport_and_count() {
+        let s = bare_session();
+        assert_eq!(
+            s.handshake_status(1_000),
+            (0, None),
+            "fresh session: zero handshakes, no observation"
+        );
+
+        // First handshake-class frame arrives over the RELAY at t=1_000.
+        s.note_handshake_rx(false, 1_000);
+        let (count, obs) = s.handshake_status(3_000);
+        assert_eq!(count, 1);
+        assert_eq!(
+            obs,
+            Some((false, 2_000)),
+            "latest = relay, age = now - stamp"
+        );
+
+        // A later frame over the DIRECT socket replaces the latest view.
+        s.note_handshake_rx(true, 5_000);
+        let (count, obs) = s.handshake_status(6_000);
+        assert_eq!(count, 2, "count is cumulative");
+        assert_eq!(obs, Some((true, 1_000)), "latest = direct");
+        assert!(
+            !s.direct_confirmed(),
+            "handshake observability must never confirm the direct path"
+        );
     }
 
     /// `should_probe_direct` is the per-session rate-limit for the

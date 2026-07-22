@@ -1407,10 +1407,20 @@ pub(crate) fn peer_paths_from_sessions(sessions: &SessionTable, now_micros: i64)
             let (direct, age_micros) = s.path_status(now_micros);
             #[allow(clippy::cast_sign_loss)] // clamped to >= 0 by `.max(0)`.
             let last_rx_age_ms = (age_micros / 1_000).max(0) as u64;
+            // Handshake observability (canary telemetry): which transport
+            // carried the LATEST handshake-class frame, how fresh it is, and
+            // the lifetime count (rate = coordinator-side delta).
+            let (handshake_rx_total, last_hs) = s.handshake_status(now_micros);
+            #[allow(clippy::cast_sign_loss)] // clamped to >= 0 by `.max(0)`.
+            let last_handshake_age_ms = last_hs.map(|(_, age)| (age / 1_000).max(0) as u64);
+            let last_handshake_direct = last_hs.map(|(hs_direct, _)| hs_direct);
             PeerPath {
                 peer_id: s.peer_id,
                 direct,
                 last_rx_age_ms,
+                last_handshake_direct,
+                last_handshake_age_ms,
+                handshake_rx_total,
             }
         })
         .collect()
@@ -1507,6 +1517,52 @@ mod tests {
         assert_eq!(d.last_rx_age_ms, 5, "age 5_000 micros → 5 ms");
         let r = by_id.get(&relay_id).expect("relay peer reported");
         assert!(!r.direct, "unconfirmed session reports relay");
+    }
+
+    /// `peer_paths_from_sessions` carries the handshake observability triple
+    /// (canary telemetry): a session with no handshake yet reports
+    /// `None`/`None`/`0`; a session that noted a handshake reports the
+    /// latest transport, its ms age (clamped non-negative) and the count.
+    #[test]
+    fn peer_paths_carry_handshake_observability() {
+        let me = x25519_dalek::StaticSecret::from([7u8; 32]);
+        let mk = |ula: &str, peer_id: Uuid| PeerInfo {
+            peer_id,
+            wg_public_key: *x25519_dalek::PublicKey::from(&me).as_bytes(),
+            ula: ula.parse().unwrap(),
+            listen_endpoint: None,
+            display_name: String::new(),
+            tags: vec![],
+            hosted_app_ulas: vec![],
+            software_version: None,
+            mesh_version: None,
+            joined_at_micros: 0,
+        };
+        let seen_id = Uuid::from_u128(1);
+        let unseen_id = Uuid::from_u128(2);
+        let table = SessionTable::new();
+        table.upsert(&me, &mk("fd5a:1f00:1::a", seen_id));
+        table.upsert(&me, &mk("fd5a:1f00:1::b", unseen_id));
+
+        // The first peer's latest handshake-class frame rode the DIRECT
+        // socket at t = 1_000_000 micros; the second never handshaked.
+        let seen = table.by_ula("fd5a:1f00:1::a".parse().unwrap()).unwrap();
+        seen.note_handshake_rx(false, 500_000);
+        seen.note_handshake_rx(true, 1_000_000);
+
+        let paths = peer_paths_from_sessions(&table, 1_004_000);
+        let by_id: std::collections::HashMap<Uuid, &PeerPath> =
+            paths.iter().map(|p| (p.peer_id, p)).collect();
+
+        let s = by_id.get(&seen_id).expect("seen peer reported");
+        assert_eq!(s.last_handshake_direct, Some(true), "latest transport wins");
+        assert_eq!(s.last_handshake_age_ms, Some(4), "4_000 micros -> 4 ms");
+        assert_eq!(s.handshake_rx_total, 2, "lifetime count");
+
+        let u = by_id.get(&unseen_id).expect("unseen peer reported");
+        assert_eq!(u.last_handshake_direct, None, "no observation yet");
+        assert_eq!(u.last_handshake_age_ms, None);
+        assert_eq!(u.handshake_rx_total, 0);
     }
 
     /// `make_reusable_udp` binds with `SO_REUSEADDR` (and `SO_REUSEPORT` on

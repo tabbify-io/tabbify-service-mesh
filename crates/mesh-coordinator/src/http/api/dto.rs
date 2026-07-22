@@ -241,6 +241,22 @@ pub struct PeerPathDto {
     /// that peer.
     #[serde(default)]
     pub last_rx_age_ms: u64,
+    /// Whether the reporter's LATEST inbound `WireGuard` handshake-class frame
+    /// from that peer arrived over its direct UDP socket (`Some(true)`) or via
+    /// the relay (`Some(false)`). `None` = no handshake-class frame observed
+    /// yet, or an older joiner that does not report the field
+    /// (`#[serde(default)]` keeps it interoperable). Canary observability.
+    #[serde(default)]
+    pub last_handshake_direct: Option<bool>,
+    /// Milliseconds since that latest handshake-class frame; `None` exactly
+    /// when `last_handshake_direct` is `None`.
+    #[serde(default)]
+    pub last_handshake_age_ms: Option<u64>,
+    /// The reporter's lifetime count of valid inbound handshake-class frames
+    /// from that peer — the between-heartbeats delta is the pair's
+    /// re-handshake RATE (thrash signature). `0` from older joiners.
+    #[serde(default)]
+    pub handshake_rx_total: u64,
 }
 
 /// Body of `POST /v1/mesh/heartbeat`.
@@ -413,6 +429,19 @@ pub struct TopologyEdge {
     pub direct: bool,
     /// Minimum `last_rx_age_ms` across the reported directions of the pair.
     pub age_ms: u64,
+    /// Whether the FRESHEST reported handshake-class frame on this pair rode
+    /// a direct endpoint (`true`) or the relay (`false`). Always present in
+    /// the wire JSON (`null` = neither direction has observed a handshake
+    /// yet, or both run older joiners) — same nullable/always-present
+    /// contract as `TopologyMachine::software_version`.
+    pub last_handshake_direct: Option<bool>,
+    /// Age in ms of that freshest handshake observation; `null` exactly when
+    /// `last_handshake_direct` is `null`.
+    pub last_handshake_age_ms: Option<u64>,
+    /// Sum of both directions' lifetime handshake-class frame counts — the
+    /// between-polls delta is the pair's re-handshake RATE (the thrash
+    /// signature a direct-rollout canary aborts on). `0` = no observations.
+    pub handshake_rx_total: u64,
 }
 
 /// JSON error envelope. Kept dead simple — there's no public-facing

@@ -362,6 +362,9 @@ async fn topology_handler_returns_machines_and_edges() {
             peer_id: b.peer_id.to_string(),
             direct: true,
             last_rx_age_ms: 12,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
 
