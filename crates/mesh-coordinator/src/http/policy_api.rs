@@ -18,6 +18,7 @@
 //!   the existing `peers/stream` SSE — nodes converge without
 //!   re-registering. See [`Coordinator::resync_all_peers`].
 
+use crate::http::admin_auth::{check_admin_bearer, err};
 use crate::http::api::ApiError;
 use crate::policy::{Policy, PolicyReplaceError};
 use crate::roster::coordinator::Coordinator;
@@ -51,42 +52,10 @@ pub(crate) struct PolicyResponse {
     pub etag: String,
 }
 
-fn err(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(ApiError {
-            error: message.into(),
-        }),
-    )
-        .into_response()
-}
-
-/// Verify the `Authorization: Bearer <token>` header against the configured
-/// admin token. Returns `None` on match, or `Some(401 response)` to reject.
-///
-/// (Returns `Option` rather than `Result` so the rejection — a large
-/// `Response` — isn't carried in an `Err` variant, which would bloat every
-/// caller's `Result`.)
-///
-/// Fail-closed: if no admin token is configured, every request is rejected.
+/// Verify the admin bearer for this API. Delegates to the shared
+/// [`check_admin_bearer`] so every admin surface enforces one rule.
 fn check_admin(state: &PolicyApiState, headers: &HeaderMap) -> Option<Response> {
-    let Some(expected) = state.admin_token.as_deref() else {
-        return Some(err(
-            StatusCode::UNAUTHORIZED,
-            "policy admin API disabled (MESH_ADMIN_TOKEN unset)",
-        ));
-    };
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    match presented {
-        Some(tok) if tok == expected => None,
-        _ => Some(err(
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing admin token",
-        )),
-    }
+    check_admin_bearer(state.admin_token.as_deref(), headers, "policy")
 }
 
 /// Fetch the current ACL policy + its `ETag` (admin-gated).

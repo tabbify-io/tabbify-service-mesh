@@ -7,12 +7,18 @@
 //! currently revealed to this viewer so policy changes converge with
 //! synthetic add/remove frames.
 
+use super::RosterApiState;
 use super::dto::{PeerInfo, StreamQuery};
+use crate::http::admin_auth::{check_admin_bearer, err};
 use crate::http::sse::PeerEvent;
 use crate::roster::coordinator::Coordinator;
 use axum::{
     extract::{Query, State},
-    response::sse::{Event as SseFrame, KeepAlive, Sse},
+    http::StatusCode,
+    response::{
+        IntoResponse, Response,
+        sse::{Event as SseFrame, KeepAlive, Sse},
+    },
 };
 use futures::stream::{Stream, StreamExt};
 use std::collections::HashSet;
@@ -26,10 +32,23 @@ use uuid::Uuid;
 /// Live SSE stream of peer-lifecycle + hole-punch events. The connection
 /// opens with a bootstrap burst of the current roster (one `peer_added`
 /// frame per peer), then forwards `peer_added` / `peer_updated` /
-/// `peer_removed` / `holepunch_initiate` frames as they happen. When
-/// `peer_id` is provided, the stream is per-viewer ACL-filtered + the
-/// hole-punch frame is routed only to its initiator. Auth:
-/// transport-level mTLS only — no application bearer.
+/// `peer_removed` / `holepunch_initiate` frames as they happen.
+///
+/// # Auth — viewer resolution fails CLOSED
+///
+/// - `peer_id` names a peer in the roster → per-viewer ACL-filtered stream,
+///   hole-punch frames routed by initiator. This is the joiner's path and
+///   needs no bearer: the identity is checked against the live roster.
+/// - `peer_id` is malformed, or names a peer that is not (or no longer) in
+///   the roster → `401`. An identity the coordinator cannot resolve must
+///   never WIDEN the view; previously all three of these collapsed to "no
+///   filter" and streamed the entire multi-tenant roster.
+/// - `peer_id` omitted → the deliberate unfiltered admin/debug view,
+///   requiring `Authorization: Bearer <MESH_ADMIN_TOKEN>`, else `401`.
+///
+/// A joiner whose peer was swept re-registers and reconnects with the fresh
+/// id; the `401` is the signal, and its reconnect loop already treats a
+/// non-success status as a retryable error.
 ///
 /// SSE wire format: `event: <kind>` + `data: <json>` per frame. The
 /// per-event payload schema is [`PeerEvent`] (mirrored here as a
@@ -41,40 +60,63 @@ use uuid::Uuid;
     tag = "mesh",
     params(
         ("peer_id" = Option<String>, Query,
-            description = "Subscribing viewer's peer-id; when present the stream is ACL-filtered to peers this viewer may see, and hole-punch frames are routed by initiator. Omit for an unfiltered admin/debug view."),
+            description = "Subscribing viewer's peer-id; must name a peer currently in the roster, and the stream is then ACL-filtered to peers this viewer may see with hole-punch frames routed by initiator. Omit AND present the admin bearer for the unfiltered admin/debug view."),
     ),
     responses(
         (status = 200, description = "SSE stream of peer events (text/event-stream)",
             content_type = "text/event-stream",
             body = PeerEvent),
+        (status = 401, description = "Unresolvable peer_id, or unfiltered view requested without a valid admin token", body = crate::http::api::ApiError),
     ),
+    security(("bearer" = []))
 )]
 #[tracing::instrument(
     skip_all,
     fields(peer_id = ?query.peer_id),
 )]
 pub async fn stream_handler(
-    State(coordinator): State<Coordinator>,
+    State(state): State<RosterApiState>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<StreamQuery>,
-) -> Sse<impl Stream<Item = Result<SseFrame, Infallible>>> {
+) -> Response {
+    let coordinator = state.coordinator;
+    // Resolve the viewer's identity BEFORE subscribing, so a rejected
+    // caller never holds a broadcast receiver.
+    let viewer = if let Some(raw) = query.peer_id.as_deref() {
+        // An asserted identity must resolve to a live roster entry.
+        let Some(resolved) = Uuid::from_str(raw)
+            .ok()
+            .and_then(|id| coordinator.peer_tags(id).map(|tags| (id, tags)))
+        else {
+            warn!(
+                peer_id = %raw,
+                "rejected peer-stream: viewer id is malformed or absent from the roster"
+            );
+            return err(
+                StatusCode::UNAUTHORIZED,
+                "unknown peer_id; re-register before subscribing to the peer stream",
+            );
+        };
+        Some(resolved)
+    } else {
+        // No asserted identity → the unfiltered admin view, admin-gated.
+        if let Some(resp) = check_admin_bearer(state.admin_token.as_deref(), &headers, "roster") {
+            warn!("rejected unauthenticated unfiltered peer-stream subscription");
+            return resp;
+        }
+        None
+    };
+
     // Bootstrap the subscriber with the current roster, THEN attach to
     // the live broadcast. The subscribe-then-snapshot ordering would
     // race — between subscribe and snapshot a peer could leave and the
     // remove frame would arrive before the bootstrap "added" frame.
     let receiver = coordinator.broadcaster().subscribe();
-
-    // Resolve the viewer's identity. An unknown / absent peer_id yields a
-    // `None` filter (unfiltered stream — backward-compatible admin view).
-    // A known peer_id installs an ACL filter keyed on that viewer's tags.
-    let viewer = query
-        .peer_id
-        .as_deref()
-        .and_then(|s| Uuid::from_str(s).ok())
-        .and_then(|id| coordinator.peer_tags(id).map(|tags| (id, tags)));
-
     let snapshot = coordinator.snapshot();
     let stream = peer_event_stream(coordinator, viewer, snapshot, receiver);
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 /// Per-viewer ACL filter for the SSE stream.

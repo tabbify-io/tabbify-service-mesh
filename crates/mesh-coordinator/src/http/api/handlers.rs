@@ -2,10 +2,12 @@
 //! (register / heartbeat / deregister / peers). The SSE stream lives in
 //! [`super::stream`].
 
+use super::RosterApiState;
 use super::dto::{
     ApiError, DeregisterRequest, HeartbeatRequest, HeartbeatResponse, RegisterRequest,
     RegisterResponse, RosterQuery, RosterResponse, TopologyResponse,
 };
+use crate::http::admin_auth::check_admin_bearer;
 use crate::roster::coordinator::{Coordinator, CoordinatorError};
 use axum::{
     Json,
@@ -252,10 +254,24 @@ pub async fn deregister_handler(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Roster snapshot — UNFILTERED, ordered by peer index. Intended for
-/// admin / debug / observability tooling; joiners use the per-viewer
-/// ACL-filtered stream at `/v1/mesh/peers/stream` instead. Auth:
-/// transport-level mTLS only — no application bearer.
+/// Roster snapshot — the FULL multi-tenant roster, ordered by peer index.
+/// Intended for admin / debug / observability tooling; joiners use the
+/// per-viewer ACL-filtered stream at `/v1/mesh/peers/stream` instead.
+///
+/// # Auth
+///
+/// Requires `Authorization: Bearer <MESH_ADMIN_TOKEN>`; anything else is
+/// `401`, and a coordinator with no configured admin token refuses every
+/// call (fail-closed).
+///
+/// Transport mTLS alone can NOT gate this: every tenant's joiner holds a
+/// cert signed by the same mesh CA, so "presented a valid client cert"
+/// proves membership of the mesh, not entitlement to enumerate it. This
+/// response spans all tenants, so it needs an authorization input that
+/// distinguishes an operator from an ordinary member — the admin bearer.
+/// `?vantage=` is caller-supplied and deliberately NOT such an input: it
+/// only re-stamps connectivity, and honouring it as identity would let any
+/// caller name a peer and inherit its view.
 ///
 /// Each peer's live `connectivity` (`"direct"` / `"relay"` / omitted) is, by
 /// default, a PER-MACHINE self-view stamped from that peer's OWN last-reported
@@ -268,17 +284,24 @@ pub async fn deregister_handler(
     path = "/v1/mesh/peers",
     tag = "mesh",
     params(
-        ("vantage" = Option<String>, Query, description = "Override the default per-machine self-view: stamp each peer's connectivity from THIS peer's reported live paths"),
+        ("vantage" = Option<String>, Query, description = "Override the default per-machine self-view: stamp each peer's connectivity from THIS peer's reported live paths. Advisory only — never an authorization input"),
     ),
     responses(
         (status = 200, description = "Full roster snapshot (admin / debug view)", body = RosterResponse),
+        (status = 401, description = "Missing / invalid admin token (or admin token unset)", body = ApiError),
     ),
+    security(("bearer" = []))
 )]
 #[tracing::instrument(skip_all)]
 pub async fn peers_handler(
-    State(coordinator): State<Coordinator>,
+    State(state): State<RosterApiState>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<RosterQuery>,
 ) -> Response {
+    if let Some(resp) = check_admin_bearer(state.admin_token.as_deref(), &headers, "roster") {
+        warn!("rejected unauthenticated roster read on /v1/mesh/peers");
+        return resp;
+    }
     // A malformed vantage UUID degrades to "no vantage" (the default
     // per-machine self-view) rather than 400 — the field is purely advisory
     // (connectivity stamping).
@@ -287,7 +310,7 @@ pub async fn peers_handler(
         .as_deref()
         .and_then(|v| Uuid::from_str(v).ok());
     Json(RosterResponse {
-        peers: coordinator.snapshot_with_vantage(vantage),
+        peers: state.coordinator.snapshot_with_vantage(vantage),
     })
     .into_response()
 }
@@ -295,8 +318,14 @@ pub async fn peers_handler(
 /// Machine graph — the roster projected into `{ machines, edges }`,
 /// EXCLUDING app-runners and collapsing the directed connectivity paths
 /// into undirected machine↔machine edges. Read-only, intended for the
-/// admin / topology UI. Same auth posture as [`peers_handler`]:
-/// transport-level mTLS only — no application bearer.
+/// admin / topology UI.
+///
+/// # Auth
+///
+/// Same gate as [`peers_handler`]: `Authorization: Bearer
+/// <MESH_ADMIN_TOKEN>`, else `401`. This is the same multi-tenant roster in
+/// another shape — machine names, ULAs and tags for every tenant — so it
+/// carries the same requirement.
 ///
 /// See [`Coordinator::topology`] for the exact filtering + edge-collapse
 /// rules.
@@ -308,11 +337,20 @@ pub async fn peers_handler(
     tag = "mesh",
     responses(
         (status = 200, description = "Machine graph: machines (runners excluded) + undirected edges", body = TopologyResponse),
+        (status = 401, description = "Missing / invalid admin token (or admin token unset)", body = ApiError),
     ),
+    security(("bearer" = []))
 )]
 #[tracing::instrument(skip_all)]
-pub async fn topology_handler(State(coordinator): State<Coordinator>) -> Response {
-    Json(coordinator.topology()).into_response()
+pub async fn topology_handler(
+    State(state): State<RosterApiState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(resp) = check_admin_bearer(state.admin_token.as_deref(), &headers, "roster") {
+        warn!("rejected unauthenticated roster read on /v1/mesh/topology");
+        return resp;
+    }
+    Json(state.coordinator.topology()).into_response()
 }
 
 /// `GET /metrics` — Prometheus-style text exposition of the Phase-5 rollout

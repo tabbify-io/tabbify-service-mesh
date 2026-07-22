@@ -93,6 +93,332 @@ fn peer_names(body: &Value) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------
+// Roster-read endpoints are admin-gated (no anonymous full-roster read).
+//
+// `GET /v1/mesh/peers` and `GET /v1/mesh/topology` expose the WHOLE
+// multi-tenant roster. Transport mTLS proves only "signed by the mesh CA",
+// which every tenant's joiner is — so it cannot separate tenants. The
+// `?vantage=` query param is caller-supplied and therefore not an
+// authorization input. These endpoints are consequently gated on the same
+// `MESH_ADMIN_TOKEN` bearer the policy / command / direct / proactive admin
+// APIs already use, and fail closed when it is unset.
+// ---------------------------------------------------------------------
+
+/// Register two peers in mutually-isolated tenants and return the base URL
+/// plus the server handle. `a1` is tenant A, `b1` is tenant B; under
+/// [`shared_service_policy`] neither may see the other.
+async fn spawn_two_tenants(
+    admin_token: Option<String>,
+) -> (String, tokio::task::JoinHandle<()>, Value, Value) {
+    let (addr, handle) = spawn(shared_service_policy(), admin_token).await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let a1 = register(&client, &base, 1, "a1", "a", &["tag:user-a"]).await;
+    let b1 = register(&client, &base, 3, "b1", "b", &["tag:user-b"]).await;
+    (base, handle, a1, b1)
+}
+
+/// An anonymous `GET /v1/mesh/peers` must not hand back the roster. Before
+/// the gate this returned `200` with EVERY tenant's peers.
+#[tokio::test]
+async fn peers_endpoint_rejects_unauthenticated_caller() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/v1/mesh/peers"))
+        .send()
+        .await
+        .expect("get peers");
+    assert_eq!(
+        resp.status(),
+        401,
+        "anonymous roster read must be rejected, not served"
+    );
+    let body = resp.text().await.expect("body");
+    assert!(
+        !body.contains("\"display_name\":\"a1\"") && !body.contains("\"display_name\":\"b1\""),
+        "a rejected roster read must leak no peer at all: {body}"
+    );
+}
+
+/// A caller holding a WRONG bearer is equally rejected — a valid mesh client
+/// cert plus a guessed token is not authorization.
+#[tokio::test]
+async fn peers_endpoint_rejects_wrong_admin_token() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/v1/mesh/peers"))
+        .header("authorization", "Bearer not-the-admin-token")
+        .send()
+        .await
+        .expect("get peers");
+    assert_eq!(resp.status(), 401, "wrong admin token must be 401");
+}
+
+/// The `?vantage=` param is caller-supplied and must NOT act as an
+/// authorization input: asserting an identity does not buy a roster read.
+#[tokio::test]
+async fn peers_endpoint_vantage_param_is_not_authorization() {
+    let (base, _s, a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+    let a1_id = a1["peer_id"].as_str().expect("a1 id");
+
+    let resp = client
+        .get(format!("{base}/v1/mesh/peers?vantage={a1_id}"))
+        .send()
+        .await
+        .expect("get peers");
+    assert_eq!(
+        resp.status(),
+        401,
+        "a spoofable vantage hint must not authorize a roster read"
+    );
+}
+
+/// With a valid admin bearer the endpoint still serves the full roster —
+/// the admin/debug view is preserved, just authenticated now.
+#[tokio::test]
+async fn peers_endpoint_serves_full_roster_to_admin() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/v1/mesh/peers"))
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .send()
+        .await
+        .expect("get peers");
+    assert_eq!(resp.status(), 200, "admin bearer must be accepted");
+    let body: Value = resp.json().await.expect("json");
+    let names = peer_names(&body);
+    assert!(names.contains(&"a1".to_owned()), "admin sees a1: {names:?}");
+    assert!(names.contains(&"b1".to_owned()), "admin sees b1: {names:?}");
+}
+
+/// Fail-closed: a coordinator started WITHOUT `MESH_ADMIN_TOKEN` rejects
+/// every roster read rather than falling back to serving it openly. Same
+/// posture as the policy admin API.
+#[tokio::test]
+async fn peers_endpoint_fails_closed_when_admin_token_unset() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(None).await;
+    let client = reqwest::Client::new();
+
+    for auth in [None, Some("Bearer anything")] {
+        let mut req = client.get(format!("{base}/v1/mesh/peers"));
+        if let Some(a) = auth {
+            req = req.header("authorization", a);
+        }
+        let resp = req.send().await.expect("get peers");
+        assert_eq!(
+            resp.status(),
+            401,
+            "no configured admin token must fail closed (auth={auth:?})"
+        );
+    }
+}
+
+/// The topology graph is the same roster in another shape — it must carry
+/// the same gate. Before the fix this returned every tenant's machines.
+#[tokio::test]
+async fn topology_endpoint_rejects_unauthenticated_caller() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/v1/mesh/topology"))
+        .send()
+        .await
+        .expect("get topology");
+    assert_eq!(resp.status(), 401, "anonymous topology read must be 401");
+    let body = resp.text().await.expect("body");
+    assert!(
+        !body.contains("\"name\":\"a1\"") && !body.contains("\"name\":\"b1\""),
+        "a rejected topology read must leak no machine: {body}"
+    );
+}
+
+/// Wrong bearer → 401 on topology too.
+#[tokio::test]
+async fn topology_endpoint_rejects_wrong_admin_token() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/v1/mesh/topology"))
+        .header("authorization", "Bearer nope")
+        .send()
+        .await
+        .expect("get topology");
+    assert_eq!(resp.status(), 401, "wrong admin token must be 401");
+}
+
+/// The admin graph consumer (node → wwww) keeps working when it presents
+/// the admin bearer: both tenants' machines are still returned.
+#[tokio::test]
+async fn topology_endpoint_serves_full_graph_to_admin() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/v1/mesh/topology"))
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .send()
+        .await
+        .expect("get topology");
+    assert_eq!(resp.status(), 200, "admin bearer must be accepted");
+    let body: Value = resp.json().await.expect("json");
+    let names: Vec<String> = body["machines"]
+        .as_array()
+        .expect("machines array")
+        .iter()
+        .map(|m| m["name"].as_str().expect("name").to_owned())
+        .collect();
+    assert!(names.contains(&"a1".to_owned()), "admin sees a1: {names:?}");
+    assert!(names.contains(&"b1".to_owned()), "admin sees b1: {names:?}");
+}
+
+/// Fail-closed on topology with no configured admin token.
+#[tokio::test]
+async fn topology_endpoint_fails_closed_when_admin_token_unset() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(None).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/v1/mesh/topology"))
+        .header("authorization", "Bearer anything")
+        .send()
+        .await
+        .expect("get topology");
+    assert_eq!(resp.status(), 401, "no admin token must fail closed");
+}
+
+// ---------------------------------------------------------------------
+// SSE viewer resolution must fail CLOSED.
+//
+// The stream previously collapsed "absent peer_id", "malformed peer_id" and
+// "peer_id not in the roster" all to `None`, which DISABLED filtering and
+// streamed the entire multi-tenant roster. An unresolvable identity must
+// never widen a view.
+// ---------------------------------------------------------------------
+
+/// A `peer_id` that is a well-formed UUID but absent from the roster must
+/// not yield an unfiltered stream. Before the fix this streamed everyone.
+#[tokio::test]
+async fn sse_stream_rejects_unknown_peer_id() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+    let ghost = uuid::Uuid::now_v7();
+
+    let mut resp = client
+        .get(format!("{base}/v1/mesh/peers/stream?peer_id={ghost}"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("stream");
+    assert_eq!(
+        resp.status(),
+        401,
+        "an unresolvable viewer must be rejected, not promoted to admin"
+    );
+    let buf = read_sse_until(&mut resp, |_| false, 1).await;
+    assert!(
+        !buf.contains("\"display_name\":\"a1\"") && !buf.contains("\"display_name\":\"b1\""),
+        "unknown viewer must receive no roster at all: {buf}"
+    );
+}
+
+/// A malformed `peer_id` must be rejected rather than silently ignored.
+#[tokio::test]
+async fn sse_stream_rejects_malformed_peer_id() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+
+    let mut resp = client
+        .get(format!("{base}/v1/mesh/peers/stream?peer_id=not-a-uuid"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("stream");
+    assert_eq!(resp.status(), 401, "malformed viewer id must be 401");
+    let buf = read_sse_until(&mut resp, |_| false, 1).await;
+    assert!(
+        !buf.contains("\"display_name\":\"b1\""),
+        "malformed viewer must receive no roster: {buf}"
+    );
+}
+
+/// Omitting `peer_id` entirely is the deliberate admin/debug view — it must
+/// now be AUTHENTICATED. Anonymous → 401; admin bearer → the unfiltered
+/// stream, preserved for operators.
+#[tokio::test]
+async fn sse_stream_without_peer_id_requires_admin_token() {
+    let (base, _s, _a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+
+    let mut resp = client
+        .get(format!("{base}/v1/mesh/peers/stream"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("stream");
+    assert_eq!(
+        resp.status(),
+        401,
+        "anonymous unfiltered stream must be 401"
+    );
+    let buf = read_sse_until(&mut resp, |_| false, 1).await;
+    assert!(
+        !buf.contains("\"display_name\":\"b1\""),
+        "anonymous stream must reveal nothing: {buf}"
+    );
+
+    // The authenticated admin view still works.
+    let mut resp = client
+        .get(format!("{base}/v1/mesh/peers/stream"))
+        .header("accept", "text/event-stream")
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .send()
+        .await
+        .expect("admin stream");
+    assert_eq!(resp.status(), 200, "admin bearer must open the stream");
+    let has_name = |b: &str, n: &str| b.contains(&format!("\"display_name\":\"{n}\""));
+    let buf = read_sse_until(&mut resp, |b| has_name(b, "a1") && has_name(b, "b1"), 3).await;
+    assert!(
+        has_name(&buf, "a1") && has_name(&buf, "b1"),
+        "admin stream is unfiltered: {buf}"
+    );
+}
+
+/// A registered viewer's own filtered stream is unaffected by the gate — the
+/// joiner presents its `peer_id` and needs no admin token.
+#[tokio::test]
+async fn sse_stream_still_serves_registered_viewer_without_admin_token() {
+    let (base, _s, a1, _b1) = spawn_two_tenants(Some(ADMIN_TOKEN.to_owned())).await;
+    let client = reqwest::Client::new();
+    let a1_id = a1["peer_id"].as_str().expect("a1 id");
+    // Give a1 a same-tenant peer so there is something visible to observe.
+    let _a2 = register(&client, &base, 2, "a2", "a", &["tag:user-a"]).await;
+
+    let mut resp = client
+        .get(format!("{base}/v1/mesh/peers/stream?peer_id={a1_id}"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("stream");
+    assert_eq!(
+        resp.status(),
+        200,
+        "a registered viewer needs no admin token"
+    );
+    let has_name = |b: &str, n: &str| b.contains(&format!("\"display_name\":\"{n}\""));
+    let buf = read_sse_until(&mut resp, |b| has_name(b, "a2"), 3).await;
+    assert!(has_name(&buf, "a2"), "a1 sees its own tenant: {buf}");
+    assert!(!has_name(&buf, "b1"), "a1 must NOT see tenant B: {buf}");
+}
+
+// ---------------------------------------------------------------------
 // Roster filtering over HTTP (acceptance: isolation).
 // ---------------------------------------------------------------------
 

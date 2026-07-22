@@ -95,7 +95,12 @@ pub struct ApiDoc;
 /// scheme name:
 /// - `POST /v1/mesh/register` carries an end-user join token, validated
 ///   against the configured auth service (`AUTH_URL`, spec §8).
-/// - `GET/PUT /v1/policy` carries the operator's `MESH_ADMIN_TOKEN`.
+/// - `GET/PUT /v1/policy`, the admin-gated `/v1/mesh/...` control endpoints
+///   AND the roster reads (`GET /v1/mesh/peers`, `GET /v1/mesh/topology`,
+///   plus the unfiltered mode of `GET /v1/mesh/peers/stream`) carry the
+///   operator's `MESH_ADMIN_TOKEN`. The roster reads span every tenant, so
+///   transport mTLS — which every tenant's joiner satisfies — cannot gate
+///   them.
 ///
 /// `OpenAPI` 3.0 has no native way to model two different bearer audiences
 /// under one scheme, so the description spells out the dual usage; the
@@ -113,8 +118,10 @@ impl utoipa::Modify for BearerSecurity {
                         .description(Some(
                             "Bearer token. On `POST /v1/mesh/register` this is the \
                              end-user join token validated via AUTH_URL (spec §8); \
-                             on `GET/PUT /v1/policy` it is the operator's \
-                             MESH_ADMIN_TOKEN.",
+                             on `GET/PUT /v1/policy` and on the roster reads \
+                             (`GET /v1/mesh/peers`, `GET /v1/mesh/topology`, and \
+                             `GET /v1/mesh/peers/stream` without `peer_id`) it is \
+                             the operator's MESH_ADMIN_TOKEN.",
                         ))
                         .build(),
                 ),

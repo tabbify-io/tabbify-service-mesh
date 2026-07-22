@@ -20,12 +20,12 @@
 //! its `--proactive` startup default (the SAFE direction when that default is
 //! off), exactly like the per-pair flag store.
 
-use crate::http::api::ApiError;
+use crate::http::admin_auth::check_admin_bearer;
 use crate::roster::coordinator::Coordinator;
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -55,35 +55,9 @@ pub struct ProactiveState {
     pub on: bool,
 }
 
-fn err(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(ApiError {
-            error: message.into(),
-        }),
-    )
-        .into_response()
-}
-
 /// Fail-closed bearer check — identical semantics to the direct + policy APIs.
 fn check_admin(state: &ProactiveApiState, headers: &HeaderMap) -> Option<Response> {
-    let Some(expected) = state.admin_token.as_deref() else {
-        return Some(err(
-            StatusCode::UNAUTHORIZED,
-            "proactive admin API disabled (MESH_ADMIN_TOKEN unset)",
-        ));
-    };
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    match presented {
-        Some(tok) if tok == expected => None,
-        _ => Some(err(
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing admin token",
-        )),
-    }
+    check_admin_bearer(state.admin_token.as_deref(), headers, "proactive")
 }
 
 /// Read the current fleet-wide proactive gate state (admin-gated).
@@ -124,7 +98,7 @@ mod tests {
     use super::*;
     use crate::publisher::EventPublisher;
     use async_trait::async_trait;
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderValue, header};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -192,7 +166,10 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(!coord.proactive_on(), "gate untouched by a rejected request");
+        assert!(
+            !coord.proactive_on(),
+            "gate untouched by a rejected request"
+        );
     }
 
     /// An unset admin token disables the endpoint entirely (401) — a

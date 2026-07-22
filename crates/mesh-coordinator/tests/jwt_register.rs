@@ -32,6 +32,11 @@ fn permissive() -> PolicyStore {
 
 /// Spawn the coordinator HTTP server with a join-token validator pointing
 /// at `auth_uri`.
+/// Admin bearer for reading the roster back (`GET /v1/mesh/peers` is
+/// admin-gated — it spans every tenant). Unrelated to the join JWT under
+/// test here, which authenticates REGISTER.
+const ADMIN_TOKEN: &str = "jwt-test-admin-token";
+
 async fn spawn_with_validator(auth_uri: &str) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let validator = AuthValidator::new(auth_uri).unwrap();
     let coord = Coordinator::with_policy_and_validator(
@@ -40,7 +45,7 @@ async fn spawn_with_validator(auth_uri: &str) -> (SocketAddr, tokio::task::JoinH
         permissive(),
         Some(validator),
     );
-    let router = build_router_with_admin(coord, None);
+    let router = build_router_with_admin(coord, Some(ADMIN_TOKEN.to_owned()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -104,6 +109,7 @@ async fn register_with_valid_bearer_admits_with_claims() {
     // stamped tags we read them back via GET /v1/mesh/peers (unfiltered).
     let peers: Value = client
         .get(format!("http://{addr}/v1/mesh/peers"))
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
         .send()
         .await
         .expect("get peers")
@@ -157,6 +163,7 @@ async fn register_with_revoked_bearer_is_401() {
 
     let peers: Value = client
         .get(format!("http://{addr}/v1/mesh/peers"))
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
         .send()
         .await
         .expect("get peers")
