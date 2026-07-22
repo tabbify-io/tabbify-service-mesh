@@ -752,6 +752,11 @@ impl SessionTable {
             // (`fd5a:1f00:…`) re-arms its expired Tunn on the brisk 5 s base; an
             // ephemeral runner-FC (`fd5a:1f02:…`) keeps the 90 s default.
             eager_convergence: AtomicBool::new(!crate::peer::is_ephemeral_peer(info.ula)),
+            // Handshake observability starts empty: no handshake-class frame
+            // seen yet on this (fresh or key-rotated) session.
+            last_handshake_rx_micros: AtomicI64::new(0),
+            last_handshake_rx_direct: AtomicBool::new(false),
+            handshake_rx_count: std::sync::atomic::AtomicU64::new(0),
             tunn: Mutex::new(tunn),
         });
         // Re-apply any app-ULAs this peer already hosts onto the FRESH

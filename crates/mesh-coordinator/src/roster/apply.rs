@@ -155,6 +155,12 @@ impl Coordinator {
             // peer leaves no stale `direct` enable that a future identity reuse
             // could inherit — the pair must re-flag explicitly.
             self.inner.direct_pair_flags.remove_peer(peer_id);
+            // Prune the per-pair relay counters involving this peer so the
+            // metrics map stays bounded by LIVE pair churn (a departed peer's
+            // rows would otherwise linger until restart).
+            self.inner
+                .relay_pair_stats
+                .retain(|&(a, b), _| a != peer_id && b != peer_id);
         }
     }
 }

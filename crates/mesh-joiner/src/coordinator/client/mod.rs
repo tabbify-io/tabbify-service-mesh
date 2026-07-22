@@ -154,6 +154,23 @@ pub struct PeerPath {
     /// Milliseconds since the last valid inbound datagram from that peer.
     /// Clamped to non-negative.
     pub last_rx_age_ms: u64,
+    /// Whether the LATEST inbound `WireGuard` handshake-class frame from that
+    /// peer arrived over the direct UDP socket (`Some(true)`) or via the relay
+    /// (`Some(false)`). `None` = no handshake-class frame seen yet on this
+    /// session. Canary observability; `#[serde(default)]` keeps an older
+    /// coordinator ignoring it and an older joiner omitting it.
+    #[serde(default)]
+    pub last_handshake_direct: Option<bool>,
+    /// Milliseconds since that latest handshake-class frame. `None` when
+    /// `last_handshake_direct` is `None`. Clamped to non-negative.
+    #[serde(default)]
+    pub last_handshake_age_ms: Option<u64>,
+    /// Total valid inbound handshake-class frames over this session's
+    /// lifetime. The coordinator-side delta between heartbeats is the per-pair
+    /// re-handshake RATE — the 2026-06-07 thrash signature an operator aborts
+    /// a direct-rollout canary on.
+    #[serde(default)]
+    pub handshake_rx_total: u64,
 }
 
 /// Body of `POST /v1/mesh/heartbeat`.

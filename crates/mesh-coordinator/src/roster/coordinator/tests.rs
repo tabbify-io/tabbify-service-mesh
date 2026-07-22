@@ -152,6 +152,9 @@ async fn record_peer_paths_replaces_reporter_edges() {
             peer_id: target.peer_id.to_string(),
             direct: true,
             last_rx_age_ms: 42,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
     assert_eq!(
@@ -176,6 +179,9 @@ async fn record_peer_paths_replaces_reporter_edges() {
             peer_id: target.peer_id.to_string(),
             direct: false,
             last_rx_age_ms: 0,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
 }
@@ -200,12 +206,18 @@ async fn self_connectivity_is_per_machine_self_view() {
                 peer_id: target.peer_id.to_string(),
                 direct: false,
                 last_rx_age_ms: 100,
+                last_handshake_direct: None,
+                last_handshake_age_ms: None,
+                handshake_rx_total: 0,
             },
             PeerPathDto {
                 // A single direct edge anywhere flips the self-view to "direct".
                 peer_id: m_relay.peer_id.to_string(),
                 direct: true,
                 last_rx_age_ms: 3,
+                last_handshake_direct: None,
+                last_handshake_age_ms: None,
+                handshake_rx_total: 0,
             },
         ],
     );
@@ -215,6 +227,9 @@ async fn self_connectivity_is_per_machine_self_view() {
             peer_id: target.peer_id.to_string(),
             direct: false,
             last_rx_age_ms: 250,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
     // m_none reports no edges at all.
@@ -258,6 +273,9 @@ async fn snapshot_stamps_connectivity_from_each_peers_own_paths() {
             peer_id: b.peer_id.to_string(),
             direct: true,
             last_rx_age_ms: 5,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
     c.record_peer_paths(
@@ -266,6 +284,9 @@ async fn snapshot_stamps_connectivity_from_each_peers_own_paths() {
             peer_id: a.peer_id.to_string(),
             direct: false,
             last_rx_age_ms: 200,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
 
@@ -306,11 +327,17 @@ async fn snapshot_with_vantage_overrides_with_single_vantage_view() {
                 peer_id: direct_m.peer_id.to_string(),
                 direct: true,
                 last_rx_age_ms: 5,
+                last_handshake_direct: None,
+                last_handshake_age_ms: None,
+                handshake_rx_total: 0,
             },
             PeerPathDto {
                 peer_id: relay_m.peer_id.to_string(),
                 direct: false,
                 last_rx_age_ms: 200,
+                last_handshake_direct: None,
+                last_handshake_age_ms: None,
+                handshake_rx_total: 0,
             },
         ],
     );
@@ -353,11 +380,17 @@ async fn snapshot_carries_connectivity_age_alongside_connectivity() {
                 peer_id: a.peer_id.to_string(),
                 direct: false,
                 last_rx_age_ms: 500,
+                last_handshake_direct: None,
+                last_handshake_age_ms: None,
+                handshake_rx_total: 0,
             },
             PeerPathDto {
                 peer_id: b.peer_id.to_string(),
                 direct: true,
                 last_rx_age_ms: 12,
+                last_handshake_direct: None,
+                last_handshake_age_ms: None,
+                handshake_rx_total: 0,
             },
         ],
     );
@@ -409,6 +442,9 @@ async fn dead_data_plane_overrides_self_connectivity() {
             peer_id: Uuid::now_v7().to_string(),
             direct: true,
             last_rx_age_ms: 99_999,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
     // ...but it just reported its data plane is dead.
@@ -455,6 +491,9 @@ async fn missing_dataplane_health_never_paints_dead() {
             peer_id: Uuid::now_v7().to_string(),
             direct: false,
             last_rx_age_ms: 10,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
     // No record_dataplane_health call → default healthy.
@@ -2244,11 +2283,17 @@ async fn topology_collapses_edges_and_filters_runners() {
                 peer_id: b.peer_id.to_string(),
                 direct: true,
                 last_rx_age_ms: 50,
+                last_handshake_direct: None,
+                last_handshake_age_ms: None,
+                handshake_rx_total: 0,
             },
             PeerPathDto {
                 peer_id: cc.peer_id.to_string(),
                 direct: false,
                 last_rx_age_ms: 900,
+                last_handshake_direct: None,
+                last_handshake_age_ms: None,
+                handshake_rx_total: 0,
             },
         ],
     );
@@ -2258,6 +2303,9 @@ async fn topology_collapses_edges_and_filters_runners() {
             peer_id: a.peer_id.to_string(),
             direct: false,
             last_rx_age_ms: 30,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
     c.record_peer_paths(
@@ -2266,6 +2314,9 @@ async fn topology_collapses_edges_and_filters_runners() {
             peer_id: a.peer_id.to_string(),
             direct: true,
             last_rx_age_ms: 10,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
 
@@ -2397,11 +2448,17 @@ async fn topology_excludes_runner_by_kind_and_tag_without_1f02_ula() {
                 peer_id: kind_runner.peer_id.to_string(),
                 direct: true,
                 last_rx_age_ms: 5,
+                last_handshake_direct: None,
+                last_handshake_age_ms: None,
+                handshake_rx_total: 0,
             },
             PeerPathDto {
                 peer_id: tag_runner.peer_id.to_string(),
                 direct: true,
                 last_rx_age_ms: 5,
+                last_handshake_direct: None,
+                last_handshake_age_ms: None,
+                handshake_rx_total: 0,
             },
         ],
     );
@@ -2411,6 +2468,9 @@ async fn topology_excludes_runner_by_kind_and_tag_without_1f02_ula() {
             peer_id: a.peer_id.to_string(),
             direct: true,
             last_rx_age_ms: 5,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
     c.record_peer_paths(
@@ -2419,6 +2479,9 @@ async fn topology_excludes_runner_by_kind_and_tag_without_1f02_ula() {
             peer_id: a.peer_id.to_string(),
             direct: true,
             last_rx_age_ms: 5,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
         }],
     );
 
@@ -2446,4 +2509,146 @@ async fn topology_excludes_runner_by_kind_and_tag_without_1f02_ula() {
         assert_ne!(e.to, tag_runner.peer_id.to_string());
     }
     assert!(topo.edges.is_empty(), "the only edges were runner↔machine");
+}
+
+/// Canary observability: the topology edge carries the collapsed handshake
+/// triple. The FRESHEST direction's (transport, age) wins the pair view (a
+/// direction with no observation never wins) and the per-direction lifetime
+/// counts SUM into the pair total.
+#[tokio::test]
+async fn topology_edge_collapses_handshake_observability() {
+    use crate::http::api::PeerPathDto;
+    let c = coordinator();
+    let (a, _) = c.register(req(70, "A")).await.expect("register A");
+    let (b, _) = c.register(req(71, "B")).await.expect("register B");
+
+    // A→B: relayed handshake, STALER (age 500), 3 lifetime frames.
+    c.record_peer_paths(
+        a.peer_id,
+        &[PeerPathDto {
+            peer_id: b.peer_id.to_string(),
+            direct: false,
+            last_rx_age_ms: 40,
+            last_handshake_direct: Some(false),
+            last_handshake_age_ms: Some(500),
+            handshake_rx_total: 3,
+        }],
+    );
+    // B→A: DIRECT handshake, FRESHER (age 100), 2 lifetime frames.
+    c.record_peer_paths(
+        b.peer_id,
+        &[PeerPathDto {
+            peer_id: a.peer_id.to_string(),
+            direct: false,
+            last_rx_age_ms: 60,
+            last_handshake_direct: Some(true),
+            last_handshake_age_ms: Some(100),
+            handshake_rx_total: 2,
+        }],
+    );
+
+    let topo = c.topology();
+    assert_eq!(topo.edges.len(), 1, "one collapsed pair edge");
+    let e = &topo.edges[0];
+    assert_eq!(
+        e.last_handshake_direct,
+        Some(true),
+        "the fresher (direct) observation wins the pair view"
+    );
+    assert_eq!(e.last_handshake_age_ms, Some(100), "freshest age surfaces");
+    assert_eq!(e.handshake_rx_total, 5, "per-direction counts sum");
+}
+
+/// Canary observability: an edge whose directions carry NO handshake
+/// observation (older joiners) surfaces null/null/0 — never a fabricated
+/// value.
+#[tokio::test]
+async fn topology_edge_handshake_fields_null_without_observations() {
+    use crate::http::api::PeerPathDto;
+    let c = coordinator();
+    let (a, _) = c.register(req(72, "A")).await.expect("register A");
+    let (b, _) = c.register(req(73, "B")).await.expect("register B");
+    c.record_peer_paths(
+        a.peer_id,
+        &[PeerPathDto {
+            peer_id: b.peer_id.to_string(),
+            direct: false,
+            last_rx_age_ms: 40,
+            last_handshake_direct: None,
+            last_handshake_age_ms: None,
+            handshake_rx_total: 0,
+        }],
+    );
+    let topo = c.topology();
+    let e = &topo.edges[0];
+    assert_eq!(e.last_handshake_direct, None);
+    assert_eq!(e.last_handshake_age_ms, None);
+    assert_eq!(e.handshake_rx_total, 0);
+}
+
+/// Per-pair relay metrics (the canary signal): forwarded bytes attribute to
+/// the (src, dst) peer pair resolved via the pubkey index; handshake-class
+/// (hi-prio) frames additionally bump the pair's handshake counter; unknown
+/// pubkeys are skipped; and the labeled series render in `/metrics` with
+/// escaped display names.
+#[tokio::test]
+async fn relay_pair_metrics_attribute_render_and_skip_unknown() {
+    let c = coordinator();
+    let (a, _) = c.register(req(80, "peer\"a")).await.expect("register A");
+    let (b, _) = c.register(req(81, "peer-b")).await.expect("register B");
+    let a_pk = [80u8; 32];
+    let b_pk = [81u8; 32];
+
+    // Two data frames + one handshake-class frame A→B; one data frame B→A.
+    c.note_relay_pair_forwarded(&a_pk, &b_pk, 100, false);
+    c.note_relay_pair_forwarded(&a_pk, &b_pk, 50, false);
+    c.note_relay_pair_forwarded(&a_pk, &b_pk, 148, true);
+    c.note_relay_pair_forwarded(&b_pk, &a_pk, 32, false);
+    // Unknown pubkey on either side → skipped entirely.
+    c.note_relay_pair_forwarded(&[9u8; 32], &b_pk, 1_000_000, false);
+    c.note_relay_pair_forwarded(&a_pk, &[9u8; 32], 1_000_000, false);
+
+    let m = c.render_metrics();
+    let a_id = a.peer_id.to_string();
+    let b_id = b.peer_id.to_string();
+    assert!(
+        m.contains(&format!(
+            "relay_pair_bytes_total{{src_id=\"{a_id}\",dst_id=\"{b_id}\",src=\"peer\\\"a\",dst=\"peer-b\"}} 298"
+        )),
+        "A→B bytes accumulate under escaped labels:\n{m}"
+    );
+    assert!(
+        m.contains(&format!(
+            "relay_pair_bytes_total{{src_id=\"{b_id}\",dst_id=\"{a_id}\",src=\"peer-b\",dst=\"peer\\\"a\"}} 32"
+        )),
+        "B→A is a distinct directed row:\n{m}"
+    );
+    assert!(
+        m.contains(&format!(
+            "relay_pair_handshake_frames_total{{src_id=\"{a_id}\",dst_id=\"{b_id}\",src=\"peer\\\"a\",dst=\"peer-b\"}} 1"
+        )),
+        "only the hi-prio frame bumps the handshake counter:\n{m}"
+    );
+    assert!(
+        !m.contains("1000000"),
+        "unknown-pubkey forwards must not create rows:\n{m}"
+    );
+}
+
+/// A departed peer's per-pair relay rows are pruned with its roster entry so
+/// the metrics map stays bounded by live-pair churn.
+#[tokio::test]
+async fn relay_pair_metrics_pruned_on_peer_left() {
+    let c = coordinator();
+    let (a, _) = c.register(req(82, "gone")).await.expect("register A");
+    let (_b, _) = c.register(req(83, "stays")).await.expect("register B");
+    c.note_relay_pair_forwarded(&[82u8; 32], &[83u8; 32], 77, false);
+    assert!(c.render_metrics().contains("relay_pair_bytes_total"), "row exists");
+
+    assert!(c.deregister(a.peer_id, "test").await, "deregister A");
+    let m = c.render_metrics();
+    assert!(
+        !m.contains("relay_pair_bytes_total{"),
+        "rows touching the departed peer are pruned:\n{m}"
+    );
 }

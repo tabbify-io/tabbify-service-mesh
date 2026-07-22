@@ -46,6 +46,64 @@ use uuid::Uuid;
 /// emits to its [`crate::publisher::EventPublisher`].
 pub const PEER_SEGMENT: &str = "platform.mesh.peers";
 
+/// One stored DIRECTED connectivity edge (`reporter → target`).
+///
+/// Reported by a peer in its heartbeat `peer_paths` (connectivity visibility
+/// + direct-rollout canary telemetry); lives in [`PeerEntry::paths`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PathEdge {
+    /// `true` = the reporter's current data path to the target is direct
+    /// (p2p); `false` = relay.
+    pub direct: bool,
+    /// Milliseconds since the reporter last received a valid datagram from
+    /// the target.
+    pub last_rx_age_ms: u64,
+    /// Whether the reporter's LATEST inbound `WireGuard` handshake-class
+    /// frame from the target arrived over the direct UDP socket
+    /// (`Some(true)`) or the relay (`Some(false)`). `None` = the reporter
+    /// has seen no handshake-class frame yet, or runs an older joiner that
+    /// does not report the field.
+    pub last_handshake_direct: Option<bool>,
+    /// Milliseconds since that latest handshake-class frame. `None` exactly
+    /// when [`Self::last_handshake_direct`] is `None`.
+    pub last_handshake_age_ms: Option<u64>,
+    /// The reporter's lifetime count of valid inbound handshake-class frames
+    /// from the target. The delta between heartbeats is the per-pair
+    /// re-handshake RATE — the 2026-06-07 thrash signature a canary aborts on.
+    pub handshake_rx_total: u64,
+}
+
+/// Escape a peer display name for use as a Prometheus label VALUE: backslash,
+/// double-quote and newline must be backslash-escaped per the text exposition
+/// format. Display names are operator-supplied strings, so never trust them
+/// to be label-safe.
+fn escape_label(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Per-directed-pair relay-floor counters (src → dst).
+///
+/// Kept in [`Inner::relay_pair_stats`]. Atomics so the relay hot path bumps
+/// them lock-free; rendered at `GET /metrics` as labeled Prometheus series.
+#[derive(Debug, Default)]
+pub(crate) struct PairRelayStat {
+    /// Total relay-forwarded downlink bytes src → dst.
+    pub(crate) bytes: std::sync::atomic::AtomicU64,
+    /// Total relay-forwarded HANDSHAKE-CLASS frames (WG types 1-3, the
+    /// hi-priority lane) src → dst. The between-scrapes delta is the pair's
+    /// relayed re-handshake rate (thrash signature).
+    pub(crate) handshake_frames: std::sync::atomic::AtomicU64,
+}
+
 /// Coordinator-internal record. The wire-facing `PeerInfo` is derived
 /// from this on read so the broadcast format stays in lock-step with
 /// the roster snapshot.
@@ -138,7 +196,7 @@ pub struct PeerEntry {
     /// so a coordinator restart starts each reporter with no edges until its
     /// next heartbeat (correct — stale "direct" must never survive a
     /// restart). Empty for a freshly-joined or older (no-`peer_paths`) peer.
-    pub paths: std::collections::HashMap<Uuid, (bool, u64)>,
+    pub paths: std::collections::HashMap<Uuid, PathEdge>,
     /// This reporter's last self-reported WG data-plane health (Track K /
     /// black-hole pill, Track V). `false` ⇒ the node is sending but receiving
     /// zero decap frames (a wedged WG return path — the MSI incident); the
@@ -360,6 +418,15 @@ pub(crate) struct Inner {
     pub(crate) relay_forwarded_bytes: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) holepunch_emitted: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) relay_wake_emitted: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-DIRECTED-pair relay counters (`(src_peer_id, dst_peer_id)` →
+    /// bytes + handshake-class frames forwarded over the relay floor). The
+    /// direct-rollout canary signal: a pair whose data went direct stops
+    /// growing its bytes counter, and a re-handshake storm shows up as a
+    /// racing handshake-frame counter. Bounded by live-pair churn: entries
+    /// involving a departed peer are pruned with its roster entry
+    /// (`apply_peer_left`), and the whole map resets on coordinator restart
+    /// (same as the global counters). Exposed at `GET /metrics`.
+    pub(crate) relay_pair_stats: DashMap<(Uuid, Uuid), PairRelayStat>,
     /// Ephemeral pubkey → live relay WS connection (Stage-3 relay floor).
     pub(crate) relay: crate::relay::RelayRegistry,
     /// Durable roster snapshot sink. Persisted on every membership change
@@ -454,6 +521,7 @@ impl Coordinator {
                 relay_forwarded_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 holepunch_emitted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 relay_wake_emitted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                relay_pair_stats: DashMap::new(),
                 relay: crate::relay::RelayRegistry::new(),
                 roster_store,
             }),
@@ -569,6 +637,34 @@ impl Coordinator {
             .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Per-pair relay metrics (the direct-rollout canary signal): record one
+    /// relay-forwarded downlink frame from `src_pubkey`'s peer to
+    /// `dst_pubkey`'s peer — `bytes` on the pair's byte counter and, when
+    /// `hi_prio` (a WG handshake-class frame on the hi lane), one on its
+    /// handshake-frame counter. Unknown pubkeys (a peer that raced a
+    /// deregister) are skipped — the global counter above still counted the
+    /// forward. Read-only side-effect; never affects routing.
+    pub fn note_relay_pair_forwarded(
+        &self,
+        src_pubkey: &[u8],
+        dst_pubkey: &[u8],
+        bytes: usize,
+        hi_prio: bool,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (Some(src), Some(dst)) = (
+            self.inner.by_pubkey.get(src_pubkey).map(|id| *id),
+            self.inner.by_pubkey.get(dst_pubkey).map(|id| *id),
+        ) else {
+            return;
+        };
+        let stat = self.inner.relay_pair_stats.entry((src, dst)).or_default();
+        stat.bytes.fetch_add(bytes as u64, Relaxed);
+        if hi_prio {
+            stat.handshake_frames.fetch_add(1, Relaxed);
+        }
+    }
+
     /// Phase-5 metrics: record one emitted `HolePunchInitiate` (the Stage-4
     /// N²-punch alarm signal).
     pub fn note_holepunch_emitted(&self) {
@@ -585,14 +681,19 @@ impl Coordinator {
     }
 
     /// Render the Prometheus-style `/metrics` text exposition — counts only, no
-    /// secrets. A read-only snapshot of the observability counters.
+    /// secrets. A read-only snapshot of the observability counters, including
+    /// the per-directed-pair relay series (`src`/`dst` labels carry the peers'
+    /// display names, `src_id`/`dst_id` their roster UUIDs) — the operator's
+    /// canary view: a pair that went direct stops growing `relay_pair_bytes`,
+    /// and a re-handshake storm races `relay_pair_handshake_frames`.
     #[must_use]
     pub fn render_metrics(&self) -> String {
+        use std::fmt::Write as _;
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = self.inner.relay_forwarded_bytes.load(Relaxed);
         let punches = self.inner.holepunch_emitted.load(Relaxed);
         let wakes = self.inner.relay_wake_emitted.load(Relaxed);
-        format!(
+        let mut out = format!(
             "# HELP relay_forwarded_bytes_total Bytes forwarded over the relay floor.\n\
              # TYPE relay_forwarded_bytes_total counter\n\
              relay_forwarded_bytes_total {bytes}\n\
@@ -602,7 +703,58 @@ impl Coordinator {
              # HELP relay_wake_emitted_total RelayWake rendezvous nudges emitted.\n\
              # TYPE relay_wake_emitted_total counter\n\
              relay_wake_emitted_total {wakes}\n"
-        )
+        );
+        if self.inner.relay_pair_stats.is_empty() {
+            return out;
+        }
+        // Deterministic output: collect + sort by (src, dst) so scrapes and
+        // humans diff cleanly. Names resolve from the live roster at render
+        // time; a departed-but-not-yet-pruned peer renders an empty name.
+        let mut rows: Vec<((Uuid, Uuid), u64, u64)> = self
+            .inner
+            .relay_pair_stats
+            .iter()
+            .map(|kv| {
+                (
+                    *kv.key(),
+                    kv.value().bytes.load(Relaxed),
+                    kv.value().handshake_frames.load(Relaxed),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(pair, _, _)| *pair);
+        let name_of = |id: Uuid| -> String {
+            self.inner
+                .roster
+                .get(&id)
+                .map(|e| escape_label(&e.display_name))
+                .unwrap_or_default()
+        };
+        out.push_str(
+            "# HELP relay_pair_bytes_total Relay-forwarded bytes per directed peer pair.\n\
+             # TYPE relay_pair_bytes_total counter\n",
+        );
+        for ((src, dst), pair_bytes, _) in &rows {
+            let _ = writeln!(
+                out,
+                "relay_pair_bytes_total{{src_id=\"{src}\",dst_id=\"{dst}\",src=\"{}\",dst=\"{}\"}} {pair_bytes}",
+                name_of(*src),
+                name_of(*dst),
+            );
+        }
+        out.push_str(
+            "# HELP relay_pair_handshake_frames_total Relay-forwarded WG handshake-class frames per directed peer pair.\n\
+             # TYPE relay_pair_handshake_frames_total counter\n",
+        );
+        for ((src, dst), _, hs) in &rows {
+            let _ = writeln!(
+                out,
+                "relay_pair_handshake_frames_total{{src_id=\"{src}\",dst_id=\"{dst}\",src=\"{}\",dst=\"{}\"}} {hs}",
+                name_of(*src),
+                name_of(*dst),
+            );
+        }
+        out
     }
 
     /// Borrow the relay registry — the WS handler registers/forwards through it.
@@ -726,7 +878,16 @@ impl Coordinator {
             let mut edges = std::collections::HashMap::with_capacity(paths.len());
             for p in paths {
                 if let Ok(target) = Uuid::parse_str(&p.peer_id) {
-                    edges.insert(target, (p.direct, p.last_rx_age_ms));
+                    edges.insert(
+                        target,
+                        PathEdge {
+                            direct: p.direct,
+                            last_rx_age_ms: p.last_rx_age_ms,
+                            last_handshake_direct: p.last_handshake_direct,
+                            last_handshake_age_ms: p.last_handshake_age_ms,
+                            handshake_rx_total: p.handshake_rx_total,
+                        },
+                    );
                     // R4: a CONFIRMED direct edge resets this pair's punch
                     // re-emit escalation streak, so a later flap back to relay
                     // re-punches briskly at BASE again instead of the decayed
@@ -767,6 +928,7 @@ impl Coordinator {
             .roster
             .get(&vantage)
             .and_then(|e| e.paths.get(&target).copied())
+            .map(|e| (e.direct, e.last_rx_age_ms))
     }
 
     /// Per-machine **self-view** of `peer_id`'s connectivity (the admin
@@ -793,7 +955,7 @@ impl Coordinator {
         if entry.paths.is_empty() {
             return None;
         }
-        let any_direct = entry.paths.values().any(|(direct, _age)| *direct);
+        let any_direct = entry.paths.values().any(|e| e.direct);
         Some(if any_direct { "direct" } else { "relay" }.to_owned())
     }
 
@@ -822,8 +984,8 @@ impl Coordinator {
         if entry.paths.is_empty() {
             return (None, None);
         }
-        let any_direct = entry.paths.values().any(|(direct, _age)| *direct);
-        let min_age = entry.paths.values().map(|(_direct, age)| *age).min();
+        let any_direct = entry.paths.values().any(|e| e.direct);
+        let min_age = entry.paths.values().map(|e| e.last_rx_age_ms).min();
         (
             Some(if any_direct { "direct" } else { "relay" }.to_owned()),
             min_age,
@@ -880,11 +1042,16 @@ impl Coordinator {
             .collect();
 
         // Collapse the directed paths into undirected pairs keyed by the
-        // canonical (lo, hi) UUID-string ordering.
-        let mut pairs: std::collections::HashMap<(String, String), (bool, u64)> =
+        // canonical (lo, hi) UUID-string ordering. `direct` ORs, `age` mins;
+        // the handshake observability collapses as: keep the FRESHEST
+        // direction's (transport, age) — `None` age sorts last so any real
+        // observation wins over "never" — and SUM the per-direction counts
+        // (both directions' inits/responses belong to the same pair's
+        // handshake exchange, and the summed delta is the pair's rate).
+        let mut pairs: std::collections::HashMap<(String, String), PathEdge> =
             std::collections::HashMap::new();
         for reporter in &entries {
-            for (target, (direct, age)) in &reporter.paths {
+            for (target, edge) in &reporter.paths {
                 // Both endpoints must be machines (skip edges to runners /
                 // unknown peers).
                 if !machine_ids.contains(target) {
@@ -895,21 +1062,38 @@ impl Coordinator {
                 let key = if a < b { (a, b) } else { (b, a) };
                 pairs
                     .entry(key)
-                    .and_modify(|(d, ag)| {
-                        *d = *d || *direct;
-                        *ag = (*ag).min(*age);
+                    .and_modify(|acc| {
+                        acc.direct = acc.direct || edge.direct;
+                        acc.last_rx_age_ms = acc.last_rx_age_ms.min(edge.last_rx_age_ms);
+                        // Freshest handshake observation wins (min age; a
+                        // direction with no observation never wins).
+                        let fresher = match (acc.last_handshake_age_ms, edge.last_handshake_age_ms)
+                        {
+                            (None, Some(_)) => true,
+                            (Some(acc_age), Some(new_age)) => new_age < acc_age,
+                            _ => false,
+                        };
+                        if fresher {
+                            acc.last_handshake_age_ms = edge.last_handshake_age_ms;
+                            acc.last_handshake_direct = edge.last_handshake_direct;
+                        }
+                        acc.handshake_rx_total =
+                            acc.handshake_rx_total.saturating_add(edge.handshake_rx_total);
                     })
-                    .or_insert((*direct, *age));
+                    .or_insert(*edge);
             }
         }
 
         let mut edges: Vec<TopologyEdge> = pairs
             .into_iter()
-            .map(|((from, to), (direct, age_ms))| TopologyEdge {
+            .map(|((from, to), edge)| TopologyEdge {
                 from,
                 to,
-                direct,
-                age_ms,
+                direct: edge.direct,
+                age_ms: edge.last_rx_age_ms,
+                last_handshake_direct: edge.last_handshake_direct,
+                last_handshake_age_ms: edge.last_handshake_age_ms,
+                handshake_rx_total: edge.handshake_rx_total,
             })
             .collect();
         edges.sort_by(|x, y| (&x.from, &x.to).cmp(&(&y.from, &y.to)));
