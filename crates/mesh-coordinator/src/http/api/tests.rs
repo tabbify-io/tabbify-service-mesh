@@ -2,8 +2,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+use super::RosterApiState;
 use super::dto::{HeartbeatRequest, PeerPathDto, RegisterRequest};
-use super::handlers::{heartbeat_handler, topology_handler};
+use super::handlers::{heartbeat_handler, peers_handler, topology_handler};
 use super::stream::ViewerFilter;
 use crate::http::sse::PeerEvent;
 use crate::publisher::EventPublisher;
@@ -260,11 +261,7 @@ fn machine_req(seed: u8, name: &str) -> RegisterRequest {
 /// is `None`) for `peer`, carrying `executed_command_ids = acked`, and parse the
 /// response JSON. `HeartbeatResponse` is Serialize-only (a wire response), so
 /// the test reads the JSON shape directly. Used by the Track-C test.
-async fn call_heartbeat(
-    coord: &Coordinator,
-    peer: Uuid,
-    acked: &[String],
-) -> serde_json::Value {
+async fn call_heartbeat(coord: &Coordinator, peer: Uuid, acked: &[String]) -> serde_json::Value {
     let req = HeartbeatRequest {
         peer_id: peer.to_string(),
         wg_listen_port: None,
@@ -328,6 +325,26 @@ async fn heartbeat_carries_pending_commands_and_acks_clear_them() {
     assert_eq!(pending2, 0);
 }
 
+const ADMIN_TOKEN: &str = "test-admin-token";
+
+/// Roster-read state carrying [`ADMIN_TOKEN`] as the expected bearer.
+fn admin_state(c: &Coordinator) -> RosterApiState {
+    RosterApiState {
+        coordinator: c.clone(),
+        admin_token: Some(ADMIN_TOKEN.to_owned()),
+    }
+}
+
+/// An `Authorization: Bearer <tok>` header map.
+fn bearer(tok: &str) -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {tok}").parse().expect("header value"),
+    );
+    h
+}
+
 /// `GET /v1/mesh/topology` (driven through [`topology_handler`]) returns
 /// `200` with both registered machines and the single undirected edge
 /// between them, marked `direct`.
@@ -348,7 +365,7 @@ async fn topology_handler_returns_machines_and_edges() {
         }],
     );
 
-    let resp = topology_handler(State(c)).await;
+    let resp = topology_handler(State(admin_state(&c)), bearer(ADMIN_TOKEN)).await;
     assert_eq!(resp.status(), 200, "topology must be 200");
 
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -364,6 +381,73 @@ async fn topology_handler_returns_machines_and_edges() {
     assert_eq!(edges.len(), 1, "exactly one collapsed edge");
     assert_eq!(edges[0]["direct"], serde_json::json!(true), "A↔B is direct");
     assert_eq!(edges[0]["age_ms"], serde_json::json!(12));
+}
+
+/// Both roster-read handlers reject a caller with no / a wrong bearer, and
+/// reject everything when no admin token is configured (fail-closed). The
+/// handler-level twin of the HTTP tests in `tests/policy_acl.rs` — pinned
+/// here so a future refactor of the router can't quietly drop the gate.
+#[tokio::test]
+async fn roster_read_handlers_reject_non_admin_callers() {
+    let c = test_coordinator();
+    let _ = c.register(machine_req(1, "A")).await.expect("register A");
+
+    let no_auth = axum::http::HeaderMap::new();
+    let gated = admin_state(&c);
+    let unconfigured = RosterApiState {
+        coordinator: c.clone(),
+        admin_token: None,
+    };
+
+    for (state, headers, case) in [
+        (gated.clone(), no_auth.clone(), "missing bearer"),
+        (gated.clone(), bearer("wrong"), "wrong bearer"),
+        (unconfigured.clone(), bearer(ADMIN_TOKEN), "token unset"),
+    ] {
+        let resp = peers_handler(
+            State(state.clone()),
+            headers.clone(),
+            axum::extract::Query(super::dto::RosterQuery { vantage: None }),
+        )
+        .await;
+        assert_eq!(resp.status(), 401, "peers must reject: {case}");
+
+        let resp = topology_handler(State(state), headers).await;
+        assert_eq!(resp.status(), 401, "topology must reject: {case}");
+    }
+
+    // The admin bearer still works on both.
+    let resp = peers_handler(
+        State(gated.clone()),
+        bearer(ADMIN_TOKEN),
+        axum::extract::Query(super::dto::RosterQuery { vantage: None }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "admin peers read must succeed");
+    let resp = topology_handler(State(gated), bearer(ADMIN_TOKEN)).await;
+    assert_eq!(resp.status(), 200, "admin topology read must succeed");
+}
+
+/// A `?vantage=` hint is advisory connectivity stamping, never an
+/// authorization input: naming a real, registered peer buys nothing.
+#[tokio::test]
+async fn vantage_query_does_not_bypass_the_roster_gate() {
+    let c = test_coordinator();
+    let (a, _) = c.register(machine_req(1, "A")).await.expect("register A");
+
+    let resp = peers_handler(
+        State(admin_state(&c)),
+        axum::http::HeaderMap::new(),
+        axum::extract::Query(super::dto::RosterQuery {
+            vantage: Some(a.peer_id.to_string()),
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        401,
+        "a real peer id in ?vantage must not authorize the read"
+    );
 }
 
 /// Track V: a topology machine carries its self-view `connectivity` so the

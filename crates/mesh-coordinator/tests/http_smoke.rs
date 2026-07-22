@@ -10,11 +10,26 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tabbify_mesh_coordinator::{
-    AclRule, Coordinator, NoopPublisher, Policy, PolicyStore, build_router,
+    AclRule, Coordinator, NoopPublisher, Policy, PolicyStore, build_router_with_admin,
 };
 
 fn pubkey(seed: u8) -> String {
     base64::engine::general_purpose::STANDARD.encode([seed; 32])
+}
+
+/// Admin bearer for the roster-READ endpoints (`peers` / `topology` / the
+/// unfiltered SSE view). Those span every tenant, so they are admin-gated;
+/// the register / heartbeat / deregister contract under test here is not.
+const ADMIN_TOKEN: &str = "smoke-admin-token";
+
+/// `GET` a roster-read endpoint with the admin bearer attached.
+async fn get_admin(client: &reqwest::Client, url: &str) -> reqwest::Response {
+    client
+        .get(url)
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .send()
+        .await
+        .expect("admin GET")
 }
 
 /// Permissive policy used by the peer-contract smoke tests: every node can
@@ -32,7 +47,7 @@ async fn spawn_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         Duration::from_secs(60),
         PolicyStore::new(permissive_policy()),
     );
-    let router = build_router(coord);
+    let router = build_router_with_admin(coord, Some(ADMIN_TOKEN.to_owned()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -176,11 +191,7 @@ async fn http_heartbeat_and_deregister_flow() {
     assert_eq!(resp.status(), 404);
 
     // GET snapshot path.
-    let resp = client
-        .get(format!("{base}/v1/mesh/peers"))
-        .send()
-        .await
-        .expect("get peers");
+    let resp = get_admin(&client, &format!("{base}/v1/mesh/peers")).await;
     assert_eq!(resp.status(), 200);
     let body = json_body(resp).await;
     assert_eq!(body["peers"].as_array().expect("peers").len(), 2);
@@ -196,11 +207,7 @@ async fn http_heartbeat_and_deregister_flow() {
         assert_eq!(resp.status(), 204);
     }
 
-    let resp = client
-        .get(format!("{base}/v1/mesh/peers"))
-        .send()
-        .await
-        .expect("get peers final");
+    let resp = get_admin(&client, &format!("{base}/v1/mesh/peers")).await;
     let body = json_body(resp).await;
     let peers = body["peers"].as_array().expect("peers");
     assert_eq!(peers.len(), 1, "only peer B should remain");
@@ -255,11 +262,7 @@ async fn http_register_reflects_observed_fields() {
     );
 
     // The peer's roster entry carries that same endpoint for other peers.
-    let resp = client
-        .get(format!("{base}/v1/mesh/peers"))
-        .send()
-        .await
-        .expect("get peers");
+    let resp = get_admin(&client, &format!("{base}/v1/mesh/peers")).await;
     let body = json_body(resp).await;
     let peer = &body["peers"].as_array().expect("peers")[0];
     assert_eq!(peer["listen_endpoint"].as_str(), Some("203.0.113.50:51820"));
@@ -328,6 +331,7 @@ async fn sse_stream_bootstraps_existing_peers() {
     let mut resp = client
         .get(format!("{base}/v1/mesh/peers/stream"))
         .header("accept", "text/event-stream")
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
         .send()
         .await
         .expect("get stream");
@@ -403,14 +407,9 @@ async fn http_peers_stamps_connectivity_from_vantage() {
     assert_eq!(resp.status(), 200);
 
     // GET with vantage=R → M is stamped "direct".
-    let body = json_body(
-        client
-            .get(format!("{base}/v1/mesh/peers?vantage={reporter}"))
-            .send()
-            .await
-            .expect("get peers vantage"),
-    )
-    .await;
+    let body =
+        json_body(get_admin(&client, &format!("{base}/v1/mesh/peers?vantage={reporter}")).await)
+            .await;
     let peers = body["peers"].as_array().expect("peers");
     let m = peers
         .iter()
@@ -423,14 +422,7 @@ async fn http_peers_stamps_connectivity_from_vantage() {
     );
 
     // GET without vantage → no connectivity field (unknown).
-    let body = json_body(
-        client
-            .get(format!("{base}/v1/mesh/peers"))
-            .send()
-            .await
-            .expect("get peers no vantage"),
-    )
-    .await;
+    let body = json_body(get_admin(&client, &format!("{base}/v1/mesh/peers")).await).await;
     let peers = body["peers"].as_array().expect("peers");
     let m = peers
         .iter()
@@ -452,14 +444,9 @@ async fn http_peers_stamps_connectivity_from_vantage() {
     )
     .await;
     assert_eq!(resp.status(), 200);
-    let body = json_body(
-        client
-            .get(format!("{base}/v1/mesh/peers?vantage={reporter}"))
-            .send()
-            .await
-            .expect("get peers vantage 2"),
-    )
-    .await;
+    let body =
+        json_body(get_admin(&client, &format!("{base}/v1/mesh/peers?vantage={reporter}")).await)
+            .await;
     let peers = body["peers"].as_array().expect("peers");
     let m = peers
         .iter()
@@ -504,7 +491,7 @@ async fn get_roster(client: &reqwest::Client, base: &str, vantage: Option<&str>)
         || format!("{base}/v1/mesh/peers"),
         |v| format!("{base}/v1/mesh/peers?vantage={v}"),
     );
-    let body = json_body(client.get(&url).send().await.expect("get peers")).await;
+    let body = json_body(get_admin(client, &url).await).await;
     body["peers"].as_array().cloned().unwrap_or_default()
 }
 
@@ -546,8 +533,15 @@ async fn roster_get_stamps_connectivity_self_view_and_vantage() {
     // Default roster: self-view. reporter holds a direct edge → "direct";
     // target/lonely reported nothing → null.
     let peers = get_roster(&client, &base, None).await;
-    assert_eq!(connectivity_of(&peers, &reporter).as_deref(), Some("direct"));
-    assert_eq!(connectivity_of(&peers, &target), None, "no self-edges → null");
+    assert_eq!(
+        connectivity_of(&peers, &reporter).as_deref(),
+        Some("direct")
+    );
+    assert_eq!(
+        connectivity_of(&peers, &target),
+        None,
+        "no self-edges → null"
+    );
     assert_eq!(connectivity_of(&peers, &lonely), None, "silent peer → null");
 
     // `?vantage=reporter`: the path reporter sees TO each peer. To target it

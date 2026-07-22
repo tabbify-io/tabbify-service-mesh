@@ -40,6 +40,23 @@ use axum::{
     routing::{get, post},
 };
 
+/// State for the roster-READ endpoints (`GET /v1/mesh/peers`,
+/// `GET /v1/mesh/topology`, `GET /v1/mesh/peers/stream`).
+///
+/// These three are the only peer endpoints whose response spans tenants, so
+/// unlike register/heartbeat/deregister they need the admin token alongside
+/// the coordinator. Transport mTLS cannot gate them: every tenant's joiner
+/// carries a cert from the same mesh CA, so a valid client cert proves mesh
+/// membership, not entitlement to enumerate the mesh.
+#[derive(Clone)]
+pub struct RosterApiState {
+    /// The coordinator owning the roster.
+    pub coordinator: Coordinator,
+    /// Expected admin bearer token. `None` fails every admin-scoped roster
+    /// read closed.
+    pub admin_token: Option<String>,
+}
+
 /// Build the full HTTP router with the admin policy API disabled.
 ///
 /// Convenience wrapper over [`build_router_with_admin`] for callers
@@ -54,14 +71,19 @@ pub fn build_router(coordinator: Coordinator) -> Router {
 
 /// Build the full HTTP router, optionally enabling the admin policy API.
 ///
-/// When `admin_token` is `Some`, `GET/PUT /v1/policy` are served and gated
-/// behind `Authorization: Bearer <token>`. When `None`, those endpoints
-/// still exist but reject every call with `401` (fail-closed — a
-/// coordinator with no admin token can't be reconfigured over the wire).
+/// When `admin_token` is `Some`, the admin-scoped endpoints are served and
+/// gated behind `Authorization: Bearer <token>`. When `None`, they still
+/// exist but reject every call with `401` (fail-closed — a coordinator with
+/// no admin token can neither be reconfigured nor enumerated over the wire).
 ///
-/// The peer endpoints (`/v1/mesh/...`) and the policy endpoints carry
-/// different axum state types, so they are built as two sub-routers and
-/// merged.
+/// Admin-scoped surfaces: `GET/PUT /v1/policy`, the per-peer command queue,
+/// the per-pair direct flag, the proactive gate, AND the roster reads
+/// (`GET /v1/mesh/peers`, `GET /v1/mesh/topology`, plus the unfiltered mode
+/// of `GET /v1/mesh/peers/stream`) — the last group because their responses
+/// span every tenant.
+///
+/// Endpoint groups carry different axum state types, so they are built as
+/// separate sub-routers and merged.
 pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<String>) -> Router {
     // Clone the inputs for the command sub-router before they are moved into
     // the peer/policy states below (Track C signed remote-restart).
@@ -74,16 +96,31 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
     let proactive_state_coord = coordinator.clone();
     let proactive_state_token = admin_token.clone();
 
+    // Clone again for the roster-read sub-router (peers / topology / SSE).
+    let roster_state_coord = coordinator.clone();
+    let roster_state_token = admin_token.clone();
+
     let peer_routes = Router::new()
         .route("/v1/mesh/register", post(register_handler))
         .route("/v1/mesh/heartbeat", post(heartbeat_handler))
         .route("/v1/mesh/deregister", post(deregister_handler))
-        .route("/v1/mesh/peers", get(peers_handler))
-        .route("/v1/mesh/topology", get(topology_handler))
         .route("/metrics", get(metrics_handler))
-        .route("/v1/mesh/peers/stream", get(stream_handler))
         .route("/v1/mesh/relay", get(crate::http::relay::relay_ws_handler))
         .with_state(coordinator.clone());
+
+    // Roster READS span every tenant, so they carry the admin token in
+    // their state: `peers` + `topology` are admin-only, and the SSE stream
+    // is admin-only in its unfiltered (no `peer_id`) mode. Its own state
+    // type → its own sub-router, merged below.
+    let roster_state = RosterApiState {
+        coordinator: roster_state_coord,
+        admin_token: roster_state_token,
+    };
+    let roster_routes = Router::new()
+        .route("/v1/mesh/peers", get(peers_handler))
+        .route("/v1/mesh/topology", get(topology_handler))
+        .route("/v1/mesh/peers/stream", get(stream_handler))
+        .with_state(roster_state);
 
     let policy_state = PolicyApiState {
         coordinator,
@@ -118,10 +155,7 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
         admin_token: direct_state_token,
     };
     let direct_routes = Router::new()
-        .route(
-            "/v1/mesh/pairs/:a/:b/direct",
-            post(post_direct_handler),
-        )
+        .route("/v1/mesh/pairs/:a/:b/direct", post(post_direct_handler))
         .with_state(direct_state);
 
     // Stage-4 fleet-wide proactive gate: admin-gated runtime toggle, same
@@ -141,6 +175,7 @@ pub fn build_router_with_admin(coordinator: Coordinator, admin_token: Option<Str
         .with_state(proactive_state);
 
     peer_routes
+        .merge(roster_routes)
         .merge(policy_routes)
         .merge(command_routes)
         .merge(direct_routes)

@@ -9,13 +9,13 @@
 //! `401`. The coordinator is a DUMB RELAY — it never verifies the body's
 //! Ed25519 signature; the node verifies the super-admin key end-to-end.
 
-use crate::http::api::ApiError;
+use crate::http::admin_auth::{check_admin_bearer, err};
 use crate::roster::coordinator::Coordinator;
 use crate::roster::coordinator::command_queue::NodeCommandDto;
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -37,43 +37,21 @@ struct PendingResponse {
     pending: Vec<String>,
 }
 
-fn err(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(ApiError {
-            error: message.into(),
-        }),
-    )
-        .into_response()
-}
-
-/// Fail-closed bearer check — identical semantics to the policy API.
+/// Fail-closed bearer check — the shared rule, same as every admin surface.
 fn check_admin(state: &CommandApiState, headers: &HeaderMap) -> Option<Response> {
-    let Some(expected) = state.admin_token.as_deref() else {
-        return Some(err(
-            StatusCode::UNAUTHORIZED,
-            "command admin API disabled (MESH_ADMIN_TOKEN unset)",
-        ));
-    };
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    match presented {
-        Some(tok) if tok == expected => None,
-        _ => Some(err(
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing admin token",
-        )),
-    }
+    check_admin_bearer(state.admin_token.as_deref(), headers, "command")
 }
 
 /// Parse the path `peer_id`, mapping a malformed UUID to a `400` response.
 /// Returns the parsed id, or `Err(response)` — the caller short-circuits with
 /// it. (`Err` carries the boxed response so the `Result` stays small.)
 fn parse_peer(raw: &str) -> Result<Uuid, Box<Response>> {
-    Uuid::from_str(raw)
-        .map_err(|e| Box::new(err(StatusCode::BAD_REQUEST, format!("invalid peer id: {e}"))))
+    Uuid::from_str(raw).map_err(|e| {
+        Box::new(err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid peer id: {e}"),
+        ))
+    })
 }
 
 /// Enqueue a signed command for the target peer (admin-gated). The coordinator

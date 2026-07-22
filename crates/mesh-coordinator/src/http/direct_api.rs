@@ -10,12 +10,12 @@
 //! next heartbeat (the instant rollback lever). A coordinator restart drops the
 //! whole store → every pair returns to relay (the SAFE direction).
 
-use crate::http::api::ApiError;
+use crate::http::admin_auth::{check_admin_bearer, err};
 use crate::roster::coordinator::Coordinator;
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -46,41 +46,19 @@ pub struct DirectBody {
     pub pin_to_relay: Option<bool>,
 }
 
-fn err(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(ApiError {
-            error: message.into(),
-        }),
-    )
-        .into_response()
-}
-
 /// Fail-closed bearer check — identical semantics to the policy + command APIs.
 fn check_admin(state: &DirectApiState, headers: &HeaderMap) -> Option<Response> {
-    let Some(expected) = state.admin_token.as_deref() else {
-        return Some(err(
-            StatusCode::UNAUTHORIZED,
-            "direct-flag admin API disabled (MESH_ADMIN_TOKEN unset)",
-        ));
-    };
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    match presented {
-        Some(tok) if tok == expected => None,
-        _ => Some(err(
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing admin token",
-        )),
-    }
+    check_admin_bearer(state.admin_token.as_deref(), headers, "direct-flag")
 }
 
 /// Parse one path UUID, mapping a malformed value to a `400` response.
 fn parse_uuid(raw: &str) -> Result<Uuid, Box<Response>> {
-    Uuid::from_str(raw)
-        .map_err(|e| Box::new(err(StatusCode::BAD_REQUEST, format!("invalid peer id: {e}"))))
+    Uuid::from_str(raw).map_err(|e| {
+        Box::new(err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid peer id: {e}"),
+        ))
+    })
 }
 
 /// Set (or clear) the per-pair direct overrides (admin-gated).

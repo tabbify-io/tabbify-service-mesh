@@ -43,9 +43,21 @@ pub async fn run(args: PeersArgs) -> Result<()> {
         args.coordinator.trim_end_matches('/'),
         PEERS_ENDPOINT
     );
-    let resp = reqwest::get(&url)
-        .await
-        .with_context(|| format!("GET {url}"))?;
+    // The roster spans every tenant, so the endpoint is admin-gated. Send
+    // the operator's token when we have one and let the coordinator be the
+    // judge — failing here would just duplicate its decision.
+    let mut req = reqwest::Client::new().get(&url);
+    if let Some(token) = args.admin_token.as_deref() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!(
+            "coordinator rejected the roster read (401) for {url}: \
+             `peers` needs the operator admin token — pass --admin-token \
+             or set MESH_ADMIN_TOKEN"
+        );
+    }
     if !resp.status().is_success() {
         anyhow::bail!("coordinator returned HTTP {} for {url}", resp.status());
     }

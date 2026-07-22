@@ -4,7 +4,11 @@
 //! SSE peer-stream plumbing ([`sse`]), the admin policy API ([`policy_api`],
 //! `/v1/policy`), and the mTLS server config ([`mtls`]). Peer endpoints
 //! live under `/v1/mesh/...`; the ACL admin endpoints under `/v1/policy`.
+//!
+//! Every admin-gated surface shares the single bearer check in
+//! [`admin_auth`] — one definition of "is this caller an admin".
 
+pub(crate) mod admin_auth;
 pub mod api;
 pub mod command_api;
 pub mod direct_api;

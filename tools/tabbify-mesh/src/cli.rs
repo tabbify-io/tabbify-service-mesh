@@ -274,6 +274,13 @@ pub struct PeersArgs {
         default_value = DEFAULT_COORDINATOR_URL,
     )]
     pub coordinator: String,
+
+    /// Coordinator admin token. `GET /v1/mesh/peers` returns the roster
+    /// across every tenant, so it is admin-gated: the request is sent as
+    /// `Authorization: Bearer <token>` and the coordinator answers `401`
+    /// without it. This is the operator's `MESH_ADMIN_TOKEN`.
+    #[arg(long, env = "MESH_ADMIN_TOKEN")]
+    pub admin_token: Option<String>,
 }
 
 /// Arguments for the `leave` subcommand.
